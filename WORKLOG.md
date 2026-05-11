@@ -33,7 +33,19 @@ Committed locally as `8fb565e`.
 - **Shape-level confirmation of the zero-regression-vs-IPDPS-single-job claim.** Bit-identical comparison deferred.
 - Result + summary at `benchmarks/results/single_job_baseline/`. Committed.
 
-**In progress:** SLURM 221612 (c70) + 221613 (c71) — two-job concurrent cross-job experiment. Both jobs share `FitCache_CLUSTER_REGISTRY_DIR=/mnt/beegfs/ghu4/fitcachepp_registry_two_job_concurrent/<run-tag>/`. Expected wall: ~19m each in parallel; ~19m total.
+**Two-job concurrent cross-job experiment landed.** First attempt (221612 c70 + 221613 c71) surfaced a fourth bug — the cluster registry's single-file-per-node rmw pattern races on BeeGFS because atomic-rename invalidates the flock inode binding. The first run's per-node registry file ended up containing only `heartbeat` keys (no addr/rank/jobid) because the heartbeat thread's RMWs fired most often and were always last. Fixed by switching to **one file per server-instance** (`nodes/<hostname>_rank<N>.txt`); each server is the sole writer of its own file (committed `4b7680e`/`3971d8c`).
+
+Second attempt (221614 c70 + 221615 c71) ran clean. Headline result:
+
+| Metric | Single-job baseline (221607) | Two-job concurrent (221614 + 221615) | Δ |
+|---|---:|---:|---:|
+| Cold epoch | 362 s | ~199 s | **−45%** |
+| Per-job wall | 19m00s | 16m19s | **−14%** |
+| Aggregate I/O work (2 jobs) | 38m00s sequential | 16m19s concurrent | **−57%** |
+
+Mechanism: HRW deterministically picks the same server for the same path across both jobs (same dataset, same global live set). Whichever job hits a file first warms the cache; the other gets a hit. peer_lookup fanout + redirect path did NOT fire — expected for a stable live set; the redirect path is for server-set churn (artificially induced in the localhost smoke). Result + analysis at `benchmarks/results/two_job_concurrent/summary_221614_221615.md`. Committed `07d28a0`.
+
+Caveat noted: c70 and c71 share `/etc/machine-id`, so HRW scores tied across nodes and all paths landed on whichever node registered first. Routing isn't node-balanced. Cross-job-sharing claim still holds; routing-balance is a separate hardening item (inject hostname or addr into HRW input).
 
 **Heartbeat:** Monitor task `bcfafdkil` (30-min interval) running.
 
