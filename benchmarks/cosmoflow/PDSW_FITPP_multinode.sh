@@ -99,24 +99,31 @@ export FITPP_N_TRAIN=${FITPP_N_TRAIN:-61440}
 echo "FITPP_N_TRAIN=$FITPP_N_TRAIN  (IPDPS used 61440)"
 
 # ---------------- Pre-create cache dirs on each PM node ----------------
-# Each storage node has its own /mnt/local and /mnt/fsdax — pre-create
-# them so multiple servers don't race on mkdir.
-for pm in "${PM_NODES[@]}"; do
-    srun -N1 -n1 -w "$pm" --jobid=$SLURM_JOB_ID \
-        bash -c "mkdir -p $FitCache_DRAM_PATH $FitCache_NVME_PATH $FitCache_PMEM_PATH; \
-                 if [ \"\${FITPP_PURGE_CACHE:-0}\" = \"1\" ]; then \
-                     find $FitCache_DRAM_PATH -mindepth 1 -delete 2>/dev/null; \
-                     find $FitCache_NVME_PATH -mindepth 1 -delete 2>/dev/null; \
-                     find $FitCache_PMEM_PATH -mindepth 1 -delete 2>/dev/null; \
-                 fi" || echo "[warn] pre-create on $pm failed"
-done
+# Skip entirely in Pure_CF mode — no FitCache servers will run, no cache
+# tiers needed. Pure_CF reads BeeGFS direct from the GPU client.
+if [ "${FITPP_PURE_CF:-0}" != "1" ]; then
+    for pm in "${PM_NODES[@]}"; do
+        srun -N1 -n1 -w "$pm" --jobid=$SLURM_JOB_ID \
+            bash -c "mkdir -p $FitCache_DRAM_PATH $FitCache_NVME_PATH $FitCache_PMEM_PATH; \
+                     if [ \"\${FITPP_PURGE_CACHE:-0}\" = \"1\" ]; then \
+                         find $FitCache_DRAM_PATH -mindepth 1 -delete 2>/dev/null; \
+                         find $FitCache_NVME_PATH -mindepth 1 -delete 2>/dev/null; \
+                         find $FitCache_PMEM_PATH -mindepth 1 -delete 2>/dev/null; \
+                     fi" || echo "[warn] pre-create on $pm failed"
+    done
+fi
 
 # ---------------- Launch FitCache servers on PM node(s) ----------------
+# Pure_CF mode skips this entirely — no servers, no LD_PRELOAD, training
+# reads BeeGFS directly. The "Pure_CF" column of the comparison table.
 SERVER_BIN=/home/ghu4/hvac/FitCachePP/build/src/fitcache_server
 SERVER_PIDS=()
 GLOBAL_SERVER_ID=0
 BASE_PORT=5555
 
+if [ "${FITPP_PURE_CF:-0}" = "1" ]; then
+    echo "[$(date '+%H:%M:%S')] FITPP_PURE_CF=1: skipping FitCache server launch (Pure_CF baseline)"
+else
 for pm in "${PM_NODES[@]}"; do
     echo "[$(date '+%H:%M:%S')] starting $SERVERS_PER_PM_NODE servers on $pm (procs $GLOBAL_SERVER_ID..$((GLOBAL_SERVER_ID + SERVERS_PER_PM_NODE - 1)))"
     # Use ONE srun call with -n${SERVERS_PER_PM_NODE} so SLURM auto-assigns
@@ -139,6 +146,7 @@ for i in $(seq 1 30); do
     [ "$n" -ge "$TOTAL_SERVERS" ] && { echo "[$(date '+%H:%M:%S')] all $TOTAL_SERVERS server endpoints registered"; break; }
     sleep 2
 done
+fi  # end FITPP_PURE_CF guard
 
 # ---------------- Launch Horovod training on GPU node(s) ----------------
 echo "[$(date '+%H:%M:%S')] horovodrun -np $TOTAL_GPUS -H $HOROVOD_HOSTLIST"

@@ -33,10 +33,21 @@ if [ -n "${FITPP_N_TRAIN:-}" ]; then
     N_TRAIN_ARG=(--n-train "$FITPP_N_TRAIN")
 fi
 
-LD_PRELOAD=/home/ghu4/hvac/FitCachePP/build/src/libfitcache_client.so \
+if [ "${FITPP_PURE_CF:-0}" = "1" ]; then
+    # Pure_CF baseline: no LD_PRELOAD, no FitCache. train.py reads BeeGFS
+    # directly via the standard POSIX path. Same --data-dir + --n-train
+    # so the only variable vs FitCachePP is the cache pathway itself.
+    echo "[command_CF_FITPP.sh] FITPP_PURE_CF=1: running WITHOUT LD_PRELOAD (Pure_CF baseline)"
     /home/ghu4/hvac/rlibrary/miniconda3/envs/hvac_tf/bin/python3 \
-    /home/ghu4/hvac/benchmark/cosmoflow-benchmark-master/train.py -d \
-    --data-dir "$FitCache_DATA_DIR" \
-    "${N_TRAIN_ARG[@]}"
+        /home/ghu4/hvac/benchmark/cosmoflow-benchmark-master/train.py -d \
+        --data-dir "$FitCache_DATA_DIR" \
+        "${N_TRAIN_ARG[@]}"
+else
+    LD_PRELOAD=/home/ghu4/hvac/FitCachePP/build/src/libfitcache_client.so \
+        /home/ghu4/hvac/rlibrary/miniconda3/envs/hvac_tf/bin/python3 \
+        /home/ghu4/hvac/benchmark/cosmoflow-benchmark-master/train.py -d \
+        --data-dir "$FitCache_DATA_DIR" \
+        "${N_TRAIN_ARG[@]}"
+fi
 
 echo DONE `hostname`
