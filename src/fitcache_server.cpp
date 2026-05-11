@@ -73,6 +73,17 @@ void signal_exit(int signum)
         fitcache::log_cross_job_stats(fitcache_server_rank);
     }
 
+    // log4c uses libc stdio buffering on the file appender. std::exit() calls
+    // exit handlers and flushes stdio, but it skips log4c_fini() which is
+    // what the log4c category-level flush hangs off. Without explicitly
+    // tearing it down, the final cross_job_stats line above can be lost
+    // (the message was queued in the category's appender buffer when the
+    // signal arrived; std::exit drops it). log4c_fini() flushes the
+    // category buffers + closes the file appender. (Header at
+    // fitcache_logging.h:33 declares a wrapper but the symbol name in the
+    // C file is mismatched and not extern-C, so we call log4c_fini directly.)
+    log4c_fini();
+
     std::exit(0);
 }
 
