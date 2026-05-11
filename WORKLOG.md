@@ -1,5 +1,34 @@
 # FitCache++ Worklog
 
+### 2026-05-11 (latest) — Post-engineering hardening pass: HRW addr-in-hash, cross-job telemetry, PMem tier
+
+Picked up after the two-job concurrent cross-job sharing run on c70 + c71 surfaced a routing collapse: identical `/etc/machine-id` across the two hosts made `node_uuid` identical, so the HRW (highest-random-weight) score `path || node_uuid || rank` tied across hosts and all paths landed on whichever host registered first. Five concrete changes landed in this session.
+
+- **HRW addr-in-hash fix** (`src/fitcache_cross_job.cpp`). Appended `s.addr` (the Mercury endpoint string, embeds host:port and is therefore unique per endpoint) to the HRW input. Breaks the tie; preserves behaviour for clusters with distinct machine-ids. Inline comment in `hrw_select` documents the failure mode.
+- **Cross-job telemetry counters** (`src/fitcache_cross_job.{h,cpp}` + comm-server bumps + heartbeat-thread emit). Eight atomic counters for the open + peer-lookup events (`opens_total`, `opens_local_hit`, `opens_redirect_to_peer`, `opens_pfs_fallback`, `peer_lookup_forwarded`, `peer_lookup_handled`, `peer_lookup_has_yes`, `peer_lookup_has_no`). Periodic L4C_INFO line emitted from the heartbeat thread when `FitCache_CROSS_JOB=1`, gated so single-job runs stay silent. Verified in the bit-equivalence smoke: 8-file workload produced `opens_total=8 pfs_fallback=8 peer_lookup forwarded=0 handled=0`.
+- **Bit-equivalence smoke** (`scripts/run_bit_equivalence_smoke.sh` + `benchmarks/results/bit_equivalence/summary.md`). Defends the zero-regression-vs-IPDPS-single-job claim at the byte level: runs the same 8-file synthetic workload with `FitCache_CROSS_JOB=0` and `=1` (single-server, no peers), per-file sha256 of cached payloads must match across passes and against source. PASS. Re-run after the PMem changes; still PASS.
+- **Opt-in PMem tier** (`src/fitcache_cache_policy.h`: added `CACHE_TIER_PMEM = 4`; `src/fitcache_data_mover.cpp`: env vars `FitCache_PMEM_PATH` / `FitCache_PMEM_CAPACITY`, placement priority DRAM → PMem → NVMe, per-tier `g_pmem_used_bytes`, restore-sidecars loop scans PMem dir, eviction reaper handles the third tier). Dormant when env vars unset — the bit-equivalence smoke confirms zero behavior change in that case.
+- **Three-tier pilot scripts** (`benchmarks/cosmoflow/PDSW_FITPP_three_tier.sh` for the CosmoFlow + Horovod variant; `scripts/run_three_tier_sustained_read.sh` for a CPU-only sustained-read micro-benchmark). Local smoke `scripts/run_three_tier_smoke.sh` verified 4/4/4 placement split across DRAM/PMem/NVMe and full restoration of all 12 files from sidecars per-tier across server restart. Cluster pilot deferred: c35 (the known-PMem candidate) is in the `cascade` partition (CPU-only); CosmoFlow + Horovod needs a GPU node that also has DAX PMem, which the cluster doesn't obviously have.
+
+Concurrent retry (SLURM 221616 + 221617 on c70 + c71) ran after the HRW fix landed: both jobs completed in ~16:15, cold epoch 200s, warm epochs 185-189s. Direct routing-balance check across the two nodes wasn't possible from this run because the per-server log4c output (where the `Open RPC: requested path` lines land) didn't end up in `$RESULTS_DIR` — only the heartbeat-error log got captured. Result + observations at `benchmarks/results/two_job_concurrent/summary_221616_221617_retry.md`.
+
+Sequential cross-job experiment (SLURM 221618 → 221619 on c66, Job B `--dependency=afterok` on Job A): Job A finished, Job B currently running. Designed to exercise the persistent-sidecar-metadata pathway end-to-end across job boundaries; result will land at `benchmarks/results/two_job_sequential/` when Job B completes.
+
+Known issue logged for follow-up: `fitcache_cluster_registry.cpp:155` rename-busy storm on long-lived shared registry dirs. Orphan `<final>.tmp.<pid>` files from earlier processes that SLURM didn't fully tear down cause chains like `c70_rank0.txt.tmp.A.tmp.B.tmp.C` and EBUSY rename failures. Functional impact is log noise + delayed heartbeat refresh; experiments still complete. Mitigation: per-run unique `$RUN_REGISTRY` subdir (already in place). Real fix would prune orphan tmps at registry init.
+
+Commits (local, not pushed; user pushes manually):
+- `feat: add cross-job telemetry counters with periodic logging`
+- `feat: add opt-in PMem tier between DRAM and NVMe`
+- `feat: add three-tier cluster pilot script and sustained-read bench`
+
+Plus the HRW addr-in-hash commit that landed before this session.
+
+**Next steps**
+- When Job B (SLURM 221619) finishes, record the sequential-result summary in `benchmarks/results/two_job_sequential/` — expecting Job B epoch-1 to be warm (~190s) instead of cold (~362s), defending the sidecar-rebuild-survives-job-boundary claim.
+- Capture per-server log4c output into `$RESULTS_DIR` in `PDSW_FITPP_inner.sh` so future cluster runs can do an opens-per-node tally directly.
+- Investigate the `registry_gc_stale` rename-busy storm root cause if it recurs in a clean fresh run.
+- Submit the three-tier pilot when a node with both a GPU and a DAX PMem mount is identified; otherwise run `scripts/run_three_tier_sustained_read.sh` on c35 for a CPU-only three-tier characterisation.
+
 ### 2026-05-11 (later) — End-to-end cross-job sharing proven on Mercury; cluster experiments started
 
 Multi-server localhost smoke harness brought up — the first real Mercury test of the cross-job redirect path. Surfaced three real bugs which were fixed in the process:
