@@ -42,9 +42,16 @@ int hrw_select(const std::string &path,
         const ServerEndpoint &s = servers[i];
         if (!s.live) continue;
 
-        // Score = FNV-1a(path || NUL || node_uuid || NUL || rank).
-        // We seed an FNV state explicitly here rather than calling
-        // fitcache_fnv1a64 three times so the NUL separators are honored.
+        // Score = FNV-1a(path || NUL || node_uuid || NUL || rank || NUL || addr).
+        // The Mercury addr is included alongside node_uuid + rank because
+        // some clusters (e.g. ARC c70 + c71) ship cloned VM images with
+        // identical /etc/machine-id, which makes node_uuid identical across
+        // hosts. Without addr in the hash, (node_uuid, rank) ties between
+        // hosts collapsed all paths onto whichever host's slot was iterated
+        // first — c71's servers got no work in the two-job concurrent
+        // benchmark on c70 + c71. Including addr (which IS unique per
+        // Mercury endpoint, since it embeds host:port) breaks the ties and
+        // restores HRW's intended ~1/N load balance.
         const uint64_t FNV_OFFSET = 0xcbf29ce484222325ULL;
         const uint64_t FNV_PRIME  = 0x100000001b3ULL;
         uint64_t h = FNV_OFFSET;
@@ -59,6 +66,8 @@ int hrw_select(const std::string &path,
             h ^= static_cast<uint64_t>((r >> (b * 8)) & 0xff);
             h *= FNV_PRIME;
         }
+        h ^= 0; h *= FNV_PRIME;
+        for (char c : s.addr) { h ^= static_cast<uint64_t>(c); h *= FNV_PRIME; }
 
         if (best_idx < 0 || h > best_score) {
             best_score = h;

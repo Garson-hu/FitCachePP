@@ -8,5 +8,6 @@
 !/build/clear_cmake.sh
 !/build/build.sh
 
-
+fitcache_server_log.*
+.ports.cfg.*
 /tpds_extension

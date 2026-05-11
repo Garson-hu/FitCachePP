@@ -1,0 +1,10 @@
+Starting FitCache++ servers...
+Starting 4 servers on c66
+  Server ID=0  c66:5555
+  Server ID=1  c66:5556
+  Server ID=2  c66:5557
+  Server ID=3  c66:5558
+Launching Horovod training on 1 GPUs (hostlist: c66:1)
+/var/spool/slurmd/job221605/slurm_script: line 120: horovodrun: command not found
+Training finished; tearing down FitCache++ servers
+DONE single-job FitCache++ baseline (job 221605)

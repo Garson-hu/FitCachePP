@@ -1,0 +1,36 @@
+Starting FitCache++ servers...
+Starting 4 servers on c66
+  Server ID=0  c66:5555
+  Server ID=1  c66:5556
+  Server ID=2  c66:5557
+  Server ID=3  c66:5558
+Launching Horovod training on 1 GPUs (hostlist: c66:1)
+2026-05-11 03:59:42.204489: I tensorflow/core/util/port.cc:111] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2026-05-11 03:59:43.843299: E tensorflow/compiler/xla/stream_executor/cuda/cuda_dnn.cc:9342] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+2026-05-11 03:59:43.843346: E tensorflow/compiler/xla/stream_executor/cuda/cuda_fft.cc:609] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+2026-05-11 03:59:43.843356: E tensorflow/compiler/xla/stream_executor/cuda/cuda_blas.cc:1518] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+2026-05-11 03:59:44.250528: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: SSE4.1 SSE4.2 AVX AVX2 AVX512F AVX512_VNNI AVX512_BF16 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+[0] + LD_PRELOAD=/home/ghu4/hvac/FitCachePP/build/src/libfitcache_client.so
+[0] + /home/ghu4/hvac/rlibrary/miniconda3/envs/hvac_tf/bin/python3 /home/ghu4/hvac/benchmark/cosmoflow-benchmark-master/train.py -d
+[0] 2026-05-11 04:00:21.353760: I tensorflow/core/util/port.cc:111] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+[0] 2026-05-11 04:00:21.386661: E tensorflow/compiler/xla/stream_executor/cuda/cuda_dnn.cc:9342] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+[0] 2026-05-11 04:00:21.386699: E tensorflow/compiler/xla/stream_executor/cuda/cuda_fft.cc:609] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+[0] 2026-05-11 04:00:21.386708: E tensorflow/compiler/xla/stream_executor/cuda/cuda_blas.cc:1518] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+[0] 2026-05-11 04:00:21.392108: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+[0] To enable the following instructions: SSE4.1 SSE4.2 AVX AVX2 AVX512F AVX512_VNNI AVX512_BF16 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+[0] train.py has started
+[0] Initializing Horovod
+[0] Traceback (most recent call last):
+[0]   File "/home/ghu4/hvac/benchmark/cosmoflow-benchmark-master/train.py", line 499, in <module>
+[0]     main()
+[0]   File "/home/ghu4/hvac/benchmark/cosmoflow-benchmark-master/train.py", line 275, in main
+[0]     config = load_config(args)
+[0]   File "/home/ghu4/hvac/benchmark/cosmoflow-benchmark-master/train.py", line 198, in load_config
+[0]     with open(args.config) as f:
+[0] FileNotFoundError: [Errno 2] No such file or directory: 'configs/cosmo.yaml'
+[0] ++ hostname
+[0] DONE c66
+[0] + echo DONE c66
+Training finished; tearing down FitCache++ servers
+DONE single-job FitCache++ baseline (job 221606)
