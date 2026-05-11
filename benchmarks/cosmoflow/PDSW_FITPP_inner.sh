@@ -56,6 +56,18 @@ fi
 # Pre-create cache dirs so multiple servers on the same node don't race.
 mkdir -p "$FitCache_DRAM_PATH" "$FitCache_NVME_PATH"
 
+# When the same physical cache dir is reused across runs (single-node
+# experiments often pin DRAM/NVMe paths to /mnt/local/ghu4/<fixed>),
+# leftover files from prior runs corrupt the engagement self-check's
+# cached-file count and pollute restore-sidecars at startup. Wipe under
+# the live tier paths if FITPP_PURGE_CACHE=1 is set (default OFF so
+# back-to-back runs that intentionally want to reuse cache don't lose it).
+if [ "${FITPP_PURGE_CACHE:-0}" = "1" ]; then
+    echo "[$(date '+%H:%M:%S')] FITPP_PURGE_CACHE=1: wiping $FitCache_DRAM_PATH and $FitCache_NVME_PATH"
+    find "$FitCache_DRAM_PATH" -mindepth 1 -delete 2>/dev/null || true
+    find "$FitCache_NVME_PATH" -mindepth 1 -delete 2>/dev/null || true
+fi
+
 # ------------------- Launch FitCache++ servers -------------------
 echo "[$(date '+%H:%M:%S')] Starting $SERVERS_PER_NODE FitCache++ servers on $NODE (jobid=$SLURM_JOB_ID, cross_job=${FitCache_CROSS_JOB:-0})"
 SERVER_PIDS=()
@@ -128,8 +140,10 @@ done
 # alone produces a noisy warning but doesn't suppress (b).
 OPEN_RPC_COUNT=$(grep -c 'Open RPC: requested path' "$RESULTS_DIR"/fitcache_server_log.*.0 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
 CACHED_FILE_COUNT=0
-for d in "$FitCache_DRAM_PATH" "$FitCache_NVME_PATH" "$FitCache_PMEM_PATH"; do
-    [ -d "$d" ] || continue
+# Use ${VAR:-} expansion so "set -u" doesn't fail when single-job runs
+# (which don't set FitCache_PMEM_PATH) reach this loop.
+for d in "${FitCache_DRAM_PATH:-}" "${FitCache_NVME_PATH:-}" "${FitCache_PMEM_PATH:-}"; do
+    [ -n "$d" ] && [ -d "$d" ] || continue
     n=$(find "$d" -type f ! -name '*.meta' 2>/dev/null | wc -l)
     CACHED_FILE_COUNT=$((CACHED_FILE_COUNT + n))
 done

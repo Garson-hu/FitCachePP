@@ -21,9 +21,22 @@ cd /home/ghu4/hvac/benchmark/cosmoflow-benchmark-master/
 # fitcache_client.cpp:116 doesn't match — every read passes through to
 # BeeGFS direct and the FitCache server pathway stays dormant (root cause
 # of the zero-Open-RPC cluster runs on 2026-05-11).
+# N_TRAIN override: caller (the outer PDSW_FITPP*.sh script) sets
+# FITPP_N_TRAIN to scale the workload. Default 1024 = the configs/cosmo.yaml
+# default (small smoke). For real comparisons against the IPDPS published
+# numbers, set FITPP_N_TRAIN=61440 (the full dataset IPDPS used). For a
+# faster-iterating comparison that still stresses I/O meaningfully, 8192
+# is a good middle ground (~8x the cold-epoch I/O cost of 1024 but
+# 8x faster than 61440).
+N_TRAIN_ARG=()
+if [ -n "${FITPP_N_TRAIN:-}" ]; then
+    N_TRAIN_ARG=(--n-train "$FITPP_N_TRAIN")
+fi
+
 LD_PRELOAD=/home/ghu4/hvac/FitCachePP/build/src/libfitcache_client.so \
     /home/ghu4/hvac/rlibrary/miniconda3/envs/hvac_tf/bin/python3 \
     /home/ghu4/hvac/benchmark/cosmoflow-benchmark-master/train.py -d \
-    --data-dir "$FitCache_DATA_DIR"
+    --data-dir "$FitCache_DATA_DIR" \
+    "${N_TRAIN_ARG[@]}"
 
 echo DONE `hostname`
