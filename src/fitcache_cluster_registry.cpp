@@ -146,6 +146,21 @@ int write_atomic(const std::string &final_path, const std::string &content) {
 // `update_fn` receives the current parsed kv-map and produces the new one.
 template <typename UpdateFn>
 int rmw_kv_file(const std::string &path, UpdateFn update_fn) {
+    // Make sure the parent directory exists. registry_init creates the tree
+    // at startup, but the directories can be wiped by external cleanup
+    // between init and use (test scenarios, shared-PFS cleanups, etc.).
+    {
+        std::error_code ec;
+        fs::path parent = fs::path(path).parent_path();
+        if (!parent.empty() && !fs::exists(parent, ec)) {
+            fs::create_directories(parent, ec);
+            if (ec) {
+                L4C_ERR("registry: cannot ensure parent dir %s: %s",
+                        parent.c_str(), ec.message().c_str());
+                return -1;
+            }
+        }
+    }
     int fd = open(path.c_str(), O_CREAT | O_RDWR, 0644);
     if (fd < 0) {
         L4C_ERR("registry: open %s: %s", path.c_str(), std::strerror(errno));

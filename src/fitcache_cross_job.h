@@ -84,6 +84,28 @@ void refresh_cluster_endpoints();
 // not yet be in the cluster snapshot. Returns -1 on empty input.
 int register_endpoint(const std::string &addr);
 
+// Subscriber-lease management for cross-job sharing. The design doc proposed
+// these as Mercury RPCs (fitcache_subscribe_rpc / fitcache_release_rpc); the
+// implementation collapses them into direct PFS-backed registry writes
+// because the registry is already PFS-backed and the client links the
+// cluster_registry module — adding an RPC layer would only add latency and
+// failure modes for no semantic gain. The wire-level subscribe/release RPCs
+// can still be added later if a client ever needs to subscribe without PFS
+// write access.
+//
+// subscribe_self_to_local_dataset: idempotent. Computes a lightweight
+// dataset_id from FitCache_DATA_DIR (root-path hash; full manifest scan is
+// deferred), initialises the registry if needed, and inserts a subscriber
+// record with a lease running for FitCache_LEASE_RENEW_SEC * 2 seconds.
+//
+// release_self_from_local_dataset: idempotent. Removes the subscriber record
+// inserted by the matching subscribe call.
+//
+// Both no-op when cross_job_enabled() is false, so single-job (IPDPS) builds
+// remain bit-identical.
+void subscribe_self_to_local_dataset();
+void release_self_from_local_dataset();
+
 }  // namespace fitcache
 
 #endif  // __cplusplus

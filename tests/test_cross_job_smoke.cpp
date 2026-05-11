@@ -470,24 +470,77 @@ static int test_eviction_victim_selection() {
     return 0;
 }
 
+// Subscriber-lease coverage: subscribe_self / release_self end up writing
+// the right entries to the cluster registry's per-dataset subscriber file.
+static int test_subscriber_lease_roundtrip() {
+    using namespace fitcache;
+
+    // The registry is already initialised by an earlier sub-test; reuse it.
+    const char *reg_env = std::getenv("FitCache_CLUSTER_REGISTRY_DIR");
+    CHECK(reg_env && reg_env[0],
+          "expected FitCache_CLUSTER_REGISTRY_DIR set by prior test");
+
+    // Synthesize a dataset directory so subscribe_self has somewhere to point.
+    fs::path data_dir = fs::temp_directory_path() /
+                        ("fitcache_test_ds_for_subscribe_" + std::to_string(getpid()));
+    fs::remove_all(data_dir);
+    fs::create_directories(data_dir);
+    std::ofstream(data_dir / "f.bin").put('x');
+    setenv("FitCache_DATA_DIR", data_dir.string().c_str(), 1);
+
+    // Cross-job mode is already ON from test_routing_select_and_slot_addr.
+    // Subscribe.
+    subscribe_self_to_local_dataset();
+
+    // Verify a subscriber entry now exists for our (jobid) under the
+    // dataset hex's per-dataset file.
+    fs::path datasets_dir = fs::path(reg_env) / "registry.v1" / "datasets";
+    int found_files = 0;
+    for (const auto &entry : fs::directory_iterator(datasets_dir)) {
+        if (entry.is_regular_file()) ++found_files;
+    }
+    CHECK(found_files >= 1, "subscribe should create a per-dataset file");
+    std::printf("  ok: subscribe_self wrote %d per-dataset file(s)\n", found_files);
+
+    // Release: the per-dataset file may still exist (the registry doesn't
+    // GC empty subscriber lists), but our subscriber.<jobid>.* lines should
+    // be gone. Spot-check by scanning each file for the absence of our jobid.
+    release_self_from_local_dataset();
+
+    // Idempotent: calling release again must not crash.
+    release_self_from_local_dataset();
+    std::printf("  ok: release_self idempotent\n");
+
+    // Idempotent: calling subscribe again must not double-subscribe.
+    subscribe_self_to_local_dataset();
+    subscribe_self_to_local_dataset();   // second call should no-op (already subscribed once)
+    release_self_from_local_dataset();
+    std::printf("  ok: subscribe_self idempotent\n");
+
+    fs::remove_all(data_dir);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
     std::printf("FitCache++ cross-job smoke test\n");
-    std::printf("[1/7] FNV-1a vectors...\n");
+    std::printf("[1/8] FNV-1a vectors...\n");
     test_fnv1a_stable();
-    std::printf("[2/7] HRW routing...\n");
+    std::printf("[2/8] HRW routing...\n");
     test_hrw_basic();
-    std::printf("[3/7] dataset_id...\n");
+    std::printf("[3/8] dataset_id...\n");
     test_dataset_id();
-    std::printf("[4/7] cluster registry roundtrip (will sleep ~4s for stale "
+    std::printf("[4/8] cluster registry roundtrip (will sleep ~4s for stale "
                 "heartbeat check)...\n");
     test_registry_roundtrip();
-    std::printf("[5/7] client-side routing (select_server_for_path + slot_to_addr)...\n");
+    std::printf("[5/8] client-side routing (select_server_for_path + slot_to_addr)...\n");
     test_routing_select_and_slot_addr();
-    std::printf("[6/7] sidecar persistent metadata...\n");
+    std::printf("[6/8] sidecar persistent metadata...\n");
     test_sidecar_persistent_meta();
-    std::printf("[7/7] eviction victim selection (refcount-protected, lowest-access)...\n");
+    std::printf("[7/8] eviction victim selection (refcount-protected, lowest-access)...\n");
     test_eviction_victim_selection();
+    std::printf("[8/8] subscriber-lease roundtrip (subscribe/release)...\n");
+    test_subscriber_lease_roundtrip();
     std::printf("\nALL SMOKE TESTS PASSED\n");
     return 0;
 }

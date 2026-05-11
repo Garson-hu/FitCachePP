@@ -19,6 +19,7 @@
 
 extern "C" {
 #include "fitcache_logging.h"
+#include <unistd.h>            // getpid()
 }
 
 #include <ctime>
@@ -183,6 +184,89 @@ int register_endpoint(const std::string &addr) {
     g_endpoints.push_back(s);
     g_addr_to_slot.emplace(s.addr, slot);
     return slot;
+}
+
+// ----------------------------------------------------------------------------
+// Subscriber-lease management.
+// State for the (one) subscription this process holds. A process subscribes
+// at most once — to the dataset referenced by FitCache_DATA_DIR.
+// ----------------------------------------------------------------------------
+namespace {
+
+std::mutex            g_subscribe_mtx;
+fitcache_dataset_id_t g_self_dataset_id;
+bool                  g_self_subscribed = false;
+uint32_t              g_self_jobid      = 0;
+
+uint32_t derive_jobid() {
+    if (const char *v = std::getenv("SLURM_JOBID")) {
+        int n = std::atoi(v);
+        if (n > 0) return static_cast<uint32_t>(n);
+    }
+    return static_cast<uint32_t>(getpid());
+}
+
+uint64_t derive_lease_until() {
+    int renew_sec = 300;
+    if (const char *v = std::getenv("FitCache_LEASE_RENEW_SEC")) {
+        int n = std::atoi(v);
+        if (n > 0) renew_sec = n;
+    }
+    return static_cast<uint64_t>(std::time(nullptr)) + static_cast<uint64_t>(renew_sec) * 2;
+}
+
+}  // namespace
+
+void subscribe_self_to_local_dataset() {
+    if (!cross_job_enabled()) return;
+    std::lock_guard<std::mutex> lock(g_subscribe_mtx);
+    if (g_self_subscribed) return;
+
+    const char *data_dir = std::getenv("FitCache_DATA_DIR");
+    if (!data_dir || !data_dir[0]) {
+        L4C_WARN("subscribe-self: FitCache_DATA_DIR not set; cannot subscribe");
+        return;
+    }
+    if (registry_init() != 0) {
+        L4C_WARN("subscribe-self: registry_init failed; not subscribing");
+        return;
+    }
+
+    // Lightweight dataset_id: root_path_hash only. The full manifest-hash
+    // scan in fitcache::build_dataset_id is deferred — we don't currently
+    // gate any behavior on manifest equality, so a placeholder identical
+    // to root_path_hash is sufficient.
+    std::memset(&g_self_dataset_id, 0, sizeof(g_self_dataset_id));
+    std::strncpy(g_self_dataset_id.name, "fitcache-default",
+                 sizeof(g_self_dataset_id.name) - 1);
+    g_self_dataset_id.root_path_hash = fitcache_dataset_root_path_hash(data_dir);
+    g_self_dataset_id.manifest_hash  = g_self_dataset_id.root_path_hash;
+
+    g_self_jobid = derive_jobid();
+    uint64_t lease_until = derive_lease_until();
+
+    int rc = registry_subscribe_dataset(g_self_dataset_id, g_self_jobid, lease_until);
+    if (rc == 0) {
+        g_self_subscribed = true;
+        L4C_INFO("subscribe-self: subscribed (root_hash=0x%lx, jobid=%u, "
+                 "lease_until=%lu)",
+                 (unsigned long)g_self_dataset_id.root_path_hash,
+                 g_self_jobid, (unsigned long)lease_until);
+    } else {
+        L4C_WARN("subscribe-self: registry_subscribe_dataset failed (rc=%d)", rc);
+    }
+}
+
+void release_self_from_local_dataset() {
+    std::lock_guard<std::mutex> lock(g_subscribe_mtx);
+    if (!g_self_subscribed) return;
+    int rc = registry_release_dataset(g_self_dataset_id, g_self_jobid);
+    if (rc == 0) {
+        L4C_INFO("release-self: released subscription (jobid=%u)", g_self_jobid);
+    } else {
+        L4C_WARN("release-self: registry_release_dataset failed (rc=%d)", rc);
+    }
+    g_self_subscribed = false;
 }
 
 }  // namespace fitcache

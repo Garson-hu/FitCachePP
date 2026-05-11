@@ -69,12 +69,20 @@ static void __attribute__((constructor)) fitcache_client_init()
     g_fitcache_initialized = true;
 
     pthread_mutex_unlock(&init_mutex);
-    
+
 	g_disable_redirect = false;
+
+	// Cross-job extension: register this job as a subscriber to the local
+	// dataset so peer servers know our cached files are in active use and
+	// the eviction reaper protects them. No-op when FitCache_CROSS_JOB=0.
+	fitcache::subscribe_self_to_local_dataset();
 }
 
 static void __attribute((destructor)) fitcache_client_shutdown()
 {
+    // Cross-job extension: drop our subscriber lease so peer servers can
+    // evict files we cached if pressure forces it. No-op when not subscribed.
+    fitcache::release_self_from_local_dataset();
     fitcache_shutdown_comm();
 }
 
