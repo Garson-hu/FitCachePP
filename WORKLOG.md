@@ -1,5 +1,50 @@
 # FitCache++ Worklog
 
+### 2026-05-11 (later) — End-to-end cross-job sharing proven on Mercury; cluster experiments started
+
+Multi-server localhost smoke harness brought up — the first real Mercury test of the cross-job redirect path. Surfaced three real bugs which were fixed in the process:
+
+1. **Silent hang on lookup_addr=NULL.** Three RPC functions (`fitcache_client_comm_gen_open_rpc`, `_gen_read_rpc`, `_gen_seek_rpc`) returned without firing the per-file sync context when `fitcache_client_comm_lookup_addr` returned NULL. The caller's `fitcache_client_block_for_file` then blocked forever. Now all three signal `-1` on the sync context so the caller's wait unblocks.
+2. **`std::string` global state silently zeroed mid-process.** `cluster_registry.cpp`'s `g_nodes_dir / g_registry_root / g_datasets_dir` had their heap-backed `c_str()` become `""` between `registry_init`'s write and the first `registry_live_servers` read — same address, different contents. Diagnosed via address-printing under WARN logs. Workaround: switched to fixed-size `char[1024]` buffers with thin getter functions, never reallocated after init. Root cause likely a libstdc++ destructor-ordering or LD_PRELOAD interaction; not pinpointed.
+3. **`ms_read` missing peer-slot override.** After the open redirect succeeded, subsequent reads on the redirected fd went back to the HRW-chosen server (which doesn't know the peer's remote_fd). Fixed: `ms_read` now consults `fitcache_client_get_peer_slot_override` before the HRW selection, matching the path already in `fitcache_remote_read` / `_pread` / `_lseek` / `_close`.
+
+Pre-existing code quality fixes folded in (build now compiles with zero warnings):
+- `wrappers.c` now properly `#include "fitcache_multi_source_read.h"` so `ms_read` is not implicitly declared.
+- `fitcache_multi_source_read.h` was using `std::vector` inside an `extern "C"` block (broken for C consumers). Moved the C++-only `g_pm_ranks`/`g_ssd_ranks` declarations out of the `extern "C"` block.
+- `test_open_close.c` was calling `fclose` on an `int` fd. Changed to `close(int)`.
+- `CMakeLists.txt` `DEBUG_HU` option was inverted (passing `-DDEBUG_HU=ON` defined the C macro to `0`/falsy). Now it defines to `1` when on, `0` when off.
+
+Also tightened `cluster_registry.cpp::rmw_kv_file` to ensure the parent directory exists before opening — fixes a stale-init scenario where the static `g_datasets_dir` outlives the directory it points at (between repeat test runs).
+
+**Smoke harness result:** 5 peer_lookup hits, 5 server-side `FITCACHE_OPEN_REDIRECT`s, 5 client-side redirects handled, all 8 files read end-to-end. Cross-job sharing is **proven on real Mercury** for the first time. Committed locally as `54fb50d`.
+
+**Benchmark scripts** under `benchmarks/cosmoflow/`:
+- `PDSW_FITPP.sh` — single-job FitCache++ baseline (`FitCache_CROSS_JOB=0`)
+- `PDSW_FITPP_inner.sh` — shared launcher (per-node servers + horovodrun)
+- `PDSW_FITPP_two_job_sequential.sh` — Job B sbatched with `--dependency=afterok` after Job A
+- `PDSW_FITPP_two_job_concurrent.sh` — both jobs sbatched in parallel on different nodes
+- `command_CF_FITPP.sh` — horovodrun command body with `cd` to the cosmoflow benchmark dir
+Committed locally as `8fb565e`.
+
+**First cluster experiment landed:** single-job FitCache++ baseline on c66, SLURM 221607, 19m00s wall.
+- Epochs: 362 / 189 / 188 / 188 / 186 s. Cold/warm speedup 1.93x.
+- `peer_lookup_query_count = 0` across all 4 servers (correct, single-job mode).
+- `sidecar_writes = 0` (correct, sidecars only fire when cross-job=1).
+- **Shape-level confirmation of the zero-regression-vs-IPDPS-single-job claim.** Bit-identical comparison deferred.
+- Result + summary at `benchmarks/results/single_job_baseline/`. Committed.
+
+**In progress:** SLURM 221612 (c70) + 221613 (c71) — two-job concurrent cross-job experiment. Both jobs share `FitCache_CLUSTER_REGISTRY_DIR=/mnt/beegfs/ghu4/fitcachepp_registry_two_job_concurrent/<run-tag>/`. Expected wall: ~19m each in parallel; ~19m total.
+
+**Heartbeat:** Monitor task `bcfafdkil` (30-min interval) running.
+
+**Next steps after the concurrent experiment finishes**
+- Grep cross-job hit counts from both jobs' server logs; quantify the cross-job-sharing-reduces-aggregate-IO claim at the 4-server-per-node × 2-job scale.
+- Run the two-job sequential variant (Job B with `--dependency=afterok`) if time permits.
+- PMem tier support + three-tier hardware evaluation pilot on c35 deferred to a future session (architectural change, ~4h).
+- Bit-equivalence unit-test harness still pending.
+
+**Push status:** local commits `54fb50d`, `8fb565e`, and the upcoming baseline-result commit are unpushed (no credentials in this environment).
+
 ### 2026-05-11 — Cross-job extension engineering work complete (four slices)
 
 Four committed slices land the open/read peer-fanout path, persistent
