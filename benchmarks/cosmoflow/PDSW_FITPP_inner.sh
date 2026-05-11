@@ -74,15 +74,30 @@ done
 # Give the servers a few seconds to bind ports + register.
 sleep 5
 
-# ------------------- Launch CosmoFlow training -------------------
+# ------------------- Launch training client -------------------
+# FITCACHE_CLIENT_LAUNCHER lets a caller swap in a different LD_PRELOAD'd
+# training command (e.g. Megatron-LM via command_megatron_FITPP.sh,
+# DINOv2 via command_dinov2_FITPP.sh) without forking inner.sh. Defaults
+# to the CosmoFlow command.
 TOTAL_GPUS=$GPUS_PER_NODE
 HOROVOD_HOSTLIST="${NODE}:${GPUS_PER_NODE}"
-echo "[$(date '+%H:%M:%S')] horovodrun -np $TOTAL_GPUS -H $HOROVOD_HOSTLIST"
-horovodrun -np "$TOTAL_GPUS" -H "$HOROVOD_HOSTLIST" \
-    /home/ghu4/hvac/FitCachePP/benchmarks/cosmoflow/command_CF_FITPP.sh \
-    2>&1 | tee "$RESULTS_DIR/horovodrun_${SLURM_JOB_ID}.log"
-HOROVOD_RC=${PIPESTATUS[0]}
-echo "[$(date '+%H:%M:%S')] horovodrun exit=$HOROVOD_RC"
+CLIENT_LAUNCHER="${FITCACHE_CLIENT_LAUNCHER:-/home/ghu4/hvac/FitCachePP/benchmarks/cosmoflow/command_CF_FITPP.sh}"
+echo "[$(date '+%H:%M:%S')] client launcher: $CLIENT_LAUNCHER"
+# Megatron's pretrain script uses torchrun internally; CosmoFlow's uses
+# horovodrun. The horovodrun wrapper is only needed for Horovod jobs.
+# Detect which path to take by the launcher name; defaults to horovodrun.
+if [[ "$CLIENT_LAUNCHER" == *megatron* ]] || [[ "$CLIENT_LAUNCHER" == *dinov2* ]]; then
+    echo "[$(date '+%H:%M:%S')] launching directly (non-Horovod client)"
+    "$CLIENT_LAUNCHER" 2>&1 | tee "$RESULTS_DIR/client_${SLURM_JOB_ID}.log"
+    HOROVOD_RC=${PIPESTATUS[0]}
+else
+    echo "[$(date '+%H:%M:%S')] horovodrun -np $TOTAL_GPUS -H $HOROVOD_HOSTLIST"
+    horovodrun -np "$TOTAL_GPUS" -H "$HOROVOD_HOSTLIST" \
+        "$CLIENT_LAUNCHER" \
+        2>&1 | tee "$RESULTS_DIR/horovodrun_${SLURM_JOB_ID}.log"
+    HOROVOD_RC=${PIPESTATUS[0]}
+fi
+echo "[$(date '+%H:%M:%S')] client exit=$HOROVOD_RC"
 
 # ------------------- Cleanup -------------------
 echo "[$(date '+%H:%M:%S')] Tearing down FitCache++ servers"
