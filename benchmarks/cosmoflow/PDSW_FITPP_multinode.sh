@@ -118,24 +118,19 @@ GLOBAL_SERVER_ID=0
 BASE_PORT=5555
 
 for pm in "${PM_NODES[@]}"; do
-    for j in $(seq 0 $((SERVERS_PER_PM_NODE - 1))); do
-        PORT=$((BASE_PORT + GLOBAL_SERVER_ID))
-        echo "[$(date '+%H:%M:%S')] starting server proc=$GLOBAL_SERVER_ID on $pm:$PORT"
-        # Use srun rather than mpirun so SLURM_PROCID + FitCache_SERVER_PORT
-        # actually reach the remote process. mpirun -N 1 -host strips the
-        # caller's env vars (mpirun launches a fresh shell on the remote
-        # node), which made every server on c35 default to SLURM_PROCID=0
-        # and all 4 lines in .ports.cfg ended up labelled rank 0
-        # (observed in cancelled 221641).
-        # `bash -c '...'` is the standard idiom for passing both env vars
-        # and the command together through srun.
-        srun --jobid=$SLURM_JOB_ID -N1 -n1 -w "$pm" \
-            --export=ALL,SLURM_PROCID=$GLOBAL_SERVER_ID,FitCache_SERVER_PORT=$PORT \
-            "$SERVER_BIN" "$FitCache_SERVER_COUNT" \
-            > "$RESULTS_DIR/server_${SLURM_JOB_ID}_${pm}_id${GLOBAL_SERVER_ID}.log" 2>&1 &
-        SERVER_PIDS+=($!)
-        GLOBAL_SERVER_ID=$((GLOBAL_SERVER_ID + 1))
-    done
+    echo "[$(date '+%H:%M:%S')] starting $SERVERS_PER_PM_NODE servers on $pm (procs $GLOBAL_SERVER_ID..$((GLOBAL_SERVER_ID + SERVERS_PER_PM_NODE - 1)))"
+    # Use ONE srun call with -n${SERVERS_PER_PM_NODE} so SLURM auto-assigns
+    # SLURM_PROCID=0,1,2,3 across the tasks. Four parallel srun -n1 calls
+    # serialize on the SLURM step ("Requested nodes are busy") and only the
+    # first task actually runs — see cancelled 221643 for the failure mode.
+    # FitCache_SERVER_PORT unset → Mercury picks ephemeral ports (the actual
+    # port is captured in .ports.cfg via HG_Addr_to_string).
+    srun --jobid=$SLURM_JOB_ID -N1 -n${SERVERS_PER_PM_NODE} -w "$pm" \
+        --export=ALL \
+        "$SERVER_BIN" "$FitCache_SERVER_COUNT" \
+        > "$RESULTS_DIR/server_${SLURM_JOB_ID}_${pm}.log" 2>&1 &
+    SERVER_PIDS+=($!)
+    GLOBAL_SERVER_ID=$((GLOBAL_SERVER_ID + SERVERS_PER_PM_NODE))
 done
 
 # Wait for .ports.cfg to populate (one entry per server).
