@@ -48,6 +48,10 @@ static void *fitcache_heartbeat_fn(void *arg)
         // the previous emit, which is what experiment analysis usually wants.
         if (fitcache::cross_job_enabled()) {
             fitcache::log_cross_job_stats(rank);
+            // Extend this process's subscriber-lease so long-running training
+            // jobs don't get GC'd by other processes mid-run. No-op if the
+            // process hasn't called subscribe_self_to_local_dataset.
+            fitcache::renew_self_dataset_lease();
         }
     }
     return nullptr;

@@ -106,6 +106,14 @@ int register_endpoint(const std::string &addr);
 void subscribe_self_to_local_dataset();
 void release_self_from_local_dataset();
 
+// Refresh this process's subscriber lease in the registry, extending its
+// lease_until to now + FitCache_LEASE_RENEW_SEC * 2. No-op if the process
+// never called subscribe_self (or cross-job mode is off). Called from the
+// server heartbeat thread; long-running training jobs need the periodic
+// extension because the initial lease only covers ~2 * renew_sec from
+// startup, after which subscriber-GC could prune the entry mid-run.
+void renew_self_dataset_lease();
+
 // Cross-job telemetry counters. Bumped from the server's open + peer-lookup
 // code paths so that experiments can verify which paths actually fired
 // (vs. were merely defined). Log periodically from the heartbeat thread

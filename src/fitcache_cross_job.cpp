@@ -267,6 +267,21 @@ void subscribe_self_to_local_dataset() {
     }
 }
 
+void renew_self_dataset_lease() {
+    if (!cross_job_enabled()) return;
+    std::lock_guard<std::mutex> lock(g_subscribe_mtx);
+    if (!g_self_subscribed) return;   // nothing to renew
+
+    uint64_t new_lease_until = derive_lease_until();
+    int rc = registry_subscribe_dataset(g_self_dataset_id, g_self_jobid, new_lease_until);
+    if (rc == 0) {
+        L4C_INFO("renew-self: extended subscriber lease (jobid=%u, lease_until=%lu)",
+                 g_self_jobid, (unsigned long)new_lease_until);
+    } else {
+        L4C_WARN("renew-self: registry_subscribe_dataset failed (rc=%d) — lease may expire", rc);
+    }
+}
+
 void release_self_from_local_dataset() {
     std::lock_guard<std::mutex> lock(g_subscribe_mtx);
     if (!g_self_subscribed) return;
