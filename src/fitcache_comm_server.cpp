@@ -280,3 +280,46 @@ hg_id_t fitcache_close_rpc_register(void) {
 hg_id_t fitcache_seek_rpc_register(void) {
     return fitcache_seek_rpc_register_server();
 }
+
+// ============================================================
+// Cross-job peer-lookup RPC. Part of the cluster-scoped
+// coordination protocol described in
+// tpds_extension/02_design_cross_job.md.
+// ------------------------------------------------------------
+// Stub handler from the cluster-registry slice: always responds
+// has=0. This proves the wire format works end-to-end before we
+// wire it into path_cache_map + dataset_id checks once the
+// open-time peer lookup fanout lands.
+// ============================================================
+hg_return_t
+fitcache_peer_lookup_rpc_handler(hg_handle_t handle)
+{
+    fitcache_peer_lookup_in_t  in;
+    fitcache_peer_lookup_out_t out;
+    int ret = HG_Get_input(handle, &in);
+    assert(ret == HG_SUCCESS);
+
+    L4C_INFO("peer_lookup: rank=%d path=%s ds_root=%lx ds_manifest=%lx (stub: has=0)",
+             server_rank, in.path,
+             (unsigned long)in.dataset_root_hash,
+             (unsigned long)in.dataset_manifest_hash);
+
+    out.has        = 0;
+    out.tier       = 0;
+    out.serve_addr = const_cast<char *>("");
+
+    HG_Respond(handle, NULL, NULL, &out);
+    HG_Free_input(handle, &in);
+    HG_Destroy(handle);
+    return (hg_return_t)ret;
+}
+
+hg_id_t
+fitcache_peer_lookup_rpc_register_server(void)
+{
+    hg_id_t tmp = MERCURY_REGISTER(
+        hg_class, "fitcache_peer_lookup_rpc",
+        fitcache_peer_lookup_in_t, fitcache_peer_lookup_out_t,
+        fitcache_peer_lookup_rpc_handler);
+    return tmp;
+}

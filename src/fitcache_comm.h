@@ -59,11 +59,26 @@ MERCURY_GEN_PROC(fitcache_close_in_t, ((int32_t)(fd)))
 MERCURY_GEN_PROC(fitcache_rpc_trigger_srv_print_stats_in_t, ((int32_t)(dummy_arg)))
 MERCURY_GEN_PROC(fitcache_rpc_trigger_srv_print_stats_out_t, ((int32_t)(status)))
 
+// Cross-job peer-lookup RPC. Part of the cluster-scoped coordination
+// protocol described in tpds_extension/02_design_cross_job.md.
+// Asks a peer FitCache server: "do you have this file from this dataset?"
+// Returns has=1 with `tier` (CACHE_TIER_DRAM/NVME) and `serve_addr` if yes,
+// has=0 if not.
+MERCURY_GEN_PROC(fitcache_peer_lookup_in_t,
+    ((hg_string_t)(path))((uint64_t)(dataset_root_hash))((uint64_t)(dataset_manifest_hash)))
+MERCURY_GEN_PROC(fitcache_peer_lookup_out_t,
+    ((int32_t)(has))((int32_t)(tier))((hg_string_t)(serve_addr)))
+
 
 //General
 void fitcache_init_comm(hg_bool_t listen);
 void *fitcache_progress_fn(void *args);
 void fitcache_comm_list_addr();
+
+// Returns this server's Mercury address string (from HG_Addr_self +
+// HG_Addr_to_string). Populated as a side effect of fitcache_comm_list_addr;
+// empty before that call. Lifetime is process-wide.
+const std::string &fitcache_comm_get_self_addr_string();
 void fitcache_comm_create_handle(hg_addr_t addr, hg_id_t id, hg_handle_t *handle);
 void fitcache_shutdown_comm();
 void fitcache_comm_free_addr(hg_addr_t addr);
@@ -114,6 +129,10 @@ hg_id_t fitcache_close_rpc_register(void);
 hg_id_t fitcache_seek_rpc_register(void);
 hg_id_t fitcache_trigger_srv_print_stats_rpc_register(void);
 
+// Cross-job peer-lookup RPC registration (TPDS extension).
+hg_id_t fitcache_peer_lookup_rpc_register_server(void);
+hg_id_t fitcache_peer_lookup_rpc_register_client(void);
+
 // Forward declarations for per-file sync context and state structures
 struct fitcache_file_sync_context;
 struct fitcache_open_state;
@@ -141,6 +160,7 @@ struct fitcache_rpc_state {
 extern hg_return_t fitcache_rpc_handler(hg_handle_t handle);
 extern hg_return_t fitcache_open_rpc_handler(hg_handle_t handle);
 extern hg_return_t fitcache_trigger_srv_print_stats_rpc_handler(hg_handle_t handle);
+extern hg_return_t fitcache_peer_lookup_rpc_handler(hg_handle_t handle);
 
 #endif
 

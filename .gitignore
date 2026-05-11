@@ -1,0 +1,12 @@
+# ignore build outputs
+/build/**
+/.claude/*
+.clangd
+/logs/*
+
+# but keep this script
+!/build/clear_cmake.sh
+!/build/build.sh
+
+
+/tpds_extension

@@ -7,6 +7,7 @@
 
 #include "fitcache_timer.h"
 #include "fitcache_comm.h"
+#include "fitcache_cross_job.h"
 #include "fitcache_data_mover_internal.h"
 
 extern "C" {
@@ -653,10 +654,16 @@ void fitcache_client_comm_gen_seek_rpc(uint32_t svr_hash, int fd, int64_t offset
 //We've converted the filename to a rank
 //Using standard c++ hashing modulo servers
 //Find the address
+//
+// Cross-job mode (FitCache_CROSS_JOB=1): the `rank` argument is a routing
+// slot returned by fitcache::select_server_for_path. We resolve it via the
+// cluster endpoint table populated from the registry. If the slot is
+// unknown there (degraded fallback returned a modulo rank), we fall through
+// to the single-job .ports.cfg.${SLURM_JOBID} path.
 hg_addr_t fitcache_client_comm_lookup_addr(int rank)
 {
     FitCache_TIMING("HvacCommClient_Lookup_Addr_TOTAL");
-    
+
 	// L4C_INFO("Guangxing RANK %d", rank);
 	{
 		std::lock_guard<std::mutex> lock(address_cache_mutex);
@@ -666,6 +673,22 @@ hg_addr_t fitcache_client_comm_lookup_addr(int rank)
 			HG_Addr_lookup2(fitcache_comm_get_class(), address_cache[rank].c_str(), &target_server);
 			return target_server;
 		}
+	}
+
+	/* Cross-job: try the registry-populated endpoint table first. */
+	if (fitcache::cross_job_enabled()) {
+		std::string addr = fitcache::slot_to_addr(rank);
+		if (!addr.empty()) {
+			hg_addr_t target_server = nullptr;
+			HG_Addr_lookup2(fitcache_comm_get_class(), addr.c_str(), &target_server);
+			if (target_server) {
+				std::lock_guard<std::mutex> lock(address_cache_mutex);
+				address_cache[rank] = addr;
+			}
+			return target_server;
+		}
+		// Slot unknown: fall through to .ports.cfg lookup. This happens when
+		// select_server_for_path degraded to modulo (registry empty/unreadable).
 	}
 
 	/* The hardway */
@@ -756,11 +779,22 @@ fitcache_trigger_srv_print_stats_rpc_register(void)
     hg_id_t tmp;
 
     tmp = MERCURY_REGISTER(
-        hg_class, "fitcache_trigger_srv_print_stats_rpc", 
-        fitcache_rpc_trigger_srv_print_stats_in_t, 
-        fitcache_rpc_trigger_srv_print_stats_out_t, 
+        hg_class, "fitcache_trigger_srv_print_stats_rpc",
+        fitcache_rpc_trigger_srv_print_stats_in_t,
+        fitcache_rpc_trigger_srv_print_stats_out_t,
         NULL);
 
+    return tmp;
+}
+
+/* register the cross-job peer-lookup RPC on the client side */
+hg_id_t
+fitcache_peer_lookup_rpc_register_client(void)
+{
+    hg_id_t tmp = MERCURY_REGISTER(
+        hg_class, "fitcache_peer_lookup_rpc",
+        fitcache_peer_lookup_in_t, fitcache_peer_lookup_out_t,
+        NULL);
     return tmp;
 }
 

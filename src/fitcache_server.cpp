@@ -10,6 +10,8 @@
 #include "fitcache_timer.h"
 #include "fitcache_comm.h"
 #include "fitcache_data_mover_internal.h"
+#include "fitcache_cluster_registry.h"
+#include "fitcache_cross_job.h"
 
 #define FitCache_SERVER 1
 
@@ -22,6 +24,28 @@ extern "C" {
 __thread bool tl_disable_redirect = false;
 uint32_t fitcache_server_count = 0;
 static std::atomic<bool> g_running{true};
+
+// Background thread that maintains the cluster-registry heartbeat for this
+// server when cross-job mode is enabled. Sleeps in `FitCache_HEARTBEAT_SEC`
+// chunks; calls `registry_gc_stale()` once per heartbeat to clean up
+// crashed peers.
+static void *fitcache_heartbeat_fn(void *arg)
+{
+    int rank = *static_cast<int *>(arg);
+    int interval_sec = 30;
+    if (const char *v = std::getenv("FitCache_HEARTBEAT_SEC")) {
+        int n = std::atoi(v);
+        if (n > 0) interval_sec = n;
+    }
+    while (g_running) {
+        // Wake up every second so shutdown is responsive even at long intervals.
+        for (int i = 0; i < interval_sec && g_running; ++i) sleep(1);
+        if (!g_running) break;
+        fitcache::registry_heartbeat(rank);
+        fitcache::registry_gc_stale();
+    }
+    return nullptr;
+}
 
 struct fitcache_lookup_arg {
 	hg_class_t *hg_class;
@@ -83,10 +107,50 @@ int fitcache_start_comm_server(void)
     fitcache_seek_rpc_register_server();
 
     // // ! Register the trigger RPC
-    // fitcache_trigger_srv_print_stats_rpc_register(); 
+    // fitcache_trigger_srv_print_stats_rpc_register();
+
+    // === Cross-job extension: cluster registry registration + peer-lookup
+    //     RPC handler. Gated by FitCache_CROSS_JOB=1; single-job runs skip
+    //     this entirely so behaviour is bit-identical to IPDPS. ===
+    static pthread_t heartbeat_tid;
+    static int       heartbeat_rank;
+    if (fitcache::cross_job_enabled()) {
+        if (fitcache::registry_init() == 0) {
+            fitcache_peer_lookup_rpc_register_server();
+
+            fitcache::ServerEndpoint self;
+            self.rank      = fitcache_server_rank;
+            // The Mercury self-addr was captured by fitcache_comm_list_addr()
+            // immediately above; reuse it so cross-job clients can route
+            // straight from the registry without rereading .ports.cfg.
+            self.addr      = fitcache_comm_get_self_addr_string();
+            self.node_uuid = "";  // registry fills with /etc/machine-id
+            const char *jobid = std::getenv("SLURM_JOBID");
+            self.jobid     = jobid ? jobid : "";
+            self.live      = true;
+            if (self.addr.empty()) {
+                L4C_WARN("registry: self addr is empty after fitcache_comm_list_addr; "
+                         "cross-job clients won't be able to route to this server");
+            }
+            fitcache::registry_register_server(self);
+
+            heartbeat_rank = fitcache_server_rank;
+            if (pthread_create(&heartbeat_tid, NULL,
+                               fitcache_heartbeat_fn, &heartbeat_rank) != 0) {
+                L4C_WARN("Failed to start cluster-registry heartbeat thread");
+            }
+        } else {
+            L4C_WARN("FitCache_CROSS_JOB=1 but registry_init failed; "
+                     "running in single-job mode");
+        }
+    }
 
     while (g_running)
         sleep(1);
+
+    if (fitcache::cross_job_enabled()) {
+        fitcache::registry_deregister_server(fitcache_server_rank);
+    }
 
     return EXIT_SUCCESS;
 }

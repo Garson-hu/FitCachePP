@@ -28,6 +28,16 @@ std::atomic<int> fitcache_progress_thread_shutdown_flags{0};
 int fitcache_server_rank = -1;
 int server_rank = -1;
 
+// Captured by fitcache_comm_list_addr so other modules (e.g. the cluster
+// registry registration in fitcache_server.cpp) can read the same Mercury
+// address string the client side reads from .ports.cfg, without touching
+// HG_Addr_self again.
+static std::string g_self_addr_string;
+
+const std::string &fitcache_comm_get_self_addr_string() {
+    return g_self_addr_string;
+}
+
 //Initialize communication for both the client and server
 //processes
 //This is based on the rpc_engine template provided by the mercury lib
@@ -139,6 +149,7 @@ void fitcache_comm_list_addr() {
         self_addr_string[0] = '\0';
     }
     HG_Addr_free(hg_class, self_addr);
+    g_self_addr_string = self_addr_string;
 
     FILE *na_config = fopen(filename, "a+");
     if (!na_config) {

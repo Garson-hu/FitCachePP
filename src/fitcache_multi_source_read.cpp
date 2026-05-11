@@ -9,6 +9,7 @@
 #include "fitcache_internal.h"        // For fitcache_file_tracked, fitcache_get_path, etc.
 #include "fitcache_comm.h"
 #include "fitcache_cache_policy.h"
+#include "fitcache_cross_job.h"
 #include "fitcache_multi_source_read.h"
 #include "fitcache_logging.h"         // For L4C_INFO, L4C_ERR
 
@@ -66,7 +67,8 @@ ssize_t ms_read(int fd, void* buf, size_t count, int64_t offset)
 
     int remote_fd = fd_redir_map[fd];
     L4C_INFO("Remote fd: %d", remote_fd);
-    int host = std::hash<std::string>{}(fd_map[fd]) % g_fitcache_server_count;
+    int host = fitcache::select_server_for_path(fd_map[fd],
+        static_cast<int>(g_fitcache_server_count));
 
     fitcache_client_comm_gen_read_rpc_with_ms(host, fd, buf, count, offset,
         ms_read_cb, dram_state);

@@ -5,15 +5,36 @@ pkg_check_modules(LOG4C REQUIRED IMPORTED_TARGET log4c)
 include_directories("$ENV{CONDA_PREFIX}/include")
 link_directories("$ENV{CONDA_PREFIX}/lib")
 
+# TPDS extension sources shared by client and server
+set(FITCACHE_TPDS_SOURCES
+    fitcache_cross_job.cpp
+    fitcache_dataset_id.cpp
+    fitcache_cluster_registry.cpp
+)
+
 #Dynamic Target
-add_library(fitcache_client SHARED fitcache_client.cpp fitcache_comm.cpp fitcache_comm_client.cpp wrappers.c fitcache_logging.c fitcache_multi_source_read.cpp fitcache_real_functions.cpp)
+add_library(fitcache_client SHARED
+    fitcache_client.cpp
+    fitcache_comm.cpp
+    fitcache_comm_client.cpp
+    wrappers.c
+    fitcache_logging.c
+    fitcache_multi_source_read.cpp
+    fitcache_real_functions.cpp
+    ${FITCACHE_TPDS_SOURCES})
 target_compile_definitions(fitcache_client PUBLIC FitCache_CLIENT)
 target_compile_definitions(fitcache_client PUBLIC FitCache_PRELOAD)
 target_include_directories(fitcache_client PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(fitcache_client PRIVATE pthread dl PkgConfig::LOG4C PkgConfig::MERCURY)
 
 #Server Daemon
-add_executable(fitcache_server fitcache_server.cpp fitcache_data_mover.cpp fitcache_comm.cpp fitcache_comm_server.cpp fitcache_logging.c ) # fitcache_cache_policy.cpp
+add_executable(fitcache_server
+    fitcache_server.cpp
+    fitcache_data_mover.cpp
+    fitcache_comm.cpp
+    fitcache_comm_server.cpp
+    fitcache_logging.c
+    ${FITCACHE_TPDS_SOURCES}) # fitcache_cache_policy.cpp
 target_compile_definitions(fitcache_server PUBLIC FitCache_SERVER)
 target_include_directories(fitcache_server PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(fitcache_server PRIVATE pthread PkgConfig::LOG4C rt PkgConfig::MERCURY)

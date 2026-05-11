@@ -17,6 +17,7 @@
 #include "fitcache_internal.h"
 #include "fitcache_logging.h"
 #include "fitcache_comm.h"
+#include "fitcache_cross_job.h"
 
 
 #define FitCache_CLIENT 1
@@ -135,8 +136,12 @@ bool fitcache_track_file(const char *path, int flags, int fd)
 			fitcache_client_comm_register_rpc();
 			g_mercury_init = true;
 		}
-		// Decide which server should we sent data
-		uint32_t host = std::hash<std::string>{}(fd_map[fd]) % g_fitcache_server_count;
+		// Decide which server should we sent data. In single-job mode this is
+		// modulo over the local rank set; in cross-job mode (FitCache_CROSS_JOB=1)
+		// it returns an HRW-chosen slot from the cluster live-server set.
+		uint32_t host = static_cast<uint32_t>(
+			fitcache::select_server_for_path(fd_map[fd],
+				static_cast<int>(g_fitcache_server_count)));
 		L4C_INFO("Remote open - Host %d", host);
 		fitcache_client_comm_gen_open_rpc(host, fd_map[fd], fd);
 
@@ -162,10 +167,12 @@ ssize_t fitcache_remote_read(int fd, void *buf, size_t count)
 	 */
 	ssize_t bytes_read = -1;
 	if (fitcache_file_tracked(fd)){
-		uint32_t host = std::hash<std::string>{}(fd_map[fd]) % g_fitcache_server_count;			// The host is the same host when open the file in fd_map[fd]
-		L4C_INFO("Remote read - Host %d", host);		
+		uint32_t host = static_cast<uint32_t>(
+			fitcache::select_server_for_path(fd_map[fd],
+				static_cast<int>(g_fitcache_server_count)));
+		L4C_INFO("Remote read - Host %d", host);
 		fitcache_client_comm_gen_read_rpc(host, fd, buf, count, -1);
-		bytes_read = fitcache_read_block_for_file(fd_map[fd]);   		
+		bytes_read = fitcache_read_block_for_file(fd_map[fd]);
 		return bytes_read;
 	}
 	/* Non-FitCache Reads come from base */
@@ -187,10 +194,12 @@ ssize_t fitcache_remote_pread(int fd, void *buf, size_t count, off_t offset)
 	 */
 	ssize_t bytes_read = -1;
 	if (fitcache_file_tracked(fd) && fd_redir_map[fd] != 0){
-		uint32_t host = std::hash<std::string>{}(fd_map[fd]) % g_fitcache_server_count;	
-		L4C_INFO("Remote pread - Host %d", host);		
+		uint32_t host = static_cast<uint32_t>(
+			fitcache::select_server_for_path(fd_map[fd],
+				static_cast<int>(g_fitcache_server_count)));
+		L4C_INFO("Remote pread - Host %d", host);
 		fitcache_client_comm_gen_read_rpc(host, fd, buf, count, offset);
-		bytes_read = fitcache_read_block_for_file(fd_map[fd]);   	
+		bytes_read = fitcache_read_block_for_file(fd_map[fd]);
 	}
 	/* Non-FitCache Reads come from base */
 	return bytes_read;
@@ -207,10 +216,12 @@ ssize_t fitcache_remote_lseek(int fd, int64_t offset, int whence)
 	 */
 	ssize_t bytes_read = -1;
 	if (fitcache_file_tracked(fd)){
-		uint32_t host = std::hash<std::string>{}(fd_map[fd]) % g_fitcache_server_count;	
-		// L4C_INFO("Remote seek - Host %d", host);		
+		uint32_t host = static_cast<uint32_t>(
+			fitcache::select_server_for_path(fd_map[fd],
+				static_cast<int>(g_fitcache_server_count)));
+		// L4C_INFO("Remote seek - Host %d", host);
 		fitcache_client_comm_gen_seek_rpc(host, fd, offset, whence);
-		bytes_read = fitcache_read_block_for_file(fd_map[fd]);  // Reuse read_block for seek result		
+		bytes_read = fitcache_read_block_for_file(fd_map[fd]);  // Reuse read_block for seek result
 		return bytes_read;
 	}
 	/* Non-FitCache Reads come from base */
@@ -219,8 +230,10 @@ ssize_t fitcache_remote_lseek(int fd, int64_t offset, int whence)
 
 void fitcache_remote_close(int fd){
 	if (fitcache_file_tracked(fd)){
-		uint32_t host = std::hash<std::string>{}(fd_map[fd]) % g_fitcache_server_count;
-		fitcache_client_comm_gen_close_rpc(host, fd);             	
+		uint32_t host = static_cast<uint32_t>(
+			fitcache::select_server_for_path(fd_map[fd],
+				static_cast<int>(g_fitcache_server_count)));
+		fitcache_client_comm_gen_close_rpc(host, fd);
 	}
 }
 
