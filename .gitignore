@@ -11,4 +11,10 @@
 fitcache_server_log.*
 .ports.cfg.*
 /tpds_extension
-/benchmarks/results/
+# Track benchmark summaries (.md, .yaml, etc.) under benchmarks/results/
+# but skip the raw per-run artifacts: SLURM .out files, log4c logs, and the
+# horovodrun stdout captures. Per-run sbatch shell scripts auto-generated
+# by the driver (named with a timestamp + PID) are also skipped.
+/benchmarks/results/**/*.log
+/benchmarks/results/**/*.out
+/benchmarks/results/**/2026*.sh
