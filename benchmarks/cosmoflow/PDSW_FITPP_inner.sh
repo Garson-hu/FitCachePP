@@ -37,6 +37,14 @@ mkdir -p "$RESULTS_DIR"
 # the cd inside command_CF_FITPP.sh).
 cd "$RESULTS_DIR"
 
+# Pin the .ports.cfg.<JOBID> location so server (which lands here after
+# `cd "$RESULTS_DIR"`) and client (which cd's into the training dir for
+# configs/cosmo.yaml inside command_CF_FITPP.sh) agree on where to write
+# and read the server-endpoint config. Without this, the client's
+# fitcache_client_comm_lookup_addr can't find the .ports.cfg and either
+# segfaults (if not patched) or returns NULL hg_addr.
+export FitCache_PORTS_CFG_DIR="$RESULTS_DIR"
+
 # FitCache_SERVER_COUNT must equal SERVERS_PER_NODE * (number of server
 # nodes). Inner script handles single-node only; multi-node would need a
 # different orchestration pattern.

@@ -137,8 +137,17 @@ void fitcache_comm_list_addr() {
     hg_size_t self_addr_string_size = PATH_MAX;
 
     char *jobid =  getenv("SLURM_JOBID");
-    L4C_INFO("JOB_ID: %s\n", jobid); 
-    sprintf(filename, "./.ports.cfg.%s", jobid);
+    L4C_INFO("JOB_ID: %s\n", jobid);
+    // Resolve the .ports.cfg directory. When FitCache_PORTS_CFG_DIR is set
+    // (the cluster benchmark scripts do this so the server and client agree
+    // on the path regardless of who cd'd where), use it. Otherwise fall back
+    // to "./" so single-process smokes that share a CWD still work.
+    const char *ports_dir = getenv("FitCache_PORTS_CFG_DIR");
+    if (ports_dir && ports_dir[0]) {
+        snprintf(filename, PATH_MAX, "%s/.ports.cfg.%s", ports_dir, jobid);
+    } else {
+        snprintf(filename, PATH_MAX, "./.ports.cfg.%s", jobid);
+    }
 
     /* Get self addr to tell client about */
     HG_Addr_self(hg_class, &self_addr);

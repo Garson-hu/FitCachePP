@@ -850,8 +850,28 @@ hg_addr_t fitcache_client_comm_lookup_addr(int rank)
 	hg_addr_t target_server = nullptr;
 	bool svr_found = false;
 	FILE *na_config = NULL;
-	sprintf(filename, "./.ports.cfg.%s", jobid);
-	na_config = fopen(filename,"r+");
+	// Resolve the .ports.cfg directory. See fitcache_comm.cpp's matching
+	// resolver — both ends must agree, and FitCache_PORTS_CFG_DIR lets the
+	// benchmark scripts pin the location so server cwd and client cwd
+	// divergence (server cd's to $RESULTS_DIR, client cd's to the training
+	// dir for its yaml) doesn't break server discovery.
+	const char *ports_dir = getenv("FitCache_PORTS_CFG_DIR");
+	if (ports_dir && ports_dir[0]) {
+		snprintf(filename, PATH_MAX, "%s/.ports.cfg.%s", ports_dir, jobid);
+	} else {
+		snprintf(filename, PATH_MAX, "./.ports.cfg.%s", jobid);
+	}
+	na_config = fopen(filename, "r+");
+	if (!na_config) {
+		// Server's ports config not visible from the client. Common cause:
+		// server and client diverged on cwd and FitCache_PORTS_CFG_DIR isn't
+		// set. Returning NULL hg_addr lets callers degrade gracefully (the
+		// RPC will fail-fast via the per-file sync context error path
+		// that was added when the silent-hang-on-NULL-lookup bug was fixed).
+		L4C_ERR("lookup_addr: cannot open %s (errno=%d %s) — server unreachable",
+		        filename, errno, strerror(errno));
+		return nullptr;
+	}
 
 	while (fscanf(na_config, "%d %s\n",&svr_rank, svr_str) == 2)
 	{
