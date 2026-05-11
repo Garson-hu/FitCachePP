@@ -121,8 +121,17 @@ for pm in "${PM_NODES[@]}"; do
     for j in $(seq 0 $((SERVERS_PER_PM_NODE - 1))); do
         PORT=$((BASE_PORT + GLOBAL_SERVER_ID))
         echo "[$(date '+%H:%M:%S')] starting server proc=$GLOBAL_SERVER_ID on $pm:$PORT"
-        SLURM_PROCID=$GLOBAL_SERVER_ID FitCache_SERVER_PORT=$PORT \
-            mpirun -N 1 -host "$pm" "$SERVER_BIN" "$FitCache_SERVER_COUNT" \
+        # Use srun rather than mpirun so SLURM_PROCID + FitCache_SERVER_PORT
+        # actually reach the remote process. mpirun -N 1 -host strips the
+        # caller's env vars (mpirun launches a fresh shell on the remote
+        # node), which made every server on c35 default to SLURM_PROCID=0
+        # and all 4 lines in .ports.cfg ended up labelled rank 0
+        # (observed in cancelled 221641).
+        # `bash -c '...'` is the standard idiom for passing both env vars
+        # and the command together through srun.
+        srun --jobid=$SLURM_JOB_ID -N1 -n1 -w "$pm" \
+            --export=ALL,SLURM_PROCID=$GLOBAL_SERVER_ID,FitCache_SERVER_PORT=$PORT \
+            "$SERVER_BIN" "$FitCache_SERVER_COUNT" \
             > "$RESULTS_DIR/server_${SLURM_JOB_ID}_${pm}_id${GLOBAL_SERVER_ID}.log" 2>&1 &
         SERVER_PIDS+=($!)
         GLOBAL_SERVER_ID=$((GLOBAL_SERVER_ID + 1))
