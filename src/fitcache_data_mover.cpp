@@ -328,11 +328,26 @@ void *fitcache_data_mover_fn(void *args)
 
     while (1) {
         pthread_mutex_lock(&data_mutex);
-        pthread_cond_wait(&data_cond, &data_mutex);
-        
+        // BUG FIX (2026-05-11): the previous unconditional pthread_cond_wait
+        // dropped signals fired while the mover was busy. Producer (close
+        // RPC handler) signals after pushing to data_queue; if the consumer
+        // is still processing a prior batch when the signal fires, the
+        // signal is lost (pthread_cond_signal has no memory of unconsumed
+        // signals). The consumer then loops back to wait() with files still
+        // in queue but no remaining signal to wake it — the queue gets
+        // stuck forever. Reproduced via the Megatron access-pattern smoke:
+        // a 2-file workload (.bin + .idx) consistently leaves the second
+        // file unprocessed. The standard pthread_cond pattern is to test
+        // the predicate (queue non-empty) before AND after waking, which
+        // turns the wait into a no-op when work is already pending.
+        while (data_queue.empty()) {
+            pthread_cond_wait(&data_cond, &data_mutex);
+        }
+
         int queue_size = data_queue.size();
         L4C_INFO("DEBUG: Data queue size: %d", queue_size);
-        /* We can do stuff here when signaled */
+        /* Drain the queue under the mutex into a local list, then process
+         * outside the lock so producers can keep pushing during the copy. */
         while (!data_queue.empty()){
             local_list.push(data_queue.front());
             data_queue.pop();
