@@ -29,6 +29,14 @@ SERVER_BIN=/home/ghu4/hvac/FitCachePP/build/src/fitcache_server
 RESULTS_DIR="${RESULTS_DIR:-/home/ghu4/hvac/FitCachePP/benchmarks/results/job_${SLURM_JOB_ID}}"
 mkdir -p "$RESULTS_DIR"
 
+# Run the server processes with $RESULTS_DIR as their CWD so log4c's per-pid
+# files (fitcache_server_log.<pid>.<rank>) land alongside the rest of the
+# job's outputs instead of polluting the repo root. The horovodrun client
+# also runs from here (CWD inherits to its children — the LD_PRELOAD'd
+# python doesn't care about the cwd since it gets configs/cosmo.yaml via
+# the cd inside command_CF_FITPP.sh).
+cd "$RESULTS_DIR"
+
 # FitCache_SERVER_COUNT must equal SERVERS_PER_NODE * (number of server
 # nodes). Inner script handles single-node only; multi-node would need a
 # different orchestration pattern.
@@ -77,6 +85,27 @@ sleep 2
 for pid in "${SERVER_PIDS[@]}"; do
     kill -9 "$pid" 2>/dev/null || true
 done
+
+# Engagement self-check. A FitCache cluster run is only quotable if at least
+# one server actually saw an "Open RPC: requested path" message — otherwise
+# the LD_PRELOAD client never intercepted, every read went straight to the
+# PFS, and the resulting epoch timings tell us nothing about FitCache. This
+# happened across 2026-05-11's cluster runs (root cause: FitCache_DATA_DIR
+# vs train.py --data-dir mismatch); the check below prevents it from
+# happening silently again.
+OPEN_RPC_COUNT=$(grep -c 'Open RPC: requested path' "$RESULTS_DIR"/fitcache_server_log.*.0 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
+if [ "$OPEN_RPC_COUNT" -eq 0 ]; then
+    echo "[$(date '+%H:%M:%S')] !!! WARNING !!! Zero 'Open RPC: requested path' lines found in"
+    echo "                $RESULTS_DIR/fitcache_server_log.*.0"
+    echo "                FitCache was NOT engaged this run. Most likely cause:"
+    echo "                FitCache_DATA_DIR ($FitCache_DATA_DIR) doesn't match the path"
+    echo "                train.py actually reads (check configs/cosmo.yaml and the"
+    echo "                --data-dir passed in command_CF_FITPP.sh). Epoch timings"
+    echo "                from this run are NOT FitCache-attributable."
+    # Don't fail the job — that loses the partial result. But flag it loud.
+else
+    echo "[$(date '+%H:%M:%S')] FitCache engaged: $OPEN_RPC_COUNT Open RPCs handled across all servers"
+fi
 
 echo "[$(date '+%H:%M:%S')] DONE FitCache++ inner (job $SLURM_JOB_ID, horovod_rc=$HOROVOD_RC)"
 exit $HOROVOD_RC
