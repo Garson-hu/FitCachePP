@@ -114,6 +114,15 @@ void release_self_from_local_dataset();
 // startup, after which subscriber-GC could prune the entry mid-run.
 void renew_self_dataset_lease();
 
+// Read this process's dataset_id manifest_hash (computed by
+// subscribe_self_to_local_dataset via build_dataset_id). Returns 0 if the
+// process never subscribed. The data mover passes this into sidecar writes
+// so the on-disk metadata records the dataset the cached file belongs to —
+// preventing a future restored server from associating a sidecar with the
+// wrong dataset (and also enabling the design-doc "refuse sharing between
+// jobs whose datasets diverged" check downstream).
+uint64_t get_self_dataset_manifest_hash();
+
 // Cross-job telemetry counters. Bumped from the server's open + peer-lookup
 // code paths so that experiments can verify which paths actually fired
 // (vs. were merely defined). Log periodically from the heartbeat thread

@@ -242,15 +242,25 @@ void subscribe_self_to_local_dataset() {
         return;
     }
 
-    // Lightweight dataset_id: root_path_hash only. The full manifest-hash
-    // scan in fitcache::build_dataset_id is deferred — we don't currently
-    // gate any behavior on manifest equality, so a placeholder identical
-    // to root_path_hash is sufficient.
-    std::memset(&g_self_dataset_id, 0, sizeof(g_self_dataset_id));
-    std::strncpy(g_self_dataset_id.name, "fitcache-default",
-                 sizeof(g_self_dataset_id.name) - 1);
-    g_self_dataset_id.root_path_hash = fitcache_dataset_root_path_hash(data_dir);
-    g_self_dataset_id.manifest_hash  = g_self_dataset_id.root_path_hash;
+    // Full dataset_id: root_path_hash AND a manifest_hash derived from the
+    // sorted (path, size, mtime) tuples under data_dir. This is what the
+    // design-doc cross-job-sharing protocol needs to refuse sharing between
+    // jobs whose datasets have diverged (e.g. one has extra training files
+    // the other doesn't). build_dataset_id caches the manifest scan on disk
+    // (`<data_dir>/.fitcache_dataset.v1`) so the cost is paid once per
+    // startup and reused across subsequent processes.
+    g_self_dataset_id = fitcache::build_dataset_id(
+        data_dir, "fitcache-default", /*sample_count=*/0);
+    // If build_dataset_id produced an all-zero result (e.g. data_dir didn't
+    // exist or scan failed), fall back to the lightweight root_path_hash so
+    // the subscribe call still has something usable.
+    if (g_self_dataset_id.root_path_hash == 0) {
+        std::memset(&g_self_dataset_id, 0, sizeof(g_self_dataset_id));
+        std::strncpy(g_self_dataset_id.name, "fitcache-default",
+                     sizeof(g_self_dataset_id.name) - 1);
+        g_self_dataset_id.root_path_hash = fitcache_dataset_root_path_hash(data_dir);
+        g_self_dataset_id.manifest_hash  = g_self_dataset_id.root_path_hash;
+    }
 
     g_self_jobid = derive_jobid();
     uint64_t lease_until = derive_lease_until();
@@ -265,6 +275,11 @@ void subscribe_self_to_local_dataset() {
     } else {
         L4C_WARN("subscribe-self: registry_subscribe_dataset failed (rc=%d)", rc);
     }
+}
+
+uint64_t get_self_dataset_manifest_hash() {
+    std::lock_guard<std::mutex> lock(g_subscribe_mtx);
+    return g_self_subscribed ? g_self_dataset_id.manifest_hash : 0;
 }
 
 void renew_self_dataset_lease() {

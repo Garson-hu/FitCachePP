@@ -419,11 +419,16 @@ void *fitcache_data_mover_fn(void *args)
                 // Only meaningful in cross-job mode; in single-job mode the
                 // sidecar is harmless extra metadata.
                 if (fitcache::cross_job_enabled()) {
+                    // Tag the sidecar with this process's dataset manifest_hash
+                    // (populated by subscribe_self_to_local_dataset via the full
+                    // build_dataset_id scan). 0 means "this process never
+                    // subscribed", which is the smoke-test path; production
+                    // server startup always subscribes before promotions.
                     fitcache::fitcache_file_meta_v1 meta =
                         fitcache::meta_make_initial(
                             original_path,
                             file_size,
-                            /*dataset_id_hash=*/0);  // TODO: wire dataset_id
+                            fitcache::get_self_dataset_manifest_hash());
                     if (fitcache::meta_write_sidecar(filename, meta) != 0) {
                         L4C_WARN("Data mover: failed to write sidecar for %s",
                                  filename.c_str());
