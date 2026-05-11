@@ -98,6 +98,23 @@ cd "$RESULTS_DIR"
 export FITPP_N_TRAIN=${FITPP_N_TRAIN:-61440}
 echo "FITPP_N_TRAIN=$FITPP_N_TRAIN  (IPDPS used 61440)"
 
+# ---------------- Optional: drop OS page cache for true cold-cache experiments -----
+# FITPP_DROP_PAGECACHE=1 evicts the dataset from page cache on BOTH the
+# storage node (c35) and the GPU client node (c66 etc.) before training
+# starts. Uses posix_fadvise(POSIX_FADV_DONTNEED) — no sudo required.
+# Critical for the cold-epoch measurement to be I/O-bound rather than
+# RAM-resident (c66 has 188 GiB RAM, full train_61440 dataset is 167 GiB,
+# so without eviction the entire dataset fits in page cache).
+if [ "${FITPP_DROP_PAGECACHE:-0}" = "1" ]; then
+    EVICT_TOOL=/home/ghu4/hvac/FitCachePP/scripts/evict_page_cache.py
+    EVICT_TARGETS=("$FitCache_DATA_DIR")
+    for n in "${PM_NODES[@]}" "${CLIENT_NODES[@]}"; do
+        echo "[$(date '+%H:%M:%S')] evicting dataset from page cache on $n"
+        srun -N1 -n1 -w "$n" --jobid=$SLURM_JOB_ID \
+            python3 "$EVICT_TOOL" "${EVICT_TARGETS[@]}" 2>&1 | sed "s/^/  [$n] /" || true
+    done
+fi
+
 # ---------------- Pre-create cache dirs on each PM node ----------------
 # Skip entirely in Pure_CF mode — no FitCache servers will run, no cache
 # tiers needed. Pure_CF reads BeeGFS direct from the GPU client.
