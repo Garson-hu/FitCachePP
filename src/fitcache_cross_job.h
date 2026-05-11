@@ -106,6 +106,43 @@ int register_endpoint(const std::string &addr);
 void subscribe_self_to_local_dataset();
 void release_self_from_local_dataset();
 
+// Cross-job telemetry counters. Bumped from the server's open + peer-lookup
+// code paths so that experiments can verify which paths actually fired
+// (vs. were merely defined). Log periodically from the heartbeat thread
+// and once at server shutdown via log_cross_job_stats().
+struct CrossJobCounters {
+    uint64_t opens_total;             // every fitcache_open_rpc_handler entry
+    uint64_t opens_local_hit;         // path was already in path_cache_map
+    uint64_t opens_redirect_to_peer;  // peer-lookup returned has=1; redirected
+    uint64_t opens_pfs_fallback;      // open returned via PFS path (no peer)
+    uint64_t peer_lookup_forwarded;   // outgoing peer_lookup_rpc HG_Forward OK
+    uint64_t peer_lookup_handled;     // incoming peer_lookup_rpc handler entry
+    uint64_t peer_lookup_has_yes;     // peer handler returned has=1
+    uint64_t peer_lookup_has_no;      // peer handler returned has=0
+};
+
+// Read a snapshot of the counters (no internal locking — values are atomic
+// but the snapshot is non-atomic with respect to in-flight increments, which
+// is fine for logging).
+CrossJobCounters cross_job_counters_snapshot();
+
+// Per-event bump helpers. Cheap (one atomic increment); safe to call from
+// any thread including Mercury handler threads.
+void cross_job_counter_bump_opens_total();
+void cross_job_counter_bump_opens_local_hit();
+void cross_job_counter_bump_opens_redirect_to_peer();
+void cross_job_counter_bump_opens_pfs_fallback();
+void cross_job_counter_bump_peer_lookup_forwarded();
+void cross_job_counter_bump_peer_lookup_handled();
+void cross_job_counter_bump_peer_lookup_has_yes();
+void cross_job_counter_bump_peer_lookup_has_no();
+
+// Emit one L4C_INFO line summarising the counters. Includes a delta vs. the
+// previous call so periodic logging shows recent activity, not just the
+// cumulative total. The first call shows totals only (no delta available).
+// `server_rank` is informational so cluster experiments can grep per-server.
+void log_cross_job_stats(int server_rank);
+
 }  // namespace fitcache
 
 #endif  // __cplusplus

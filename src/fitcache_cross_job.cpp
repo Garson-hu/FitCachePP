@@ -22,6 +22,7 @@ extern "C" {
 #include <unistd.h>            // getpid()
 }
 
+#include <atomic>
 #include <ctime>
 #include <cstdlib>
 #include <cstring>
@@ -276,6 +277,91 @@ void release_self_from_local_dataset() {
         L4C_WARN("release-self: registry_release_dataset failed (rc=%d)", rc);
     }
     g_self_subscribed = false;
+}
+
+// ----------------------------------------------------------------------------
+// Cross-job telemetry counters.
+// Atomics; readers take a snapshot via cross_job_counters_snapshot(). Bumps
+// are constant-time and lock-free; no contention path in the open/read RPC
+// handlers.
+// ----------------------------------------------------------------------------
+namespace {
+
+std::atomic<uint64_t> g_opens_total{0};
+std::atomic<uint64_t> g_opens_local_hit{0};
+std::atomic<uint64_t> g_opens_redirect_to_peer{0};
+std::atomic<uint64_t> g_opens_pfs_fallback{0};
+std::atomic<uint64_t> g_peer_lookup_forwarded{0};
+std::atomic<uint64_t> g_peer_lookup_handled{0};
+std::atomic<uint64_t> g_peer_lookup_has_yes{0};
+std::atomic<uint64_t> g_peer_lookup_has_no{0};
+
+std::mutex            g_stats_log_mtx;
+CrossJobCounters      g_stats_last_logged = {};
+bool                  g_stats_have_baseline = false;
+
+}  // namespace
+
+CrossJobCounters cross_job_counters_snapshot() {
+    CrossJobCounters c;
+    c.opens_total            = g_opens_total.load();
+    c.opens_local_hit        = g_opens_local_hit.load();
+    c.opens_redirect_to_peer = g_opens_redirect_to_peer.load();
+    c.opens_pfs_fallback     = g_opens_pfs_fallback.load();
+    c.peer_lookup_forwarded  = g_peer_lookup_forwarded.load();
+    c.peer_lookup_handled    = g_peer_lookup_handled.load();
+    c.peer_lookup_has_yes    = g_peer_lookup_has_yes.load();
+    c.peer_lookup_has_no     = g_peer_lookup_has_no.load();
+    return c;
+}
+
+void cross_job_counter_bump_opens_total()            { g_opens_total.fetch_add(1, std::memory_order_relaxed); }
+void cross_job_counter_bump_opens_local_hit()        { g_opens_local_hit.fetch_add(1, std::memory_order_relaxed); }
+void cross_job_counter_bump_opens_redirect_to_peer() { g_opens_redirect_to_peer.fetch_add(1, std::memory_order_relaxed); }
+void cross_job_counter_bump_opens_pfs_fallback()     { g_opens_pfs_fallback.fetch_add(1, std::memory_order_relaxed); }
+void cross_job_counter_bump_peer_lookup_forwarded()  { g_peer_lookup_forwarded.fetch_add(1, std::memory_order_relaxed); }
+void cross_job_counter_bump_peer_lookup_handled()    { g_peer_lookup_handled.fetch_add(1, std::memory_order_relaxed); }
+void cross_job_counter_bump_peer_lookup_has_yes()    { g_peer_lookup_has_yes.fetch_add(1, std::memory_order_relaxed); }
+void cross_job_counter_bump_peer_lookup_has_no()     { g_peer_lookup_has_no.fetch_add(1, std::memory_order_relaxed); }
+
+void log_cross_job_stats(int server_rank) {
+    CrossJobCounters cur = cross_job_counters_snapshot();
+
+    std::lock_guard<std::mutex> lock(g_stats_log_mtx);
+    if (!g_stats_have_baseline) {
+        L4C_INFO("cross_job_stats[rank=%d]: opens_total=%lu local_hit=%lu "
+                 "redirect_to_peer=%lu pfs_fallback=%lu | "
+                 "peer_lookup forwarded=%lu handled=%lu has_yes=%lu has_no=%lu "
+                 "(first sample; no delta)",
+                 server_rank,
+                 (unsigned long)cur.opens_total,
+                 (unsigned long)cur.opens_local_hit,
+                 (unsigned long)cur.opens_redirect_to_peer,
+                 (unsigned long)cur.opens_pfs_fallback,
+                 (unsigned long)cur.peer_lookup_forwarded,
+                 (unsigned long)cur.peer_lookup_handled,
+                 (unsigned long)cur.peer_lookup_has_yes,
+                 (unsigned long)cur.peer_lookup_has_no);
+        g_stats_last_logged = cur;
+        g_stats_have_baseline = true;
+        return;
+    }
+
+    const CrossJobCounters &p = g_stats_last_logged;
+    L4C_INFO("cross_job_stats[rank=%d]: opens_total=%lu(+%lu) local_hit=%lu(+%lu) "
+             "redirect_to_peer=%lu(+%lu) pfs_fallback=%lu(+%lu) | "
+             "peer_lookup forwarded=%lu(+%lu) handled=%lu(+%lu) "
+             "has_yes=%lu(+%lu) has_no=%lu(+%lu)",
+             server_rank,
+             (unsigned long)cur.opens_total,            (unsigned long)(cur.opens_total            - p.opens_total),
+             (unsigned long)cur.opens_local_hit,        (unsigned long)(cur.opens_local_hit        - p.opens_local_hit),
+             (unsigned long)cur.opens_redirect_to_peer, (unsigned long)(cur.opens_redirect_to_peer - p.opens_redirect_to_peer),
+             (unsigned long)cur.opens_pfs_fallback,     (unsigned long)(cur.opens_pfs_fallback     - p.opens_pfs_fallback),
+             (unsigned long)cur.peer_lookup_forwarded,  (unsigned long)(cur.peer_lookup_forwarded  - p.peer_lookup_forwarded),
+             (unsigned long)cur.peer_lookup_handled,    (unsigned long)(cur.peer_lookup_handled    - p.peer_lookup_handled),
+             (unsigned long)cur.peer_lookup_has_yes,    (unsigned long)(cur.peer_lookup_has_yes    - p.peer_lookup_has_yes),
+             (unsigned long)cur.peer_lookup_has_no,     (unsigned long)(cur.peer_lookup_has_no     - p.peer_lookup_has_no));
+    g_stats_last_logged = cur;
 }
 
 }  // namespace fitcache

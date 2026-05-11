@@ -43,6 +43,12 @@ static void *fitcache_heartbeat_fn(void *arg)
         if (!g_running) break;
         fitcache::registry_heartbeat(rank);
         fitcache::registry_gc_stale();
+        // Emit a periodic cross-job counters snapshot. Cheap; one L4C_INFO
+        // line per heartbeat. The snapshot includes per-counter delta vs.
+        // the previous emit, which is what experiment analysis usually wants.
+        if (fitcache::cross_job_enabled()) {
+            fitcache::log_cross_job_stats(rank);
+        }
     }
     return nullptr;
 }
@@ -60,6 +66,12 @@ void signal_exit(int signum)
               << ", exiting...\n";
 
     g_running = false;
+
+    // Final cross-job counters dump so post-run analysis has the totals even
+    // when the process is signalled before the next heartbeat fires.
+    if (fitcache::cross_job_enabled()) {
+        fitcache::log_cross_job_stats(fitcache_server_rank);
+    }
 
     std::exit(0);
 }

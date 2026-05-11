@@ -77,6 +77,7 @@ static void state_release(OpenPeerLookupState *st) {
 // Open the file from PFS as the original handler did, then respond.
 // Caller must guarantee st->responded is now true (set under respond_mtx).
 static void respond_open_pfs(OpenPeerLookupState *st) {
+    fitcache::cross_job_counter_bump_opens_pfs_fallback();
     fitcache_open_out_t out;
     out.ret_status = open(st->original_path.c_str(), O_RDONLY);
     out.peer_addr  = const_cast<char*>("");
@@ -95,6 +96,7 @@ static void respond_open_pfs(OpenPeerLookupState *st) {
 // Tell the client to retry the open against st->peer_addr_winner.
 // Caller must guarantee st->responded is now true.
 static void respond_open_redirect(OpenPeerLookupState *st) {
+    fitcache::cross_job_counter_bump_opens_redirect_to_peer();
     fitcache_open_out_t out;
     out.ret_status = FITCACHE_OPEN_REDIRECT;
     out.peer_addr  = const_cast<char*>(st->peer_addr_winner.c_str());
@@ -152,6 +154,7 @@ fitcache_open_rpc_handler(hg_handle_t handle)
     std::string path_str = in.path;     // copy out before freeing input
     HG_Free_input(handle, &in);
 
+    fitcache::cross_job_counter_bump_opens_total();
     L4C_INFO("Open RPC: requested path %s", path_str.c_str());
 
     // 1. Local cache hit?
@@ -167,6 +170,7 @@ fitcache_open_rpc_handler(hg_handle_t handle)
     }
 
     if (local_hit) {
+        fitcache::cross_job_counter_bump_opens_local_hit();
         L4C_INFO("Server Rank %d : Successful Redirection %s to %s",
                  server_rank, path_str.c_str(), redir_path.c_str());
         fitcache_open_out_t out;
@@ -234,6 +238,7 @@ fitcache_open_rpc_handler(hg_handle_t handle)
                     --st->responses_remaining;
                     continue;
                 }
+                fitcache::cross_job_counter_bump_peer_lookup_forwarded();
                 ++forwards_issued;
             }
 
@@ -258,6 +263,7 @@ fitcache_open_rpc_handler(hg_handle_t handle)
     }
 
     // 3. PFS fallback (existing single-job behaviour).
+    fitcache::cross_job_counter_bump_opens_pfs_fallback();
     fitcache_open_out_t out;
     out.ret_status = open(path_str.c_str(), O_RDONLY);
     out.peer_addr  = const_cast<char*>("");
@@ -531,6 +537,8 @@ fitcache_peer_lookup_rpc_handler(hg_handle_t handle)
     int ret = HG_Get_input(handle, &in);
     assert(ret == HG_SUCCESS);
 
+    fitcache::cross_job_counter_bump_peer_lookup_handled();
+
     bool found = false;
     {
         std::shared_lock<std::shared_mutex> rlock(cache_mtx);
@@ -541,12 +549,14 @@ fitcache_peer_lookup_rpc_handler(hg_handle_t handle)
     const std::string &my_addr = fitcache_comm_get_self_addr_string();
 
     if (found) {
+        fitcache::cross_job_counter_bump_peer_lookup_has_yes();
         out.has        = 1;
         out.tier       = (int32_t)CACHE_TIER_DRAM;
         out.serve_addr = const_cast<char *>(my_addr.c_str());
         L4C_INFO("peer_lookup: rank=%d path=%s -> HAS (serve_addr=%s)",
                  server_rank, in.path, my_addr.c_str());
     } else {
+        fitcache::cross_job_counter_bump_peer_lookup_has_no();
         out.has        = 0;
         out.tier       = 0;
         out.serve_addr = const_cast<char *>("");
