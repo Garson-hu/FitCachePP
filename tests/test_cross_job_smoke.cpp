@@ -16,6 +16,7 @@
 #include "../src/fitcache_dataset_id.h"
 #include "../src/fitcache_cross_job.h"
 #include "../src/fitcache_cluster_registry.h"
+#include "../src/fitcache_persistent_meta.h"
 
 #include <cassert>
 #include <cstdint>
@@ -319,20 +320,112 @@ static int test_routing_select_and_slot_addr() {
     return 0;
 }
 
+// Sidecar metadata coverage: write/read roundtrip, refcount mutation,
+// scan + quarantine of corrupt sidecars.
+static int test_sidecar_persistent_meta() {
+    using namespace fitcache;
+
+    fs::path tmp = fs::temp_directory_path() /
+                   ("fitcache_test_meta_" + std::to_string(getpid()));
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    // Synthetic cached file (just an empty data file under the tier).
+    fs::path data_file = tmp / "ab" / "cd" / "file_42.bin";
+    fs::create_directories(data_file.parent_path());
+    std::ofstream(data_file).put('x');
+
+    // 1. write_sidecar + read_sidecar roundtrip
+    fitcache_file_meta_v1 m = meta_make_initial(
+        "/orig/path/to/file_42.bin", /*size=*/4096, /*ds_hash=*/0xdeadbeef12345678ULL);
+    CHECK(meta_write_sidecar(data_file.string(), m) == 0,
+          "meta_write_sidecar failed");
+
+    fitcache_file_meta_v1 readback;
+    CHECK(meta_read_sidecar(data_file.string(), &readback) == 0,
+          "meta_read_sidecar failed");
+    CHECK(readback.magic == FITCACHE_META_MAGIC, "magic round-trip mismatch");
+    CHECK(readback.version == FITCACHE_META_VERSION, "version round-trip mismatch");
+    CHECK(readback.dataset_id_hash == 0xdeadbeef12345678ULL, "ds_hash round-trip");
+    CHECK(readback.original_size == 4096, "original_size round-trip");
+    CHECK(std::strcmp(readback.original_path, "/orig/path/to/file_42.bin") == 0,
+          "original_path round-trip");
+    CHECK(readback.refcount == 0, "initial refcount should be 0");
+    std::printf("  ok: sidecar write/read roundtrip\n");
+
+    // 2. bump and drop refcount
+    int rc = meta_bump_refcount(data_file.string());
+    CHECK(rc == 1, "bump from 0 should yield 1");
+    rc = meta_bump_refcount(data_file.string());
+    CHECK(rc == 2, "bump again should yield 2");
+    rc = meta_drop_refcount(data_file.string());
+    CHECK(rc == 1, "drop should yield 1");
+    rc = meta_drop_refcount(data_file.string());
+    CHECK(rc == 0, "drop should yield 0");
+    rc = meta_drop_refcount(data_file.string());
+    CHECK(rc == 0, "drop below 0 should clamp to 0");
+    std::printf("  ok: refcount bump/drop, clamp-at-zero\n");
+
+    // 3. scan_tier_dir finds our valid sidecar
+    int found = 0;
+    int n = meta_scan_tier_dir(tmp.string(),
+        [&](const std::string &cached_path, const fitcache_file_meta_v1 &meta) {
+            CHECK(cached_path == data_file.string(),
+                  "scan returned unexpected cached_path");
+            CHECK(meta.dataset_id_hash == 0xdeadbeef12345678ULL,
+                  "scan returned unexpected ds_hash");
+            ++found;
+        });
+    CHECK(n == 1 && found == 1, "scan should find exactly 1 sidecar");
+    std::printf("  ok: scan_tier_dir found %d sidecar(s)\n", n);
+
+    // 4. corrupt sidecar gets quarantined to .broken
+    fs::path data_file2 = tmp / "ef" / "01" / "file_99.bin";
+    fs::create_directories(data_file2.parent_path());
+    std::ofstream(data_file2).put('y');
+    {
+        std::ofstream f(data_file2.string() + ".meta");
+        f << "garbage not a valid sidecar";
+    }
+    int n2 = meta_scan_tier_dir(tmp.string(),
+        [&](const std::string &, const fitcache_file_meta_v1 &) {});
+    // Only the GOOD sidecar should be visited; the corrupt one should be
+    // quarantined to .broken and skipped.
+    CHECK(n2 == 1, "corrupt sidecar should not be counted as valid");
+    CHECK(fs::exists(data_file2.string() + ".meta.broken"),
+          "corrupt sidecar should be renamed to .broken");
+    CHECK(!fs::exists(data_file2.string() + ".meta"),
+          "corrupt sidecar original should be gone (renamed)");
+    std::printf("  ok: corrupt sidecar quarantined to .broken\n");
+
+    // 5. orphaned sidecar (data file deleted) — scan reports 0 valid
+    // (orphans are skipped without quarantine)
+    fs::remove(data_file);  // delete the data file but keep its sidecar
+    int n3 = meta_scan_tier_dir(tmp.string(),
+        [&](const std::string &, const fitcache_file_meta_v1 &) {});
+    CHECK(n3 == 0, "orphaned sidecar should not be counted");
+    std::printf("  ok: orphaned sidecar skipped\n");
+
+    fs::remove_all(tmp);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
     std::printf("FitCache++ cross-job smoke test\n");
-    std::printf("[1/5] FNV-1a vectors...\n");
+    std::printf("[1/6] FNV-1a vectors...\n");
     test_fnv1a_stable();
-    std::printf("[2/5] HRW routing...\n");
+    std::printf("[2/6] HRW routing...\n");
     test_hrw_basic();
-    std::printf("[3/5] dataset_id...\n");
+    std::printf("[3/6] dataset_id...\n");
     test_dataset_id();
-    std::printf("[4/5] cluster registry roundtrip (will sleep ~4s for stale "
+    std::printf("[4/6] cluster registry roundtrip (will sleep ~4s for stale "
                 "heartbeat check)...\n");
     test_registry_roundtrip();
-    std::printf("[5/5] client-side routing (select_server_for_path + slot_to_addr)...\n");
+    std::printf("[5/6] client-side routing (select_server_for_path + slot_to_addr)...\n");
     test_routing_select_and_slot_addr();
+    std::printf("[6/6] sidecar persistent metadata...\n");
+    test_sidecar_persistent_meta();
     std::printf("\nALL SMOKE TESTS PASSED\n");
     return 0;
 }

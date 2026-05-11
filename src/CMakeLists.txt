@@ -5,11 +5,12 @@ pkg_check_modules(LOG4C REQUIRED IMPORTED_TARGET log4c)
 include_directories("$ENV{CONDA_PREFIX}/include")
 link_directories("$ENV{CONDA_PREFIX}/lib")
 
-# TPDS extension sources shared by client and server
+# Cross-job extension sources shared by client and server
 set(FITCACHE_TPDS_SOURCES
     fitcache_cross_job.cpp
     fitcache_dataset_id.cpp
     fitcache_cluster_registry.cpp
+    fitcache_persistent_meta.cpp
 )
 
 #Dynamic Target

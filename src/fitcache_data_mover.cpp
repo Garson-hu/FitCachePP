@@ -12,6 +12,8 @@
 #include "fitcache_logging.h"
 #include "fitcache_data_mover_internal.h"
 #include "fitcache_cache_policy.h"
+#include "fitcache_cross_job.h"
+#include "fitcache_persistent_meta.h"
 using namespace std;
 namespace fs = std::filesystem;
 
@@ -30,6 +32,48 @@ unordered_map<string, string> path_cache_map;     // & Original path -> Redirect
 shared_mutex cache_mtx;                       // & Mutex for the path cache
 
 queue<string> data_queue;               // & List of files to be moved
+
+int fitcache_data_mover_restore_from_sidecars()
+{
+    const char *dram_env = getenv("FitCache_DRAM_PATH");
+    const char *nvme_env = getenv("FitCache_NVME_PATH");
+    if (!dram_env && !nvme_env) {
+        L4C_WARN("restore-sidecars: neither FitCache_DRAM_PATH nor "
+                 "FitCache_NVME_PATH set; nothing to scan");
+        return -1;
+    }
+
+    int total_restored = 0;
+
+    auto restore_one = [&](bool to_dram) {
+        return [&, to_dram](const std::string &cached_path,
+                            const fitcache::fitcache_file_meta_v1 &meta) {
+            std::unique_lock<std::shared_mutex> wlock(cache_mtx);
+            path_cache_map[meta.original_path] = cached_path;
+            if (to_dram) g_dram_used_bytes += meta.original_size;
+            else         g_nvme_used_bytes += meta.original_size;
+        };
+    };
+
+    if (dram_env && dram_env[0]) {
+        int n = fitcache::meta_scan_tier_dir(dram_env, restore_one(true));
+        if (n > 0) {
+            L4C_INFO("restore-sidecars: restored %d files from DRAM tier %s",
+                     n, dram_env);
+            total_restored += n;
+        }
+    }
+    if (nvme_env && nvme_env[0]) {
+        int n = fitcache::meta_scan_tier_dir(nvme_env, restore_one(false));
+        if (n > 0) {
+            L4C_INFO("restore-sidecars: restored %d files from NVMe tier %s",
+                     n, nvme_env);
+            total_restored += n;
+        }
+    }
+    L4C_INFO("restore-sidecars: total restored = %d", total_restored);
+    return total_restored;
+}
 
 void *fitcache_data_mover_fn(void *args)
 {
@@ -148,11 +192,30 @@ void *fitcache_data_mover_fn(void *args)
                 if(DEBUG_HU)
                     L4C_INFO("Data mover: Copied %s -> %s using simple hash buckets", original_path.c_str(), filename.c_str());
 
+                // Cross-job durability: write a sidecar so this cache survives
+                // server restart and can be discovered by peer-job lookups.
+                // Only meaningful in cross-job mode; in single-job mode the
+                // sidecar is harmless extra metadata.
+                if (fitcache::cross_job_enabled()) {
+                    fitcache::fitcache_file_meta_v1 meta =
+                        fitcache::meta_make_initial(
+                            original_path,
+                            file_size,
+                            /*dataset_id_hash=*/0);  // TODO: wire dataset_id
+                    if (fitcache::meta_write_sidecar(filename, meta) != 0) {
+                        L4C_WARN("Data mover: failed to write sidecar for %s",
+                                 filename.c_str());
+                    } else if (DEBUG_HU) {
+                        L4C_INFO("Data mover: wrote sidecar for %s",
+                                 filename.c_str());
+                    }
+                }
+
             } catch (const fs::filesystem_error& e)
             {
                 fprintf(stderr, "Error : %s copying from %s to %s\n", e.what(), original_path.c_str(), filename.c_str());
                 L4C_INFO("Failed to copy %s to %s\n", original_path.c_str(), filename.c_str());
-            }        
+            }
             
             local_list.pop();
         }
