@@ -11,3 +11,4 @@
 fitcache_server_log.*
 .ports.cfg.*
 /tpds_extension
+/benchmarks/results/
