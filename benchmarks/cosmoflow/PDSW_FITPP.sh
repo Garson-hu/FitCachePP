@@ -86,59 +86,17 @@ export BBPATH=$FitCache_NVME_PATH
 # Single-job baseline: cross-job OFF. Servers behave exactly like IPDPS.
 export FitCache_CROSS_JOB=0
 
-# Make sure the result dir exists
-RESULTS_DIR=/home/ghu4/hvac/FitCachePP/benchmarks/results/single_job_baseline
+# Hand off to the shared launcher PDSW_FITPP_inner.sh — same code path as the
+# two-job and three-tier benchmarks. The inner script handles:
+#   - cd into RESULTS_DIR so log4c files land alongside the rest of the
+#     job's outputs (not the repo root)
+#   - export FitCache_PORTS_CFG_DIR so server (which cd's here) and client
+#     (which cd's into the training dir for configs/cosmo.yaml) agree on
+#     where to find .ports.cfg.<JOBID>
+#   - the FitCache-engagement self-check at the end (greps Open RPC count
+#     in the server logs — fails loud if zero)
+# Inherits SERVER_NODES / SERVERS_PER_NODE / CLIENT_NODES / FitCache_SERVER_COUNT
+# from the variable defaults above.
+export RESULTS_DIR=/home/ghu4/hvac/FitCachePP/benchmarks/results/single_job_baseline
 mkdir -p "$RESULTS_DIR"
-
-# ------------------- Launch FitCache++ servers -------------------
-echo "Starting FitCache++ servers..."
-SERVER_BIN=/home/ghu4/hvac/FitCachePP/build/src/fitcache_server
-SERVER_PIDS=()
-BASE_PORT=5555
-GLOBAL_SERVER_ID=0
-
-for idx in "${!SERVER_NODES_ARR[@]}"; do
-    NODE=${SERVER_NODES_ARR[$idx]}
-    SERVERS_FOR_THIS_NODE=${SERVERS_PER_NODE_ARR[$idx]}
-    [ "$SERVERS_FOR_THIS_NODE" -le 0 ] && continue
-
-    # Pre-create per-server cache dirs so multiple servers on the same node
-    # don't race on mkdir.
-    mkdir -p "$FitCache_DRAM_PATH" "$FitCache_NVME_PATH"
-
-    echo "Starting $SERVERS_FOR_THIS_NODE servers on $NODE"
-    for local_idx in $(seq 0 $((SERVERS_FOR_THIS_NODE - 1))); do
-        PORT=$((BASE_PORT + GLOBAL_SERVER_ID))
-        echo "  Server ID=$GLOBAL_SERVER_ID  $NODE:$PORT"
-        SLURM_PROCID=$GLOBAL_SERVER_ID \
-        FitCache_SERVER_PORT=$PORT \
-            mpirun -N 1 -host "$NODE" "$SERVER_BIN" "$FitCache_SERVER_COUNT" \
-            > "$RESULTS_DIR/server_${SLURM_JOB_ID}_id${GLOBAL_SERVER_ID}.log" 2>&1 &
-        SERVER_PIDS+=($!)
-        GLOBAL_SERVER_ID=$((GLOBAL_SERVER_ID + 1))
-    done
-done
-
-# Give the servers a few seconds to register and write .ports.cfg.${SLURM_JOBID}
-sleep 5
-
-# ------------------- Launch CosmoFlow training -------------------
-if [ "$TOTAL_GPUS" -gt 0 ]; then
-    echo "Launching Horovod training on $TOTAL_GPUS GPUs (hostlist: $HOROVOD_HOSTLIST)"
-    horovodrun -np "$TOTAL_GPUS" -H "$HOROVOD_HOSTLIST" \
-        /home/ghu4/hvac/FitCachePP/benchmarks/cosmoflow/command_CF_FITPP.sh
-else
-    echo "WARNING: TOTAL_GPUS=0; not launching training"
-fi
-
-# ------------------- Cleanup -------------------
-echo "Training finished; tearing down FitCache++ servers"
-for pid in "${SERVER_PIDS[@]}"; do
-    kill -TERM "$pid" 2>/dev/null || true
-done
-sleep 2
-for pid in "${SERVER_PIDS[@]}"; do
-    kill -9 "$pid" 2>/dev/null || true
-done
-
-echo "DONE single-job FitCache++ baseline (job $SLURM_JOB_ID)"
+exec /home/ghu4/hvac/FitCachePP/benchmarks/cosmoflow/PDSW_FITPP_inner.sh
