@@ -64,7 +64,10 @@ export FitCache_DRAM_PATH=/mnt/local/ghu4/fitcachepp_dram_seq_${RUN_TAG}
 export FitCache_NVME_PATH=/mnt/local/ghu4/fitcachepp_nvme_seq_${RUN_TAG}
 export FitCache_DRAM_CAPACITY=$((100 * 1024 * 1024 * 1024))
 export FitCache_NVME_CAPACITY=$((500 * 1024 * 1024 * 1024))
-export FitCache_DATA_DIR=/mnt/beegfs/ghu4/hvac/cosmoUniverse_2019_05_4parE_tf_v2_mini/train_61440/train/
+# NOTE: parent of train/ + validation/, so the LD_PRELOAD substring filter
+# (fitcache_client.cpp:116) catches both. train.py gets the same path via
+# --data-dir in command_CF_FITPP.sh.
+export FitCache_DATA_DIR=/mnt/beegfs/ghu4/hvac/cosmoUniverse_2019_05_4parE_tf_v2_mini/train_61440
 export BBPATH=/mnt/local/ghu4/fitcachepp_nvme_seq_${RUN_TAG}
 export FitCache_LOG_LEVEL=500
 export PKG_CONFIG_PATH=\$PKG_CONFIG_PATH:/home/ghu4/hvac/log4c-1.2.4/install/lib/pkgconfig:/home/ghu4/hvac/rlibrary/mercury2.0.1/lib/pkgconfig

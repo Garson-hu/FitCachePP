@@ -73,7 +73,10 @@ export FitCache_NVME_PATH=/mnt/local/ghu4/fitcachepp_three_tier_nvme
 export FitCache_DRAM_CAPACITY=$((20  * 1024 * 1024 * 1024))   # 20 GiB
 export FitCache_PMEM_CAPACITY=$((60 * 1024 * 1024 * 1024))    # 60 GiB
 export FitCache_NVME_CAPACITY=$((500 * 1024 * 1024 * 1024))   # 500 GiB
-export FitCache_DATA_DIR=/mnt/beegfs/ghu4/hvac/cosmoUniverse_2019_05_4parE_tf_v2_mini/train_61440/train/
+# NOTE: parent of train/ + validation/, so the LD_PRELOAD substring filter
+# (fitcache_client.cpp:116) catches both. train.py gets the same path via
+# --data-dir in command_CF_FITPP.sh.
+export FitCache_DATA_DIR=/mnt/beegfs/ghu4/hvac/cosmoUniverse_2019_05_4parE_tf_v2_mini/train_61440
 export BBPATH=$FitCache_NVME_PATH
 
 # Cross-job OFF for this pilot — we're characterising the three-tier

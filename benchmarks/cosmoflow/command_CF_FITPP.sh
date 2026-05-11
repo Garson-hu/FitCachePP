@@ -15,8 +15,15 @@ set -x
 # achieves implicitly because they're sbatched from that dir.
 cd /home/ghu4/hvac/benchmark/cosmoflow-benchmark-master/
 
+# --data-dir override forces train.py to read from the SAME path the FitCache
+# LD_PRELOAD client filters on (FitCache_DATA_DIR). Without this, configs/cosmo.yaml's
+# default data_dir (train_1024) is used and the LD_PRELOAD filter at
+# fitcache_client.cpp:116 doesn't match — every read passes through to
+# BeeGFS direct and the FitCache server pathway stays dormant (root cause
+# of the zero-Open-RPC cluster runs on 2026-05-11).
 LD_PRELOAD=/home/ghu4/hvac/FitCachePP/build/src/libfitcache_client.so \
     /home/ghu4/hvac/rlibrary/miniconda3/envs/hvac_tf/bin/python3 \
-    /home/ghu4/hvac/benchmark/cosmoflow-benchmark-master/train.py -d
+    /home/ghu4/hvac/benchmark/cosmoflow-benchmark-master/train.py -d \
+    --data-dir "$FitCache_DATA_DIR"
 
 echo DONE `hostname`

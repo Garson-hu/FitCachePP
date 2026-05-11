@@ -71,7 +71,15 @@ export FitCache_DRAM_PATH=/mnt/local/ghu4/fitcachepp_train_cache_dram
 export FitCache_NVME_PATH=/mnt/local/ghu4/fitcachepp_train_cache_nvme
 export FitCache_DRAM_CAPACITY=$((100 * 1024 * 1024 * 1024))   # 100 GB
 export FitCache_NVME_CAPACITY=$((500 * 1024 * 1024 * 1024))   # 500 GB
-export FitCache_DATA_DIR=/mnt/beegfs/ghu4/hvac/cosmoUniverse_2019_05_4parE_tf_v2_mini/train_61440/train/
+# NOTE: Drop the trailing /train/ so FitCache_DATA_DIR is the canonical PARENT
+# of both train/ and validation/ subdirs. The LD_PRELOAD client in
+# fitcache_client.cpp:116 does a substring match between a candidate file's
+# parent-path and canonical(FitCache_DATA_DIR); pointing at the parent makes
+# the filter catch validation reads too, not just training reads.
+# Both train.py (--data-dir) and the FitCache shim must agree on this path,
+# or every read passes through to BeeGFS direct and the FitCache pathway
+# stays dormant (root cause of the zero-Open-RPC cluster runs on 2026-05-11).
+export FitCache_DATA_DIR=/mnt/beegfs/ghu4/hvac/cosmoUniverse_2019_05_4parE_tf_v2_mini/train_61440
 
 export BBPATH=$FitCache_NVME_PATH
 
