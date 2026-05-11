@@ -2,6 +2,7 @@
 #ifndef __FitCache_DATA_MOVER_INTERNAL_H__
 #define __FitCache_DATA_MOVER_INTERNAL_H__
 
+#include <atomic>
 #include <queue>
 #include <map>
 
@@ -35,5 +36,15 @@ void *fitcache_data_mover_fn(void *args);
 // Returns the number of files restored (0 on first-ever start; -1 on env
 // misconfiguration).
 int fitcache_data_mover_restore_from_sidecars();
+
+// Background eviction reaper thread entry point. Wakes every
+// FitCache_REAPER_SEC seconds (default 30) and, for each tier whose used
+// bytes exceeds FitCache_EVICT_HIGH_WM * capacity, evicts refcount=0 files
+// (lowest access_count first) until used bytes drops below
+// FitCache_EVICT_LOW_WM * capacity. Only active under FitCache_CROSS_JOB=1
+// because it relies on sidecars (which are only written in cross-job mode).
+// Set fitcache_eviction_reaper_running to false and pthread_join to stop it.
+void *fitcache_eviction_reaper_fn(void *arg);
+extern std::atomic<bool> fitcache_eviction_reaper_running;
 
 #endif //__FitCache_DATA_MOVER_INTERNAL_H__

@@ -149,6 +149,16 @@ int fitcache_start_comm_server(void)
                 L4C_INFO("Cross-job startup: restored %d cached files from "
                          "sidecar metadata", restored);
             }
+
+            // Cross-job eviction: start the background reaper that enforces
+            // FitCache_EVICT_HIGH_WM / FitCache_EVICT_LOW_WM watermarks.
+            static pthread_t reaper_tid;
+            fitcache_eviction_reaper_running.store(true);
+            if (pthread_create(&reaper_tid, NULL,
+                               fitcache_eviction_reaper_fn, NULL) != 0) {
+                L4C_WARN("Failed to start cross-job eviction reaper thread");
+                fitcache_eviction_reaper_running.store(false);
+            }
         } else {
             L4C_WARN("FitCache_CROSS_JOB=1 but registry_init failed; "
                      "running in single-job mode");
@@ -159,6 +169,7 @@ int fitcache_start_comm_server(void)
         sleep(1);
 
     if (fitcache::cross_job_enabled()) {
+        fitcache_eviction_reaper_running.store(false);
         fitcache::registry_deregister_server(fitcache_server_rank);
     }
 

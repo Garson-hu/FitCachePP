@@ -410,22 +410,84 @@ static int test_sidecar_persistent_meta() {
     return 0;
 }
 
+// Eviction coverage: meta_select_eviction_victim respects refcount and picks
+// lowest access_count; meta_evict_file unlinks both data + sidecar.
+static int test_eviction_victim_selection() {
+    using namespace fitcache;
+
+    fs::path tmp = fs::temp_directory_path() /
+                   ("fitcache_test_evict_" + std::to_string(getpid()));
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    auto plant = [&](const std::string &basename, uint64_t size,
+                     uint32_t access_count, uint32_t refcount) {
+        fs::path data = tmp / basename;
+        std::ofstream(data).put('z');
+        fitcache_file_meta_v1 m = meta_make_initial(
+            "/orig/" + basename, size, /*ds_hash=*/0);
+        m.access_count = access_count;
+        m.refcount     = refcount;
+        CHECK(meta_write_sidecar(data.string(), m) == 0,
+              "plant: write_sidecar failed");
+        return data.string();
+    };
+
+    std::string a = plant("a.bin", 1024, /*access=*/100, /*refcount=*/0);
+    std::string b = plant("b.bin", 2048, /*access=*/ 10, /*refcount=*/0);  // lowest access, evictable
+    std::string c = plant("c.bin", 4096, /*access=*/  1, /*refcount=*/2);  // lowest access BUT protected
+    std::string d = plant("d.bin",  512, /*access=*/ 50, /*refcount=*/0);
+
+    std::vector<std::string> candidates = {a, b, c, d};
+
+    // 1. select_eviction_victim picks b (lowest access among refcount==0)
+    std::string victim = meta_select_eviction_victim(candidates);
+    CHECK(victim == b, "victim should be b (lowest access_count, refcount=0)");
+    std::printf("  ok: select_eviction_victim picked b\n");
+
+    // 2. meta_evict_file unlinks data + sidecar, returns original_size
+    uint64_t freed = meta_evict_file(b);
+    CHECK(freed == 2048, "freed bytes should equal original_size");
+    CHECK(!fs::exists(b), "data file should be unlinked");
+    CHECK(!fs::exists(b + ".meta"), "sidecar should be unlinked");
+    std::printf("  ok: meta_evict_file removed data + sidecar (freed %lu bytes)\n",
+                (unsigned long)freed);
+
+    // 3. After b is gone, victim is d (next lowest access among refcount=0;
+    //    c is still protected by refcount=2).
+    std::vector<std::string> after = {a, c, d};
+    std::string victim2 = meta_select_eviction_victim(after);
+    CHECK(victim2 == d, "after evicting b, next victim should be d");
+    std::printf("  ok: refcount-protected file (c) is never picked as victim\n");
+
+    // 4. With only refcount-protected files, no victim is returned
+    std::vector<std::string> only_protected = {c};
+    std::string none = meta_select_eviction_victim(only_protected);
+    CHECK(none.empty(), "all-protected candidate set should yield no victim");
+    std::printf("  ok: empty result when every candidate has refcount > 0\n");
+
+    fs::remove_all(tmp);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
     std::printf("FitCache++ cross-job smoke test\n");
-    std::printf("[1/6] FNV-1a vectors...\n");
+    std::printf("[1/7] FNV-1a vectors...\n");
     test_fnv1a_stable();
-    std::printf("[2/6] HRW routing...\n");
+    std::printf("[2/7] HRW routing...\n");
     test_hrw_basic();
-    std::printf("[3/6] dataset_id...\n");
+    std::printf("[3/7] dataset_id...\n");
     test_dataset_id();
-    std::printf("[4/6] cluster registry roundtrip (will sleep ~4s for stale "
+    std::printf("[4/7] cluster registry roundtrip (will sleep ~4s for stale "
                 "heartbeat check)...\n");
     test_registry_roundtrip();
-    std::printf("[5/6] client-side routing (select_server_for_path + slot_to_addr)...\n");
+    std::printf("[5/7] client-side routing (select_server_for_path + slot_to_addr)...\n");
     test_routing_select_and_slot_addr();
-    std::printf("[6/6] sidecar persistent metadata...\n");
+    std::printf("[6/7] sidecar persistent metadata...\n");
     test_sidecar_persistent_meta();
+    std::printf("[7/7] eviction victim selection (refcount-protected, lowest-access)...\n");
+    test_eviction_victim_selection();
     std::printf("\nALL SMOKE TESTS PASSED\n");
     return 0;
 }

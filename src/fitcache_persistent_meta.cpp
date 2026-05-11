@@ -205,6 +205,45 @@ int meta_drop_refcount(const std::string &cached_path) {
     return rmw_refcount(cached_path, -1);
 }
 
+std::string meta_select_eviction_victim(
+    const std::vector<std::string> &cached_paths) {
+    std::string victim;
+    uint32_t lowest_access = UINT32_MAX;
+    for (const auto &cached_path : cached_paths) {
+        fitcache_file_meta_v1 m;
+        if (meta_read_sidecar(cached_path, &m) != 0) continue;
+        if (m.refcount > 0) continue;            // protected by an active subscriber
+        if (m.access_count < lowest_access) {
+            lowest_access = m.access_count;
+            victim = cached_path;
+        }
+    }
+    return victim;
+}
+
+uint64_t meta_evict_file(const std::string &cached_path) {
+    fitcache_file_meta_v1 m;
+    if (meta_read_sidecar(cached_path, &m) != 0) {
+        L4C_WARN("evict: cannot read sidecar for %s; skipping", cached_path.c_str());
+        return 0;
+    }
+    std::error_code ec;
+    fs::remove(cached_path, ec);
+    if (ec) {
+        L4C_ERR("evict: failed to unlink data file %s: %s",
+                cached_path.c_str(), ec.message().c_str());
+        return 0;
+    }
+    fs::remove(sidecar_path_for(cached_path), ec);   // best effort
+    if (ec) {
+        L4C_WARN("evict: data file gone but sidecar unlink failed for %s: %s",
+                 cached_path.c_str(), ec.message().c_str());
+    }
+    L4C_INFO("evict: removed %s (freed %lu bytes, access_count=%u)",
+             cached_path.c_str(), (unsigned long)m.original_size, m.access_count);
+    return m.original_size;
+}
+
 int meta_scan_tier_dir(
     const std::string &tier_root,
     const std::function<void(const std::string &cached_path,

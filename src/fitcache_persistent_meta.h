@@ -32,6 +32,7 @@
 #ifdef __cplusplus
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace fitcache {
 
@@ -93,6 +94,21 @@ int meta_bump_refcount(const std::string &cached_path);
 // Decrement the refcount on an existing sidecar. Same atomicity as bump.
 // Returns the new refcount, or -1 on error.
 int meta_drop_refcount(const std::string &cached_path);
+
+// Pick an eviction victim out of a candidate set. A cached path is evictable
+// iff its sidecar exists, has valid magic+version, and refcount == 0.
+// Returns the cached_path with the lowest access_count among evictable
+// candidates, or "" if there is none. Caller is responsible for snapshotting
+// the candidate list under whatever lock protects it.
+std::string meta_select_eviction_victim(
+    const std::vector<std::string> &cached_paths);
+
+// Evict a single cached file: unlink the data file and its sidecar.
+// Returns the bytes freed (original_size from the sidecar before unlinking)
+// or 0 if the sidecar could not be read or the data file could not be
+// unlinked. The caller still has to remove the cached_path from its in-memory
+// path_cache_map.
+uint64_t meta_evict_file(const std::string &cached_path);
 
 }  // namespace fitcache
 

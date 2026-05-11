@@ -8,7 +8,10 @@
 
 #include <pthread.h>
 #include <string.h>
+#include <unistd.h>      // sleep()
 #include <chrono>
+#include <utility>
+#include <vector>
 #include "fitcache_logging.h"
 #include "fitcache_data_mover_internal.h"
 #include "fitcache_cache_policy.h"
@@ -32,6 +35,141 @@ unordered_map<string, string> path_cache_map;     // & Original path -> Redirect
 shared_mutex cache_mtx;                       // & Mutex for the path cache
 
 queue<string> data_queue;               // & List of files to be moved
+
+std::atomic<bool> fitcache_eviction_reaper_running{false};
+
+namespace {
+
+// Pull capacity / path / watermark / interval values from env vars. Returns
+// false (and leaves outputs untouched) if the required tier env vars are
+// missing — the reaper logs a warning and exits in that case.
+bool reaper_read_env_config(std::string &dram_path, std::string &nvme_path,
+                            uint64_t &dram_cap, uint64_t &nvme_cap,
+                            double   &high_wm,    double   &low_wm,
+                            int      &interval_sec) {
+    const char *dp = getenv("FitCache_DRAM_PATH");
+    const char *np = getenv("FitCache_NVME_PATH");
+    const char *dc = getenv("FitCache_DRAM_CAPACITY");
+    const char *nc = getenv("FitCache_NVME_CAPACITY");
+    if (!dp || !np || !dc || !nc) return false;
+    dram_path = dp; nvme_path = np;
+    dram_cap  = std::stoull(dc);
+    nvme_cap  = std::stoull(nc);
+    high_wm = 0.85; low_wm = 0.70; interval_sec = 30;
+    if (const char *v = getenv("FitCache_EVICT_HIGH_WM")) {
+        double n = std::atof(v); if (n > 0 && n < 1.0) high_wm = n;
+    }
+    if (const char *v = getenv("FitCache_EVICT_LOW_WM")) {
+        double n = std::atof(v); if (n > 0 && n < 1.0) low_wm = n;
+    }
+    if (const char *v = getenv("FitCache_REAPER_SEC")) {
+        int n = std::atoi(v); if (n > 0) interval_sec = n;
+    }
+    return true;
+}
+
+// Take a snapshot of cached files under `tier_path` (i.e. cached files whose
+// path begins with the tier root). Snapshot under cache_mtx so we don't hold
+// the lock while doing per-file sidecar I/O.
+std::vector<std::pair<std::string, std::string>>
+snapshot_cached_files_in_tier(const std::string &tier_path) {
+    std::vector<std::pair<std::string, std::string>> out;
+    std::shared_lock<std::shared_mutex> rlock(cache_mtx);
+    out.reserve(path_cache_map.size());
+    for (const auto &kv : path_cache_map) {
+        if (kv.second.compare(0, tier_path.size(), tier_path) == 0) {
+            out.emplace_back(kv.first, kv.second);
+        }
+    }
+    return out;
+}
+
+// Evict one victim from `tier_path` (refcount=0, lowest access_count). On
+// success returns bytes freed and rewires path_cache_map / used_bytes;
+// returns 0 if no eviction happened (no candidate or unlink failed).
+uint64_t evict_one_in_tier(const std::string &tier_path,
+                           uint64_t &tier_used_bytes) {
+    auto snapshot = snapshot_cached_files_in_tier(tier_path);
+    std::vector<std::string> cached_only;
+    cached_only.reserve(snapshot.size());
+    for (const auto &p : snapshot) cached_only.push_back(p.second);
+
+    std::string victim_cached = fitcache::meta_select_eviction_victim(cached_only);
+    if (victim_cached.empty()) return 0;
+
+    // Map back to original_path for path_cache_map removal.
+    std::string victim_orig;
+    for (const auto &p : snapshot) {
+        if (p.second == victim_cached) { victim_orig = p.first; break; }
+    }
+    if (victim_orig.empty()) return 0;
+
+    uint64_t freed = fitcache::meta_evict_file(victim_cached);
+    if (freed == 0) return 0;
+
+    {
+        std::unique_lock<std::shared_mutex> wlock(cache_mtx);
+        path_cache_map.erase(victim_orig);
+    }
+    if (tier_used_bytes >= freed) tier_used_bytes -= freed;
+    else                          tier_used_bytes  = 0;
+    return freed;
+}
+
+}  // namespace
+
+void *fitcache_eviction_reaper_fn(void *arg) {
+    (void)arg;
+    std::string dram_path, nvme_path;
+    uint64_t dram_cap = 0, nvme_cap = 0;
+    double high_wm = 0.85, low_wm = 0.70;
+    int interval_sec = 30;
+    if (!reaper_read_env_config(dram_path, nvme_path,
+                                dram_cap, nvme_cap,
+                                high_wm,   low_wm,
+                                interval_sec)) {
+        L4C_WARN("eviction-reaper: missing tier env config; reaper exiting");
+        return NULL;
+    }
+    L4C_INFO("eviction-reaper: started (interval=%ds, high_wm=%.2f, low_wm=%.2f)",
+             interval_sec, high_wm, low_wm);
+
+    uint64_t dram_high = (uint64_t)(high_wm * dram_cap);
+    uint64_t dram_low  = (uint64_t)(low_wm  * dram_cap);
+    uint64_t nvme_high = (uint64_t)(high_wm * nvme_cap);
+    uint64_t nvme_low  = (uint64_t)(low_wm  * nvme_cap);
+
+    while (fitcache_eviction_reaper_running.load()) {
+        for (int i = 0; i < interval_sec && fitcache_eviction_reaper_running.load(); ++i)
+            sleep(1);
+        if (!fitcache_eviction_reaper_running.load()) break;
+
+        // DRAM tier
+        if (g_dram_used_bytes > dram_high) {
+            L4C_INFO("eviction-reaper: DRAM over high watermark (%lu > %lu); evicting",
+                     (unsigned long)g_dram_used_bytes, (unsigned long)dram_high);
+            int passes = 0;
+            while (g_dram_used_bytes > dram_low && passes < 1024) {
+                uint64_t freed = evict_one_in_tier(dram_path, g_dram_used_bytes);
+                if (freed == 0) break;             // nothing more to evict
+                ++passes;
+            }
+        }
+        // NVMe tier
+        if (g_nvme_used_bytes > nvme_high) {
+            L4C_INFO("eviction-reaper: NVMe over high watermark (%lu > %lu); evicting",
+                     (unsigned long)g_nvme_used_bytes, (unsigned long)nvme_high);
+            int passes = 0;
+            while (g_nvme_used_bytes > nvme_low && passes < 1024) {
+                uint64_t freed = evict_one_in_tier(nvme_path, g_nvme_used_bytes);
+                if (freed == 0) break;
+                ++passes;
+            }
+        }
+    }
+    L4C_INFO("eviction-reaper: shutting down");
+    return NULL;
+}
 
 int fitcache_data_mover_restore_from_sidecars()
 {
