@@ -42,17 +42,25 @@ single-job comparison block.
 - ❌ **Prior baselines (221607, ...615, ...617, ...619) all show 0 Open RPCs** — see `summary_221618_221619.md`. The ~200s cold / ~188s warm pattern they reported is kernel page cache + GPU/TF warmup, not FitCache. **Do not quote those numbers.**
 - Source: `benchmarks/results/single_job_baseline/summary_221634_engaged.md`. Memory `project_fitcachepp_tpds.md`.
 
-### 1b. Multi-node baseline (c35 storage + GPU client, n_train=61440) — IPDPS layout
+### 1b. Multi-node baseline (c35 storage + c66 GPU client, n_train=8192) — IPDPS layout
 
-| Configuration | Cold ep1 | Warm | Mean | Open RPCs | Engagement | Status |
-|---|---:|---:|---:|---:|---|:---:|
-| **221638 FitCachePP** (Phase A.1) | — | — | — | — | in flight | 🚧 in flight |
-| Phase A.2 — replicates ×2 | — | — | — | — | not started | ⏸️ blocked on A.1 |
-| Phase A.3 — Pure_CF (no LD_PRELOAD) ×3 | — | — | — | — | not started | ⏸️ blocked on A.1 |
-| IPDPS-published FitCache `n_train=61440` 1 GPU | — | — | — | — | per `logs/pdsw/RunTime{1,2,3}/` | ref |
+Note: scaled to `n_train=8192` (8× faster wall-clock than the IPDPS 61440)
+for sane per-cell iteration; the comparison column is the RELATIVE ratio
+against Pure_CF (Phase A.3) rather than absolute wall-clock against IPDPS.
+Optional Phase F upgrade to one n_train=61440 cell available later.
 
-- 🚧 SLURM 221638 in flight: c35 PMem storage + c66 GPU client, n_train=61440, 4 servers on c35. Full-dataset run (~16-20 min wall). Monitor `baslzpd48` will fire when done.
-- Source: `benchmarks/results/multinode_baseline/` (will be populated by 221638).
+| Configuration | Cold ep1 | Warm mean (ep2-5) | Mean (all 5) | Open RPCs | Cached files | Cold→warm | Status |
+|---|---:|---:|---:|---:|---:|---:|:---:|
+| **221645 FitCachePP** (Phase A.1) | **1665s** | 895s (σ=3s) | **1048s** | **46,088** | **9,216** | **46.2%** | ✅ |
+| Phase A.2 — replicates ×2 | — | — | — | — | — | — | 🚧 next |
+| Phase A.3 — Pure_CF (no LD_PRELOAD) ×3 | — | — | — | — | — | — | ⏸️ blocked on A.2 |
+| IPDPS FitCache 1 GPU n_train=61440 | 7552s | 6573s | 6968s | n/a (CROSS_JOB=0) | per `logs/pdsw/...` | ~13% | ref |
+
+- ✅ **221645 is the first end-to-end multi-node FitCachePP cluster result with everything working.** c35 storage (PMem-equipped) + c66 GPU client, 4 servers on c35 via single-srun-n4 (avoids the parallel-srun-deadlock bug from 221643).
+- ✅ **46,088 Open RPCs handled across 4 c35 servers + 9,216 cached files** — direct evidence of FitCache engagement at multi-node cluster scale (vs the 0-Open-RPCs of all prior 221607/...615/...617/...619 runs).
+- ✅ **46.2% cold-to-warm-steady reduction** (1665s → 895s) at n_train=8192 — vs only 8% at n_train=1024 in 221634; confirms n_train=8192 is the right working scale to actually stress I/O.
+- ✅ **Warm steady-state σ≈3s** across epochs 2-5 (891/898/895/896) — the data-mover signal-loss fix + registry rmw fix + lookup_addr NULL fix all hold under sustained load.
+- Source: `benchmarks/results/multinode_baseline/FitCachePP_multinode-221645.out` + `fitcache_server_log.*.0` + `.ports.cfg.221645`.
 
 ---
 
