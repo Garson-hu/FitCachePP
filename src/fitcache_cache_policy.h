@@ -35,9 +35,16 @@ extern "C" {
  */
 typedef enum {
     CACHE_TIER_DRAM = 0,             // DRAM-based tmpfs (e.g., /tmp)
-    CACHE_TIER_NVME,
-    CACHE_TIER_PFS,                  // Shared filesystem (e.g., Beegfs/PFS)
-    CACHE_TIER_UNKNOWN               // Unknown or not found
+    CACHE_TIER_NVME = 1,
+    CACHE_TIER_PFS  = 2,             // Shared filesystem (e.g., Beegfs/PFS)
+    CACHE_TIER_UNKNOWN = 3,          // Unknown or not found
+    CACHE_TIER_PMEM = 4              // Persistent memory tier (DAX-mounted,
+                                     // e.g., /mnt/pmem) — sits between DRAM
+                                     // and NVMe in placement priority. Added
+                                     // after PFS/UNKNOWN to keep the existing
+                                     // wire-protocol tier values stable so
+                                     // older peer_lookup responses still
+                                     // decode the same way.
 } cache_tier_t;
 
 /**
