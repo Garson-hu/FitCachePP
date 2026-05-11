@@ -54,7 +54,7 @@ export FitCache_NVME_CAPACITY=$((500 * 1024 * 1024 * 1024))
 # --data-dir in command_CF_FITPP.sh.
 export FitCache_DATA_DIR=/mnt/beegfs/ghu4/hvac/cosmoUniverse_2019_05_4parE_tf_v2_mini/train_61440
 export BBPATH=/mnt/local/ghu4/fitcachepp_nvme_${RUN_TAG}
-export FitCache_LOG_LEVEL=500
+export FitCache_LOG_LEVEL=600
 export PKG_CONFIG_PATH=\$PKG_CONFIG_PATH:/home/ghu4/hvac/log4c-1.2.4/install/lib/pkgconfig:/home/ghu4/hvac/rlibrary/mercury2.0.1/lib/pkgconfig
 export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:/home/ghu4/hvac/log4c-1.2.4/install/lib:/home/ghu4/hvac/rlibrary/mercury2.0.1/lib
 export PATH=/home/ghu4/hvac/rlibrary/miniconda3/envs/hvac_tf/bin:/home/ghu4/hvac/mercury-2.0.1/build/bin:\$PATH

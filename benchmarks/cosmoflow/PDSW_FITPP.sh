@@ -58,7 +58,12 @@ done
 HOROVOD_HOSTLIST=${HOROVOD_HOSTLIST%,}
 
 # Mercury / log4c env (mirrors the build env)
-export FitCache_LOG_LEVEL=500
+# INFO threshold (600) so the per-Open RPC trace + cross_job_stats periodic
+# emit + data-mover-promotion lines all land in the log file. NOTICE (500)
+# filters all of those — and at NOTICE with zero registry errors the file
+# is never created at all, which makes the engagement self-check think
+# FitCache wasn't engaged when it actually was.
+export FitCache_LOG_LEVEL=600
 export RDMAV_FORK_SAFE=1
 export VERBS_LOG_LEVEL=4
 export PKG_CONFIG_PATH=$PKG_CONFIG_PATH:/home/ghu4/hvac/log4c-1.2.4/install/lib/pkgconfig:/home/ghu4/hvac/rlibrary/mercury2.0.1/lib/pkgconfig

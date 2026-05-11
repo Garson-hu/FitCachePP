@@ -101,18 +101,39 @@ done
 # happened across 2026-05-11's cluster runs (root cause: FitCache_DATA_DIR
 # vs train.py --data-dir mismatch); the check below prevents it from
 # happening silently again.
+# Two independent engagement signals:
+#   (a) "Open RPC: requested path" lines in the server log4c file. These are
+#       emitted at INFO level (priority 600). If FitCache_LOG_LEVEL is set
+#       below INFO (e.g. NOTICE=500), the lines are filtered and the count
+#       is zero even when FitCache *is* engaged.
+#   (b) the number of files actually promoted into the cache tier dirs.
+#       Independent of log level: if FitCache caught at least one open,
+#       the data mover copied at least one file into DRAM/NVMe/PMem.
+# Treat the run as engaged if EITHER signal fires. False-negative on (a)
+# alone produces a noisy warning but doesn't suppress (b).
 OPEN_RPC_COUNT=$(grep -c 'Open RPC: requested path' "$RESULTS_DIR"/fitcache_server_log.*.0 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
-if [ "$OPEN_RPC_COUNT" -eq 0 ]; then
-    echo "[$(date '+%H:%M:%S')] !!! WARNING !!! Zero 'Open RPC: requested path' lines found in"
-    echo "                $RESULTS_DIR/fitcache_server_log.*.0"
+CACHED_FILE_COUNT=0
+for d in "$FitCache_DRAM_PATH" "$FitCache_NVME_PATH" "$FitCache_PMEM_PATH"; do
+    [ -d "$d" ] || continue
+    n=$(find "$d" -type f ! -name '*.meta' 2>/dev/null | wc -l)
+    CACHED_FILE_COUNT=$((CACHED_FILE_COUNT + n))
+done
+
+if [ "$OPEN_RPC_COUNT" -eq 0 ] && [ "$CACHED_FILE_COUNT" -eq 0 ]; then
+    echo "[$(date '+%H:%M:%S')] !!! WARNING !!! No FitCache engagement signal: zero Open RPC log lines"
+    echo "                AND zero cached files in DRAM/NVMe/PMem tier dirs."
     echo "                FitCache was NOT engaged this run. Most likely cause:"
     echo "                FitCache_DATA_DIR ($FitCache_DATA_DIR) doesn't match the path"
     echo "                train.py actually reads (check configs/cosmo.yaml and the"
     echo "                --data-dir passed in command_CF_FITPP.sh). Epoch timings"
     echo "                from this run are NOT FitCache-attributable."
-    # Don't fail the job — that loses the partial result. But flag it loud.
+elif [ "$OPEN_RPC_COUNT" -eq 0 ] && [ "$CACHED_FILE_COUNT" -gt 0 ]; then
+    echo "[$(date '+%H:%M:%S')] FitCache engaged: $CACHED_FILE_COUNT files in cache tiers."
+    echo "                (Open RPC log count was 0 — that's INFO-level so a"
+    echo "                FitCache_LOG_LEVEL<600 setting filters it; the cached"
+    echo "                file count is the authoritative signal.)"
 else
-    echo "[$(date '+%H:%M:%S')] FitCache engaged: $OPEN_RPC_COUNT Open RPCs handled across all servers"
+    echo "[$(date '+%H:%M:%S')] FitCache engaged: $OPEN_RPC_COUNT Open RPCs handled across all servers; $CACHED_FILE_COUNT files cached."
 fi
 
 echo "[$(date '+%H:%M:%S')] DONE FitCache++ inner (job $SLURM_JOB_ID, horovod_rc=$HOROVOD_RC)"
