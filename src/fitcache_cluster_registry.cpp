@@ -250,9 +250,23 @@ int registry_init() {
     return 0;
 }
 
+// Per-server-instance file path: nodes/<hostname>_rank<N>.txt. Each server
+// process owns its own file and is the sole writer; no inter-process write
+// races. Earlier design used a single nodes/<hostname>.txt shared by all
+// servers on the node, but the rmw + atomic-rename pattern broke under
+// multi-server concurrency on BeeGFS — rename invalidated the inode the
+// flock was bound to, so concurrent rmws lost each other's keys (only
+// the heartbeat keys survived, since heartbeat update_fn was the only
+// thing that ran often enough to be the last writer). Per-server files
+// side-step the race entirely.
+static std::string per_server_file(int rank) {
+    return g_nodes_dir() + "/" + g_self_hostname()
+         + "_rank" + std::to_string(rank) + ".txt";
+}
+
 int registry_register_server(const ServerEndpoint &self) {
     if (!g_initialized) return -1;
-    std::string path = g_nodes_dir() + "/" + g_self_hostname() + ".txt";
+    std::string path = per_server_file(self.rank);
     std::string node_uuid = g_self_node_uuid();
     int rc = rmw_kv_file(path, [&](auto &kv) {
         std::string p = "server." + std::to_string(self.rank) + ".";
@@ -264,15 +278,15 @@ int registry_register_server(const ServerEndpoint &self) {
         kv[p + "heartbeat"] = std::to_string(now_unix());
     });
     if (rc == 0) {
-        L4C_INFO("registry: registered server rank=%d addr=%s",
-                 self.rank, self.addr.c_str());
+        L4C_INFO("registry: registered server rank=%d addr=%s (file=%s)",
+                 self.rank, self.addr.c_str(), path.c_str());
     }
     return rc;
 }
 
 int registry_heartbeat(int rank) {
     if (!g_initialized) return -1;
-    std::string path = g_nodes_dir() + "/" + g_self_hostname() + ".txt";
+    std::string path = per_server_file(rank);
     return rmw_kv_file(path, [&](auto &kv) {
         std::string key = "server." + std::to_string(rank) + ".heartbeat";
         kv[key] = std::to_string(now_unix());
@@ -281,17 +295,18 @@ int registry_heartbeat(int rank) {
 
 int registry_deregister_server(int rank) {
     if (!g_initialized) return -1;
-    std::string path = g_nodes_dir() + "/" + g_self_hostname() + ".txt";
-    std::string prefix = "server." + std::to_string(rank) + ".";
-    return rmw_kv_file(path, [&](auto &kv) {
-        for (auto it = kv.begin(); it != kv.end(); ) {
-            if (it->first.compare(0, prefix.size(), prefix) == 0) {
-                it = kv.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    });
+    // With per-server files, deregistration is just unlink. No rmw needed.
+    std::string path = per_server_file(rank);
+    std::error_code ec;
+    fs::remove(path, ec);
+    if (ec) {
+        L4C_WARN("registry: deregister rank=%d unlink %s failed: %s",
+                 rank, path.c_str(), ec.message().c_str());
+        return -1;
+    }
+    L4C_INFO("registry: deregistered server rank=%d (removed %s)",
+             rank, path.c_str());
+    return 0;
 }
 
 int registry_subscribe_dataset(const fitcache_dataset_id_t &id,
