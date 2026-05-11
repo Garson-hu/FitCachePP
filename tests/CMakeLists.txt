@@ -1,5 +1,6 @@
 add_executable(basic_test basic_test.c )
 add_executable(test_open_close test_open_close.c)
+add_executable(harness_read_files harness_read_files.c)
 
 # TPDS extension Phase-1 smoke test: exercises FNV/HRW/dataset_id/registry
 # without touching Mercury, so it can run on any host (no MPI/Slurm needed).

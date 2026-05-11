@@ -8,6 +8,7 @@
 #include "fitcache_timer.h"
 #include "fitcache_comm.h"
 #include "fitcache_cross_job.h"
+#include "fitcache_multi_source_read.h"   // for ms_read_state definition
 #include "fitcache_data_mover_internal.h"
 
 extern "C" {
@@ -517,9 +518,19 @@ void fitcache_client_comm_gen_open_rpc(uint32_t svr_hash, string path, int fd)
 
     /* Get address according to server hash  */
     /* svr_hash is calculated as: ((fd_map[fd]) % g_fitcache_server_count) */
-    svr_addr = fitcache_client_comm_lookup_addr(svr_hash);  
+    svr_addr = fitcache_client_comm_lookup_addr(svr_hash);
     if (!svr_addr) {
-        L4C_ERR("Open RPC: could not resolve server rank %d (missing .ports.cfg?)", (int)svr_hash);
+        L4C_ERR("Open RPC: could not resolve server rank %d (missing .ports.cfg?)",
+                (int)svr_hash);
+        // Caller will fitcache_client_block_for_file(path) right after this
+        // returns. Without a signal it would block forever — set an FD-error
+        // state and signal an error result on the per-file sync context so
+        // the caller's wait unblocks with a -1 result.
+        fitcache_set_fd_state(fd, FitCache_FD_ERROR, path);
+        fd_redir_map[fd] = -1;
+        fitcache_file_sync_context *ctx = fitcache_get_file_sync_context(path);
+        fitcache_signal_file_operation_done(ctx, -1);
+        fitcache_release_file_sync_context(path);
         return;
     }
     L4C_INFO("PREAD: FitCache: Open RPC Server Hash: %d", svr_hash);
@@ -578,7 +589,21 @@ void fitcache_client_comm_gen_read_rpc(uint32_t svr_hash, int localfd, void *buf
     /* Get address */
     svr_addr = fitcache_client_comm_lookup_addr(svr_hash);
     if (!svr_addr) {
-        L4C_ERR("Read RPC: could not resolve server rank %d (missing .ports.cfg?)", (int)svr_hash);
+        L4C_ERR("Read RPC: could not resolve server rank %d (missing .ports.cfg?)",
+                (int)svr_hash);
+        // Signal -1 read on the per-file sync ctx so the caller's
+        // fitcache_read_block_for_file() returns instead of hanging.
+        std::string filename;
+        fitcache_get_fd_state(localfd, &filename);
+        if (filename.empty()) {
+            auto it = fd_map.find(localfd);
+            if (it != fd_map.end()) filename = it->second;
+        }
+        if (!filename.empty()) {
+            fitcache_file_sync_context *ctx = fitcache_get_file_sync_context(filename);
+            fitcache_signal_file_operation_done(ctx, 0, -1);
+            fitcache_release_file_sync_context(filename);
+        }
         return;
     }
 
@@ -649,7 +674,25 @@ void fitcache_client_comm_gen_read_rpc_with_ms(uint32_t svr_hash, int localfd, v
         L4C_INFO("PREAD -1 DEBUG: DEBUG_HU: FitCache: Offset %lld", offset);
     hg_addr_t svr_addr = fitcache_client_comm_lookup_addr(svr_hash);
     if (!svr_addr) {
-        L4C_ERR("Read RPC (ms): could not resolve server rank %d (missing .ports.cfg?)", (int)svr_hash);
+        L4C_ERR("Read RPC (ms): could not resolve server rank %d (missing .ports.cfg?)",
+                (int)svr_hash);
+        // Signal the ms_read_state so the caller's pthread_cond_wait unblocks.
+        // Without this the ms_read in the caller spins forever.
+        if (rpc_state && rpc_state->ms) {
+            pthread_mutex_lock(&rpc_state->ms->lock);
+            if (rpc_state->requested_tier == CACHE_TIER_DRAM) {
+                rpc_state->ms->pm_done   = true;
+                rpc_state->ms->pm_result = -1;
+            } else {
+                rpc_state->ms->ssd_done   = true;
+                rpc_state->ms->ssd_result = -1;
+            }
+            if (rpc_state->ms->pm_done && rpc_state->ms->ssd_done) {
+                rpc_state->ms->completed = true;
+                pthread_cond_signal(&rpc_state->ms->cond);
+            }
+            pthread_mutex_unlock(&rpc_state->ms->lock);
+        }
         return;
     }
     fitcache_rpc_in_t in;
@@ -700,9 +743,22 @@ void fitcache_client_comm_gen_seek_rpc(uint32_t svr_hash, int fd, int64_t offset
     // done = HG_FALSE; // This line is removed as per the new_code
 
     /* Get address */
-    svr_addr = fitcache_client_comm_lookup_addr(svr_hash);    
+    svr_addr = fitcache_client_comm_lookup_addr(svr_hash);
     if (!svr_addr) {
-        L4C_ERR("Seek RPC: could not resolve server rank %d (missing .ports.cfg?)", (int)svr_hash);
+        L4C_ERR("Seek RPC: could not resolve server rank %d (missing .ports.cfg?)",
+                (int)svr_hash);
+        // Signal -1 on the per-file sync ctx so seek_block returns.
+        std::string filename;
+        fitcache_get_fd_state(fd, &filename);
+        if (filename.empty()) {
+            auto it = fd_map.find(fd);
+            if (it != fd_map.end()) filename = it->second;
+        }
+        if (!filename.empty()) {
+            fitcache_file_sync_context *ctx = fitcache_get_file_sync_context(filename);
+            fitcache_signal_file_operation_done(ctx, -1, -1);
+            fitcache_release_file_sync_context(filename);
+        }
         return;
     }
 

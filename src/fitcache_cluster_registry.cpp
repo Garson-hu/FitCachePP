@@ -58,13 +58,31 @@ namespace {
 constexpr int    kHeartbeatStaleMultiplier = 3;
 constexpr int    kDefaultHeartbeatSec      = 30;
 
-std::string g_registry_root;          // .../registry.v1/
-std::string g_nodes_dir;              // .../registry.v1/nodes/
-std::string g_datasets_dir;           // .../registry.v1/datasets/
-std::string g_self_hostname;          // gethostname() result
-std::string g_self_node_uuid;         // best-effort persistent ID
+// Persistent registry-dir state.
+//
+// EARLIER design used `std::string g_registry_root / g_nodes_dir / g_datasets_dir`
+// here, set once by registry_init. Empirically those std::strings get their
+// heap-backed content zeroed mid-process (same address, contents become "")
+// — likely a libstdc++ destructor-ordering or heap-corruption interaction
+// with the LD_PRELOAD'd shared library. Switched to fixed-size C buffers,
+// never reallocated after init, to side-step the issue. The buffers are
+// large enough for any reasonable PFS path.
+constexpr size_t kRegPathMax = 1024;
+char        g_registry_root_buf[kRegPathMax] = {0};   // .../registry.v1
+char        g_nodes_dir_buf   [kRegPathMax] = {0};    // .../registry.v1/nodes
+char        g_datasets_dir_buf[kRegPathMax] = {0};    // .../registry.v1/datasets
+char        g_self_hostname_buf[256] = {0};
+char        g_self_node_uuid_buf[256] = {0};
 bool        g_initialized = false;
 std::mutex  g_init_mutex;
+
+// Convenience std::string views built from the C buffers; constructed each
+// call (cheap; std::string copy of a few hundred bytes).
+inline std::string g_registry_root() { return std::string(g_registry_root_buf); }
+inline std::string g_nodes_dir()     { return std::string(g_nodes_dir_buf);     }
+inline std::string g_datasets_dir()  { return std::string(g_datasets_dir_buf);  }
+inline std::string g_self_hostname() { return std::string(g_self_hostname_buf); }
+inline std::string g_self_node_uuid(){ return std::string(g_self_node_uuid_buf);}
 
 int heartbeat_sec() {
     const char *v = std::getenv("FitCache_HEARTBEAT_SEC");
@@ -206,35 +224,41 @@ int registry_init() {
         root_env = std::string(data_dir) + "/../.fitcache_registry";
     }
 
-    g_registry_root = root_env + "/registry.v1";
-    g_nodes_dir     = g_registry_root + "/nodes";
-    g_datasets_dir  = g_registry_root + "/datasets";
+    std::string root_path     = root_env + "/registry.v1";
+    std::string nodes_path    = root_path + "/nodes";
+    std::string datasets_path = root_path + "/datasets";
 
-    if (!ensure_dir(g_nodes_dir) || !ensure_dir(g_datasets_dir)) return -1;
+    if (!ensure_dir(nodes_path) || !ensure_dir(datasets_path)) return -1;
 
     char hn[256];
     if (gethostname(hn, sizeof(hn)) != 0) {
         L4C_ERR("registry: gethostname failed");
         return -1;
     }
-    g_self_hostname = hn;
-    g_self_node_uuid = read_node_uuid_or_synthesize();
+    std::string node_uuid = read_node_uuid_or_synthesize();
+
+    // Copy into the C-buffer storage (no destructors run on these).
+    std::strncpy(g_registry_root_buf, root_path.c_str(),     kRegPathMax - 1);
+    std::strncpy(g_nodes_dir_buf,     nodes_path.c_str(),    kRegPathMax - 1);
+    std::strncpy(g_datasets_dir_buf,  datasets_path.c_str(), kRegPathMax - 1);
+    std::strncpy(g_self_hostname_buf, hn, sizeof(g_self_hostname_buf) - 1);
+    std::strncpy(g_self_node_uuid_buf, node_uuid.c_str(), sizeof(g_self_node_uuid_buf) - 1);
 
     g_initialized = true;
     L4C_INFO("registry: initialized at %s (host=%s uuid=%s)",
-             g_registry_root.c_str(), g_self_hostname.c_str(),
-             g_self_node_uuid.c_str());
+             g_registry_root_buf, g_self_hostname_buf, g_self_node_uuid_buf);
     return 0;
 }
 
 int registry_register_server(const ServerEndpoint &self) {
     if (!g_initialized) return -1;
-    std::string path = g_nodes_dir + "/" + g_self_hostname + ".txt";
+    std::string path = g_nodes_dir() + "/" + g_self_hostname() + ".txt";
+    std::string node_uuid = g_self_node_uuid();
     int rc = rmw_kv_file(path, [&](auto &kv) {
         std::string p = "server." + std::to_string(self.rank) + ".";
         kv[p + "rank"]      = std::to_string(self.rank);
         kv[p + "addr"]      = self.addr;
-        kv[p + "node_uuid"] = g_self_node_uuid;
+        kv[p + "node_uuid"] = node_uuid;
         kv[p + "jobid"]     = self.jobid;
         kv[p + "uid"]       = std::to_string(getuid());
         kv[p + "heartbeat"] = std::to_string(now_unix());
@@ -248,7 +272,7 @@ int registry_register_server(const ServerEndpoint &self) {
 
 int registry_heartbeat(int rank) {
     if (!g_initialized) return -1;
-    std::string path = g_nodes_dir + "/" + g_self_hostname + ".txt";
+    std::string path = g_nodes_dir() + "/" + g_self_hostname() + ".txt";
     return rmw_kv_file(path, [&](auto &kv) {
         std::string key = "server." + std::to_string(rank) + ".heartbeat";
         kv[key] = std::to_string(now_unix());
@@ -257,7 +281,7 @@ int registry_heartbeat(int rank) {
 
 int registry_deregister_server(int rank) {
     if (!g_initialized) return -1;
-    std::string path = g_nodes_dir + "/" + g_self_hostname + ".txt";
+    std::string path = g_nodes_dir() + "/" + g_self_hostname() + ".txt";
     std::string prefix = "server." + std::to_string(rank) + ".";
     return rmw_kv_file(path, [&](auto &kv) {
         for (auto it = kv.begin(); it != kv.end(); ) {
@@ -276,7 +300,7 @@ int registry_subscribe_dataset(const fitcache_dataset_id_t &id,
     if (!g_initialized) return -1;
     char hex[33];
     fitcache_dataset_id_to_hex(&id, hex, sizeof(hex));
-    std::string path = g_datasets_dir + "/" + hex + ".txt";
+    std::string path = g_datasets_dir() + "/" + hex + ".txt";
     return rmw_kv_file(path, [&](auto &kv) {
         std::string p = "subscriber." + std::to_string(jobid) + ".";
         kv[p + "lease_until"] = std::to_string(lease_until_unix);
@@ -290,7 +314,7 @@ int registry_release_dataset(const fitcache_dataset_id_t &id, uint32_t jobid) {
     if (!g_initialized) return -1;
     char hex[33];
     fitcache_dataset_id_to_hex(&id, hex, sizeof(hex));
-    std::string path = g_datasets_dir + "/" + hex + ".txt";
+    std::string path = g_datasets_dir() + "/" + hex + ".txt";
     std::string prefix = "subscriber." + std::to_string(jobid) + ".";
     return rmw_kv_file(path, [&](auto &kv) {
         for (auto it = kv.begin(); it != kv.end(); ) {
@@ -306,13 +330,20 @@ int registry_release_dataset(const fitcache_dataset_id_t &id, uint32_t jobid) {
 std::vector<ServerEndpoint> registry_live_servers() {
     std::vector<ServerEndpoint> out;
     if (!g_initialized) return out;
+    const std::string nodes_dir = g_nodes_dir();
     std::error_code ec;
     uint64_t now = now_unix();
     uint64_t stale = static_cast<uint64_t>(heartbeat_sec()) * kHeartbeatStaleMultiplier;
 
-    for (const auto &entry : fs::directory_iterator(g_nodes_dir, ec)) {
-        if (ec) break;
+    int file_count = 0;
+    for (const auto &entry : fs::directory_iterator(nodes_dir, ec)) {
+        if (ec) {
+            L4C_WARN("registry_live_servers: directory_iterator(%s) error: %s",
+                     nodes_dir.c_str(), ec.message().c_str());
+            break;
+        }
         if (!entry.is_regular_file(ec)) continue;
+        ++file_count;
         auto kv = parse_kv(entry.path().string());
 
         // Discover the set of ranks present in this file by scanning keys
@@ -343,6 +374,7 @@ std::vector<ServerEndpoint> registry_live_servers() {
             out.push_back(std::move(s));
         }
     }
+    (void)file_count;
     return out;
 }
 
@@ -356,8 +388,9 @@ std::vector<std::string> registry_nodes_caching_dataset(
     (void)id;
     std::vector<std::string> out;
     if (!g_initialized) return out;
+    const std::string nodes_dir = g_nodes_dir();
     std::error_code ec;
-    for (const auto &entry : fs::directory_iterator(g_nodes_dir, ec)) {
+    for (const auto &entry : fs::directory_iterator(nodes_dir, ec)) {
         if (ec) break;
         if (!entry.is_regular_file(ec)) continue;
         out.push_back(entry.path().stem().string());
@@ -367,11 +400,12 @@ std::vector<std::string> registry_nodes_caching_dataset(
 
 int registry_gc_stale() {
     if (!g_initialized) return -1;
+    const std::string nodes_dir = g_nodes_dir();
     std::error_code ec;
     uint64_t now = now_unix();
     uint64_t stale = static_cast<uint64_t>(heartbeat_sec()) * kHeartbeatStaleMultiplier;
     int gc_count = 0;
-    for (const auto &entry : fs::directory_iterator(g_nodes_dir, ec)) {
+    for (const auto &entry : fs::directory_iterator(nodes_dir, ec)) {
         if (ec) break;
         if (!entry.is_regular_file(ec)) continue;
         std::string path = entry.path().string();

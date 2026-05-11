@@ -147,13 +147,13 @@ int select_server_for_path(const std::string &path, int local_server_count) {
         refresh_locked();
     }
     if (g_live_slots.empty()) {
-        // Registry empty or unreadable — degrade to modulo so the call
-        // returns a usable slot. Single-job .ports.cfg path will resolve it.
+        // Registry empty or unreadable. Degrade to modulo so the call returns
+        // a usable slot. Single-job .ports.cfg path resolves it; otherwise
+        // the open will fail-fast via the lookup_addr signal.
         return modulo_select(path, local_server_count);
     }
 
-    // Build the HRW input from the currently-live slot subset. Order matches
-    // g_live_slots so we can map the chosen index back to a slot id.
+    // Build the HRW input from the currently-live slot subset.
     std::vector<ServerEndpoint> view;
     view.reserve(g_live_slots.size());
     for (int s : g_live_slots) view.push_back(g_endpoints[s]);

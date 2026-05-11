@@ -23,7 +23,12 @@
 #include "fitcache_internal.h"
 #include "fitcache_logging.h"
 #include "execinfo.h"
-// #include "fitcache_multi_source_read.h"
+
+// ms_read() lives in fitcache_multi_source_read.{cpp,h}. The header is
+// extern "C"-guarded so this C TU can include it directly; without it the
+// compiler treats ms_read as implicitly declared and the build warns
+// "implicit declaration of function 'ms_read'".
+#include "fitcache_multi_source_read.h"
 
 // Global symbol that will "turn off" all I/O redirection.  Set during init
 // and shutdown to prevent us from getting into init loops that cause a

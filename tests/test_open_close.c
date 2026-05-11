@@ -46,7 +46,7 @@ void generate_files_open_close(uint32_t filecount){
         memset(buffer, 'A', sizeof(buffer));
         write(testfile, (void *)buffer, sizeof(buffer));
 
-        fclose(testfile);
+        close(testfile);
     }
 }
 

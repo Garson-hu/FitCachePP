@@ -67,8 +67,18 @@ ssize_t ms_read(int fd, void* buf, size_t count, int64_t offset)
 
     int remote_fd = fd_redir_map[fd];
     L4C_INFO("Remote fd: %d", remote_fd);
-    int host = fitcache::select_server_for_path(fd_map[fd],
-        static_cast<int>(g_fitcache_server_count));
+    // Cross-job peer-fanout: if the open returned a redirect to a peer,
+    // route this read to that peer too. Without this the remote_fd from the
+    // peer is sent to the HRW-chosen server (which doesn't know that fd) and
+    // the read fails.
+    int override_slot = fitcache_client_get_peer_slot_override(fd);
+    int host = (override_slot >= 0)
+        ? override_slot
+        : fitcache::select_server_for_path(fd_map[fd],
+            static_cast<int>(g_fitcache_server_count));
+    if (override_slot >= 0) {
+        L4C_INFO("ms_read: peer-slot override %d active for fd %d", override_slot, fd);
+    }
 
     fitcache_client_comm_gen_read_rpc_with_ms(host, fd, buf, count, offset,
         ms_read_cb, dram_state);

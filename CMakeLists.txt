@@ -12,10 +12,18 @@ project(FitCache
 		LANGUAGES C CXX)
 
 
-option(DEBUG_HU "Enable the DEBUG_HU macro in code" OFF)
+option(DEBUG_HU "Enable verbose DEBUG_HU log lines in the FitCache code" OFF)
 
+# Always define DEBUG_HU as an integer (0 or 1) so the `if(DEBUG_HU)` checks
+# in C/C++ compile cleanly regardless of whether the option is on or off.
+# Previously this branch only added the definition when the CMake option was
+# ON, but with the value 0 — which is confusing (the C macro was either
+# undefined or defined to a falsy value). The build script worked around it
+# by always passing -DDEBUG_HU=1. Cleaned up here.
 if(DEBUG_HU)
-  add_definitions(-DDEBUG_HU=0)  # or use target_compile_definitions
+  add_definitions(-DDEBUG_HU=1)
+else()
+  add_definitions(-DDEBUG_HU=0)
 endif()
 
 #Some Parts are C
