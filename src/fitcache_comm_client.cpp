@@ -49,6 +49,10 @@ struct fitcache_open_state {
     uint32_t local_fd;
     fitcache_file_sync_context *sync_ctx;     // Per-file sync context
     std::string filename;                 // Associated filename
+    // Cross-job peer-fanout: number of redirect hops the open is still allowed
+    // to take. Starts at 1; decremented when fitcache_open_cb sees
+    // FITCACHE_OPEN_REDIRECT and re-issues the open against the peer.
+    int redirect_hops_remaining;
 };
 
 struct fitcache_seek_state {
@@ -222,6 +226,31 @@ std::map<int, std::string> address_cache;  // Key: Rank, Value: Server Address
 extern std::map<int, int > fd_redir_map;
 extern std::map<int, std::string > fd_map;
 
+// Cross-job peer-fanout: after an open RPC returned FITCACHE_OPEN_REDIRECT and
+// we re-opened against a peer, store the peer routing slot here so subsequent
+// read/seek/close RPCs on the same local fd route to that peer rather than to
+// the path's HRW-chosen server. Empty for fds that opened directly on the
+// HRW-chosen server (the normal case).
+static std::mutex                 fd_peer_slot_mutex;
+static std::map<int, int>         fd_peer_slot_override;
+
+// Public helpers used by the routing layer in fitcache_client.cpp.
+extern "C" int fitcache_client_get_peer_slot_override(int local_fd) {
+    std::lock_guard<std::mutex> lock(fd_peer_slot_mutex);
+    auto it = fd_peer_slot_override.find(local_fd);
+    return (it == fd_peer_slot_override.end()) ? -1 : it->second;
+}
+
+extern "C" void fitcache_client_clear_peer_slot_override(int local_fd) {
+    std::lock_guard<std::mutex> lock(fd_peer_slot_mutex);
+    fd_peer_slot_override.erase(local_fd);
+}
+
+static void fitcache_client_set_peer_slot_override(int local_fd, int peer_slot) {
+    std::lock_guard<std::mutex> lock(fd_peer_slot_mutex);
+    fd_peer_slot_override[local_fd] = peer_slot;
+}
+
 extern "C" bool fitcache_file_tracked(int fd);
 extern "C" bool fitcache_track_file(const char* path, int flags, int fd);
 
@@ -251,38 +280,101 @@ fitcache_seek_cb(const struct hg_cb_info *info)
     return HG_SUCCESS;    
 }
 
+// Helper: signal completion (failure path) and clean up open_state.
+static void open_cb_fail_cleanup(struct fitcache_open_state *open_state) {
+    fitcache_set_fd_state(open_state->local_fd, FitCache_FD_ERROR, open_state->filename);
+    fd_redir_map[open_state->local_fd] = -1;
+    fitcache_signal_file_operation_done(open_state->sync_ctx, -1);
+    fitcache_release_file_sync_context(open_state->filename);
+    delete open_state;
+}
+
 static hg_return_t
 fitcache_open_cb(const struct hg_cb_info *info)
 {
     FitCache_TIMING("HvacCommClient_(fitcache_open_cb)_total");
-    
+
     fitcache_open_out_t out;
-    struct fitcache_open_state *open_state = (struct fitcache_open_state *)info->arg;    
+    struct fitcache_open_state *open_state = (struct fitcache_open_state *)info->arg;
     assert(info->ret == HG_SUCCESS);
 
-    HG_Get_output(info->info.forward.handle, &out); 
+    HG_Get_output(info->info.forward.handle, &out);
 
-    // Map the local fd to the remote fd
+    // Cross-job peer redirect: the server we asked told us to retry against
+    // a peer that has the file cached. Re-issue the open RPC against that
+    // peer, then route subsequent reads/seek/close on this fd to the peer.
+    if (out.ret_status == FITCACHE_OPEN_REDIRECT &&
+        out.peer_addr != NULL && out.peer_addr[0] != '\0' &&
+        open_state->redirect_hops_remaining > 0) {
+
+        std::string peer_addr = out.peer_addr;
+        L4C_INFO("Open RPC: server told us to redirect fd %d (path=%s) to peer %s",
+                 open_state->local_fd, open_state->filename.c_str(), peer_addr.c_str());
+
+        HG_Free_output(info->info.forward.handle, &out);
+        HG_Destroy(info->info.forward.handle);
+
+        int peer_slot = fitcache::register_endpoint(peer_addr);
+        if (peer_slot < 0) {
+            L4C_ERR("Open RPC: failed to register peer addr %s as a routing slot",
+                    peer_addr.c_str());
+            open_cb_fail_cleanup(open_state);
+            return HG_SUCCESS;
+        }
+
+        hg_addr_t peer_hg_addr = fitcache_client_comm_lookup_addr(peer_slot);
+        if (!peer_hg_addr) {
+            L4C_ERR("Open RPC: failed to resolve hg_addr for peer slot %d (addr=%s)",
+                    peer_slot, peer_addr.c_str());
+            open_cb_fail_cleanup(open_state);
+            return HG_SUCCESS;
+        }
+
+        hg_handle_t new_handle;
+        fitcache_comm_create_handle(peer_hg_addr, fitcache_client_open_id, &new_handle);
+
+        fitcache_open_in_t new_in;
+        new_in.path = (hg_string_t)malloc(open_state->filename.size() + 1);
+        sprintf(new_in.path, "%s", open_state->filename.c_str());
+
+        // Remember to route subsequent ops on this fd to the peer.
+        fitcache_client_set_peer_slot_override(open_state->local_fd, peer_slot);
+        open_state->redirect_hops_remaining--;
+
+        hg_return_t hr = HG_Forward(new_handle, fitcache_open_cb, open_state, &new_in);
+        free(new_in.path);
+        fitcache_comm_free_addr(peer_hg_addr);
+
+        if (hr != HG_SUCCESS) {
+            L4C_ERR("Open RPC: HG_Forward to peer %s failed (hr=%d)",
+                    peer_addr.c_str(), (int)hr);
+            HG_Destroy(new_handle);
+            // Drop the peer slot override we just set — opening failed.
+            fitcache_client_clear_peer_slot_override(open_state->local_fd);
+            open_cb_fail_cleanup(open_state);
+            return HG_SUCCESS;
+        }
+        // Wait for the redirected callback to fire; do not signal yet.
+        return HG_SUCCESS;
+    }
+
+    // Normal path (no redirect, or redirects exhausted): record the remote fd.
     fd_redir_map[open_state->local_fd] = out.ret_status;
-    // Update FD state
     if (out.ret_status > 0) {
         fitcache_set_fd_state(open_state->local_fd, FitCache_FD_READY, open_state->filename);
     } else {
         fitcache_set_fd_state(open_state->local_fd, FitCache_FD_ERROR, open_state->filename);
     }
-    
-    L4C_INFO("Open RPC Returned FD: %d, Local FD %d\n",out.ret_status, open_state->local_fd);
+
+    L4C_INFO("Open RPC Returned FD: %d, Local FD %d\n", out.ret_status, open_state->local_fd);
 
     HG_Free_output(info->info.forward.handle, &out);
     HG_Destroy(info->info.forward.handle);
 
-    // Signal completion to the specific file's sync context
     fitcache_signal_file_operation_done(open_state->sync_ctx, out.ret_status);
-    
-    // Release the sync context and cleanup
     fitcache_release_file_sync_context(open_state->filename);
     delete open_state;
-    
+
     return HG_SUCCESS;
 }
 
@@ -438,6 +530,9 @@ void fitcache_client_comm_gen_open_rpc(uint32_t svr_hash, string path, int fd)
     // Get or create per-file sync context
     fitcache_open_state_p->sync_ctx = fitcache_get_file_sync_context(path);
     fitcache_open_state_p->filename = path;
+    // Allow at most one cross-job peer redirect on this open. If the peer also
+    // says "go elsewhere" the second open is treated as a hard failure.
+    fitcache_open_state_p->redirect_hops_remaining = 1;
     
     // Set FD state to opening
     fitcache_set_fd_state(fd, FitCache_FD_OPENING, path);

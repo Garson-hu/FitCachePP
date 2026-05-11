@@ -78,6 +78,12 @@ std::string slot_to_addr(int slot);
 // production code refreshes opportunistically inside select_server_for_path.
 void refresh_cluster_endpoints();
 
+// Register a Mercury addr as a routing slot if it isn't already known, and
+// return the slot id (existing or newly-issued). Used by the client when an
+// open RPC returns FITCACHE_OPEN_REDIRECT pointing at a peer addr that may
+// not yet be in the cluster snapshot. Returns -1 on empty input.
+int register_endpoint(const std::string &addr);
+
 }  // namespace fitcache
 
 #endif  // __cplusplus

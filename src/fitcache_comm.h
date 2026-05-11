@@ -23,12 +23,23 @@ extern int server_rank;
 extern "C" hg_return_t fitcache_rpc_handler_bulk_cb(const struct hg_cb_info *info);
 
 //RPC Open Handler
-MERCURY_GEN_PROC(fitcache_open_out_t, ((int32_t)(ret_status)))
-/*
-typedef struct {
-    int32_t ret_status;
-} fitcache_open_out_t;
-*/
+//
+// In single-job mode `ret_status` is the local server fd (>= 0) or a negative
+// errno on failure. In cross-job mode (FitCache_CROSS_JOB=1) the server may
+// also return FITCACHE_OPEN_REDIRECT, in which case `peer_addr` is set to the
+// Mercury addr of a peer-job server that has the file cached. The client
+// re-issues the open RPC against that peer.
+//
+// `peer_addr` is always present in the wire format; it is the empty string
+// when there is no redirect.
+MERCURY_GEN_PROC(fitcache_open_out_t,
+    ((int32_t)(ret_status))((hg_string_t)(peer_addr)))
+
+// Special ret_status sentinel that signals the client should retry the open
+// against `peer_addr` instead of the originally-chosen server.
+// Chosen well outside the kernel errno range so it cannot collide with a real
+// -errno return from open().
+#define FITCACHE_OPEN_REDIRECT (-32768)
 
 MERCURY_GEN_PROC(fitcache_open_in_t, ((hg_string_t)(path)))
 /*
@@ -104,6 +115,13 @@ void fitcache_client_comm_register_rpc();
 void fitcache_client_block_for_file(const std::string& file_path);
 ssize_t fitcache_read_block_for_file(const std::string& file_path);
 
+// Cross-job peer-fanout: routing override per local fd. After an open RPC
+// returned FITCACHE_OPEN_REDIRECT and we re-opened on a peer, the local fd's
+// subsequent read/seek/close RPCs must be routed to that peer's slot rather
+// than to the path's HRW-chosen slot. Returns -1 if no override is set.
+extern "C" int  fitcache_client_get_peer_slot_override(int local_fd);
+extern "C" void fitcache_client_clear_peer_slot_override(int local_fd);
+
 // DEPRECATED: Old global blocking functions (kept for backward compatibility)
 void fitcache_client_block();
 ssize_t fitcache_read_block();
@@ -132,6 +150,12 @@ hg_id_t fitcache_trigger_srv_print_stats_rpc_register(void);
 // Cross-job peer-lookup RPC registration (TPDS extension).
 hg_id_t fitcache_peer_lookup_rpc_register_server(void);
 hg_id_t fitcache_peer_lookup_rpc_register_client(void);
+
+// Returns the peer-lookup hg_id_t captured by the most recent server-side
+// registration. Used by fitcache_open_rpc_handler to issue HG_Forward when
+// fanning out peer-lookup queries on cache miss in cross-job mode. Returns 0
+// if the server hasn't registered the RPC yet.
+hg_id_t fitcache_peer_lookup_get_id(void);
 
 // Forward declarations for per-file sync context and state structures
 struct fitcache_file_sync_context;

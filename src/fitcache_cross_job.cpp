@@ -168,4 +168,21 @@ std::string slot_to_addr(int slot) {
     return g_endpoints[slot].addr;
 }
 
+int register_endpoint(const std::string &addr) {
+    if (addr.empty()) return -1;
+    std::lock_guard<std::mutex> lock(g_routing_mtx);
+    auto it = g_addr_to_slot.find(addr);
+    if (it != g_addr_to_slot.end()) return it->second;
+    ServerEndpoint s;
+    s.rank      = -1;       // unknown — we only have the addr
+    s.addr      = addr;
+    s.node_uuid = "";
+    s.jobid     = "";
+    s.live      = true;
+    int slot = static_cast<int>(g_endpoints.size());
+    g_endpoints.push_back(s);
+    g_addr_to_slot.emplace(s.addr, slot);
+    return slot;
+}
+
 }  // namespace fitcache

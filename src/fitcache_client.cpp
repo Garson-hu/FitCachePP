@@ -167,10 +167,15 @@ ssize_t fitcache_remote_read(int fd, void *buf, size_t count)
 	 */
 	ssize_t bytes_read = -1;
 	if (fitcache_file_tracked(fd)){
-		uint32_t host = static_cast<uint32_t>(
-			fitcache::select_server_for_path(fd_map[fd],
-				static_cast<int>(g_fitcache_server_count)));
-		L4C_INFO("Remote read - Host %d", host);
+		// Cross-job peer-fanout: if the open returned a redirect to a peer,
+		// route this read to the peer instead of HRW-picking again.
+		int override_slot = fitcache_client_get_peer_slot_override(fd);
+		uint32_t host = (override_slot >= 0)
+			? static_cast<uint32_t>(override_slot)
+			: static_cast<uint32_t>(
+				fitcache::select_server_for_path(fd_map[fd],
+					static_cast<int>(g_fitcache_server_count)));
+		L4C_INFO("Remote read - Host %d (override=%d)", host, override_slot);
 		fitcache_client_comm_gen_read_rpc(host, fd, buf, count, -1);
 		bytes_read = fitcache_read_block_for_file(fd_map[fd]);
 		return bytes_read;
@@ -194,10 +199,13 @@ ssize_t fitcache_remote_pread(int fd, void *buf, size_t count, off_t offset)
 	 */
 	ssize_t bytes_read = -1;
 	if (fitcache_file_tracked(fd) && fd_redir_map[fd] != 0){
-		uint32_t host = static_cast<uint32_t>(
-			fitcache::select_server_for_path(fd_map[fd],
-				static_cast<int>(g_fitcache_server_count)));
-		L4C_INFO("Remote pread - Host %d", host);
+		int override_slot = fitcache_client_get_peer_slot_override(fd);
+		uint32_t host = (override_slot >= 0)
+			? static_cast<uint32_t>(override_slot)
+			: static_cast<uint32_t>(
+				fitcache::select_server_for_path(fd_map[fd],
+					static_cast<int>(g_fitcache_server_count)));
+		L4C_INFO("Remote pread - Host %d (override=%d)", host, override_slot);
 		fitcache_client_comm_gen_read_rpc(host, fd, buf, count, offset);
 		bytes_read = fitcache_read_block_for_file(fd_map[fd]);
 	}
@@ -216,9 +224,12 @@ ssize_t fitcache_remote_lseek(int fd, int64_t offset, int whence)
 	 */
 	ssize_t bytes_read = -1;
 	if (fitcache_file_tracked(fd)){
-		uint32_t host = static_cast<uint32_t>(
-			fitcache::select_server_for_path(fd_map[fd],
-				static_cast<int>(g_fitcache_server_count)));
+		int override_slot = fitcache_client_get_peer_slot_override(fd);
+		uint32_t host = (override_slot >= 0)
+			? static_cast<uint32_t>(override_slot)
+			: static_cast<uint32_t>(
+				fitcache::select_server_for_path(fd_map[fd],
+					static_cast<int>(g_fitcache_server_count)));
 		// L4C_INFO("Remote seek - Host %d", host);
 		fitcache_client_comm_gen_seek_rpc(host, fd, offset, whence);
 		bytes_read = fitcache_read_block_for_file(fd_map[fd]);  // Reuse read_block for seek result
@@ -230,10 +241,17 @@ ssize_t fitcache_remote_lseek(int fd, int64_t offset, int whence)
 
 void fitcache_remote_close(int fd){
 	if (fitcache_file_tracked(fd)){
-		uint32_t host = static_cast<uint32_t>(
-			fitcache::select_server_for_path(fd_map[fd],
-				static_cast<int>(g_fitcache_server_count)));
+		int override_slot = fitcache_client_get_peer_slot_override(fd);
+		uint32_t host = (override_slot >= 0)
+			? static_cast<uint32_t>(override_slot)
+			: static_cast<uint32_t>(
+				fitcache::select_server_for_path(fd_map[fd],
+					static_cast<int>(g_fitcache_server_count)));
 		fitcache_client_comm_gen_close_rpc(host, fd);
+		// Clear the peer override now that we're done with the fd.
+		if (override_slot >= 0) {
+			fitcache_client_clear_peer_slot_override(fd);
+		}
 	}
 }
 
