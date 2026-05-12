@@ -32,6 +32,16 @@ N_TRAIN_ARG=()
 if [ -n "${FITPP_N_TRAIN:-}" ]; then
     N_TRAIN_ARG=(--n-train "$FITPP_N_TRAIN")
 fi
+# FITPP_SEED override — different seeds across jobs in Phase B.1 cross-job
+# concurrent so the two jobs access files in DIFFERENT orders. With the
+# default --seed=0 in both jobs, they race on the same file at the same
+# time, peer_lookup always sees an empty cache (file not yet promoted on
+# either side), and cross-job sharing never fires. Different seeds give
+# Job A a chance to populate the cache BEFORE Job B asks for the file.
+SEED_ARG=()
+if [ -n "${FITPP_SEED:-}" ]; then
+    SEED_ARG=(--seed "$FITPP_SEED")
+fi
 
 if [ "${FITPP_PURE_CF:-0}" = "1" ]; then
     # Pure_CF baseline: no LD_PRELOAD, no FitCache. train.py reads BeeGFS
@@ -41,13 +51,15 @@ if [ "${FITPP_PURE_CF:-0}" = "1" ]; then
     /home/ghu4/hvac/rlibrary/miniconda3/envs/hvac_tf/bin/python3 \
         /home/ghu4/hvac/benchmark/cosmoflow-benchmark-master/train.py -d \
         --data-dir "$FitCache_DATA_DIR" \
-        "${N_TRAIN_ARG[@]}"
+        "${N_TRAIN_ARG[@]}" \
+        "${SEED_ARG[@]}"
 else
     LD_PRELOAD=/home/ghu4/hvac/FitCachePP/build/src/libfitcache_client.so \
         /home/ghu4/hvac/rlibrary/miniconda3/envs/hvac_tf/bin/python3 \
         /home/ghu4/hvac/benchmark/cosmoflow-benchmark-master/train.py -d \
         --data-dir "$FitCache_DATA_DIR" \
-        "${N_TRAIN_ARG[@]}"
+        "${N_TRAIN_ARG[@]}" \
+        "${SEED_ARG[@]}"
 fi
 
 echo DONE `hostname`

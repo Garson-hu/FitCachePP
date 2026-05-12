@@ -50,26 +50,30 @@ COMMON_EXPORT+=",FITPP_N_TRAIN=$N_TRAIN"
 COMMON_EXPORT+=",FITPP_DROP_PAGECACHE=1"
 COMMON_EXPORT+=",FITPP_PURGE_CACHE=1"
 
-# Submit Job A. Override RESULTS_DIR + DRAM/NVME paths so Jobs A + B don't
-# collide on disk (they're on different physical nodes anyway, but make
-# the names distinct for clarity).
+# Submit Job A with FITPP_SEED=1 + Job B with FITPP_SEED=2 so the two jobs
+# shuffle the dataset DIFFERENTLY. With identical seeds (the prior default
+# of --seed=0 in both jobs), both jobs read files in the same order and
+# race at every open — peer_lookup always sees an empty cache because the
+# file hasn't been promoted on either side yet. Different seeds let one
+# job get ahead on a given file → peer_lookup finds HAS=1 → cross-job
+# sharing actually fires.
 JOB_A_RESULTS=$RESULTS_DIR_BASE/jobA_${RUN_TAG}
 mkdir -p "$JOB_A_RESULTS"
 JOB_A_OUT=$(sbatch \
     -w "$NODE_A" \
     -o "$JOB_A_RESULTS/FitCachePP-%j.out" \
-    --export="$COMMON_EXPORT,RESULTS_DIR=$JOB_A_RESULTS,FitCache_DRAM_PATH=/mnt/local/ghu4/fitcachepp_concv2_${RUN_TAG}_dram,FitCache_NVME_PATH=/mnt/local/ghu4/fitcachepp_concv2_${RUN_TAG}_nvme" \
+    --export="$COMMON_EXPORT,FITPP_SEED=1,RESULTS_DIR=$JOB_A_RESULTS,FitCache_DRAM_PATH=/mnt/local/ghu4/fitcachepp_concv2_${RUN_TAG}_dram,FitCache_NVME_PATH=/mnt/local/ghu4/fitcachepp_concv2_${RUN_TAG}_nvme" \
     "$REPO/benchmarks/cosmoflow/PDSW_FITPP.sh" 2>&1 | tail -1)
-echo "[driver] $JOB_A_OUT (Job A on $NODE_A)"
+echo "[driver] $JOB_A_OUT (Job A on $NODE_A, seed=1)"
 
 JOB_B_RESULTS=$RESULTS_DIR_BASE/jobB_${RUN_TAG}
 mkdir -p "$JOB_B_RESULTS"
 JOB_B_OUT=$(sbatch \
     -w "$NODE_B" \
     -o "$JOB_B_RESULTS/FitCachePP-%j.out" \
-    --export="$COMMON_EXPORT,RESULTS_DIR=$JOB_B_RESULTS,FitCache_DRAM_PATH=/mnt/local/ghu4/fitcachepp_concv2_${RUN_TAG}_dram,FitCache_NVME_PATH=/mnt/local/ghu4/fitcachepp_concv2_${RUN_TAG}_nvme" \
+    --export="$COMMON_EXPORT,FITPP_SEED=2,RESULTS_DIR=$JOB_B_RESULTS,FitCache_DRAM_PATH=/mnt/local/ghu4/fitcachepp_concv2_${RUN_TAG}_dram,FitCache_NVME_PATH=/mnt/local/ghu4/fitcachepp_concv2_${RUN_TAG}_nvme" \
     "$REPO/benchmarks/cosmoflow/PDSW_FITPP.sh" 2>&1 | tail -1)
-echo "[driver] $JOB_B_OUT (Job B on $NODE_B)"
+echo "[driver] $JOB_B_OUT (Job B on $NODE_B, seed=2)"
 
 JOB_A_ID=$(echo "$JOB_A_OUT" | awk '{print $NF}')
 JOB_B_ID=$(echo "$JOB_B_OUT" | awk '{print $NF}')
