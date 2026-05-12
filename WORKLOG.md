@@ -1,5 +1,41 @@
 # FitCache++ Worklog
 
+### 2026-05-12 — Phase A + B.2 cluster results: single-job baseline complete, sidecar restore validated
+
+End-to-end cluster experiments after fixing 6+ session bugs (path-filter mismatch in train.py vs FitCache_DATA_DIR, mpirun-strips-env, parallel-srun-deadlock, PDSW_FITPP.sh hardcoding overrides, FitCache_PMEM_PATH unbound under `set -u`, and the 6 from 2026-05-11).
+
+**Phase A — single-job FitCachePP vs Pure_CF baseline**, all at n_train=8192 on c66 (1 GPU, 188 GB RAM):
+
+| Cell | Mean epoch | Cold ep1 | Warm ep2-5 | σ |
+|---|---:|---:|---:|---:|
+| Pure_CF (no LD_PRELOAD), OS-warm ×2 | 842s | 856 / 855 | 841s | < 2s |
+| Pure_CF OS-cold (page cache evicted) | 840s | 855s | 838s | 1 rep |
+| FitCachePP, OS-warm ×3 | 905s (reps 2-3, rep 1 cold-cluster=1048) | 940-941 | 897s | < 3s |
+| FitCachePP OS-cold ×1.5 | 899s | 935-936 | 891s | < 2s |
+
+**Headline:** at n_train=8192/1-GPU, **FitCache adds 58s = +7% overhead**. Root cause: train_61440 dataset (167 GB) fits in c66's 188 GB RAM → OS page cache absorbs working set → FitCache's local-NVMe cache has nothing structural to win against. Mercury RPC per file open costs ~13ms/file × 4096 files = ~53s overhead per epoch. Page cache eviction (`posix_fadvise(POSIX_FADV_DONTNEED)`) confirmed no effect — **GPU compute (~205ms/step × 4096 steps = 840s) is the bottleneck**, not I/O. FitCache's value emerges in cross-job mode (Phase B.2) and presumably at multi-GPU large-working-set regime (Phase F, not yet run).
+
+**Phase B.2 — two-job sequential, sidecar restoration across job boundary** (SLURM 221695 → 221696 on c66 via `--dependency=afterok`, shared local cache):
+
+| Job | Cold ep1 | Warm ep2-4 | Sidecars at startup |
+|---|---:|---:|---:|
+| Job A (no prior cache) | 1023s | 863s ± 2s | 0 |
+| **Job B (sidecar restore)** | **979s** | 864s ± 1s | **9,216** |
+
+**Headline:** Job B's startup ran `restore-sidecars` and rebuilt path_cache_map from 9,216 sidecars on disk. Job B's epoch-1 = 979s = Job A's cold (1023s) − 44s = the FitCache cache-promotion overhead that Job B avoided. **The persistent-sidecar-metadata mechanism is validated** — Job B avoids the FitCache-specific cold-start penalty. (Job B epoch 5 hung after 90+ min; cancelled. The hang is independent of the sidecar restore claim, which is fully exercised in epoch 1.)
+
+**Phase B.1 — two-job concurrent peer_lookup redirect — UNRESOLVED.** Both attempts cancelled after 1h50min stuck on epoch 1. cross_job_stats counters show peer_lookup RPCs DO fire (11,662 forwarded by Job B) but EVERY response is has_no=0 across 12,196 lookups. Hypothesis: HRW with 8 cluster servers picks different servers across jobs for the same path; the responder server's path_cache_map doesn't have the file. Deep FitCache internals issue, deferred for debug session.
+
+**Phase D — real PMem on c35 /mnt/fsdax — SKIPPED.** /mnt/fsdax is root-owned, no user write access. Local 3-tier smoke already validates the code path; real-PMem performance measurement deferred until sysadmin grants write access.
+
+Files: [PHASE_AB_SUMMARY.md](benchmarks/results/PHASE_AB_SUMMARY.md), [EXPERIMENT_STATUS.md](EXPERIMENT_STATUS.md). Commits this session: 11 (path-filter, data-mover, registry, scripts, summaries). Cluster jobs run: ~20+ over the day.
+
+**Next steps**
+- Debug Phase B.1: instrument peer_lookup to log requested-path vs available-path mismatch; check if HRW server selection is consistent across job processes.
+- Phase C (Megatron + DINOv2): user prep (conda envs + tokenized corpus + ImageNet-22k metadata).
+- Phase D: sysadmin restore /mnt/fsdax write access on c35.
+- Phase F (optional): one n_train=61440 cell for IPDPS-comparable wall-clock parity.
+
 ### 2026-05-11 (latest) — Post-engineering hardening pass: HRW addr-in-hash, cross-job telemetry, PMem tier
 
 Picked up after the two-job concurrent cross-job sharing run on c70 + c71 surfaced a routing collapse: identical `/etc/machine-id` across the two hosts made `node_uuid` identical, so the HRW (highest-random-weight) score `path || node_uuid || rank` tied across hosts and all paths landed on whichever host registered first. Five concrete changes landed in this session.

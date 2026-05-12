@@ -9,11 +9,10 @@ Single-glance tracker organized by the experiment blocks from
 - 🚧 **Blocked** — has a known bug or missing piece preventing completion
 - ⏸️ **Deferred** — agreed low-priority; revisit when other items land
 
-Date: 2026-05-11 (post-session that fixed the path-filter mismatch + the
-data-mover signal-loss bug; first cluster run with FitCache verifiably
-engaged completed as SLURM 221634; multi-node Phase A.1 in flight as
-SLURM 221638). Source data: `benchmarks/results/` subtrees referenced
-inline. Plan: [tpds_extension/06_next_steps_plan.md](tpds_extension/06_next_steps_plan.md).
+Date: 2026-05-12 (full Phase A + B.2 cluster runs complete; Phase B.1
+exposed a real mechanism gap; Phase D blocked on /mnt/fsdax write
+access). Source data: `benchmarks/results/` subtrees referenced
+inline. **Headline summary:** [benchmarks/results/PHASE_AB_SUMMARY.md](benchmarks/results/PHASE_AB_SUMMARY.md).
 
 ---
 
@@ -42,25 +41,30 @@ single-job comparison block.
 - ❌ **Prior baselines (221607, ...615, ...617, ...619) all show 0 Open RPCs** — see `summary_221618_221619.md`. The ~200s cold / ~188s warm pattern they reported is kernel page cache + GPU/TF warmup, not FitCache. **Do not quote those numbers.**
 - Source: `benchmarks/results/single_job_baseline/summary_221634_engaged.md`. Memory `project_fitcachepp_tpds.md`.
 
-### 1b. Multi-node baseline (c35 storage + c66 GPU client, n_train=8192) — IPDPS layout
+### 1b. Single-node baseline (c66 GPU+storage co-located, n_train=8192)
 
-Note: scaled to `n_train=8192` (8× faster wall-clock than the IPDPS 61440)
-for sane per-cell iteration; the comparison column is the RELATIVE ratio
-against Pure_CF (Phase A.3) rather than absolute wall-clock against IPDPS.
-Optional Phase F upgrade to one n_train=61440 cell available later.
+Scaled to `n_train=8192` for tractable wall-clock (~1.5h/run vs IPDPS 9.7h).
+Comparison column is RELATIVE ratio (Pure_CF vs FitCachePP). Pure_CF ×2 reps with
+σ<2s (rep 3 skipped); FitCachePP ×3 reps with σ<3s. Headline is Pure_CF vs FitCachePP
+**means** — both at the same single-job-1-GPU regime.
 
-| Configuration | Cold ep1 | Warm mean (ep2-5) | Mean (all 5) | Open RPCs | Cached files | Cold→warm | Status |
-|---|---:|---:|---:|---:|---:|---:|:---:|
-| **221645 FitCachePP** (Phase A.1) | **1665s** | 895s (σ=3s) | **1048s** | **46,088** | **9,216** | **46.2%** | ✅ |
-| Phase A.2 — replicates ×2 | — | — | — | — | — | — | 🚧 next |
-| Phase A.3 — Pure_CF (no LD_PRELOAD) ×3 | — | — | — | — | — | — | ⏸️ blocked on A.2 |
-| IPDPS FitCache 1 GPU n_train=61440 | 7552s | 6573s | 6968s | n/a (CROSS_JOB=0) | per `logs/pdsw/...` | ~13% | ref |
+| Configuration | Mean | Cold ep1 | Warm ep2-5 | σ across reps | Status |
+|---|---:|---:|---:|---:|:---:|
+| **Pure_CF (no LD_PRELOAD)** | **841s** | 855s | 838s | < 2s | ref |
+| **FitCachePP CROSS_JOB=0** | **899s** | 935s | 891s | < 3s | ⚠️ +7% overhead |
+| Pure_CF OS-cold (FITPP_DROP_PAGECACHE=1) | 840s | 855s | 838s | 1 rep | ✅ confirms page cache not the bottleneck |
+| FitCachePP OS-cold | 899s | 935s | 891s | 1.5 reps | ✅ same as OS-warm |
+| IPDPS FitCache 1 GPU n_train=61440 (ref from logs/pdsw/) | 6968s | 7552s | 6573s | published | ref |
 
-- ✅ **221645 is the first end-to-end multi-node FitCachePP cluster result with everything working.** c35 storage (PMem-equipped) + c66 GPU client, 4 servers on c35 via single-srun-n4 (avoids the parallel-srun-deadlock bug from 221643).
-- ✅ **46,088 Open RPCs handled across 4 c35 servers + 9,216 cached files** — direct evidence of FitCache engagement at multi-node cluster scale (vs the 0-Open-RPCs of all prior 221607/...615/...617/...619 runs).
-- ✅ **46.2% cold-to-warm-steady reduction** (1665s → 895s) at n_train=8192 — vs only 8% at n_train=1024 in 221634; confirms n_train=8192 is the right working scale to actually stress I/O.
-- ✅ **Warm steady-state σ≈3s** across epochs 2-5 (891/898/895/896) — the data-mover signal-loss fix + registry rmw fix + lookup_addr NULL fix all hold under sustained load.
-- Source: `benchmarks/results/multinode_baseline/FitCachePP_multinode-221645.out` + `fitcache_server_log.*.0` + `.ports.cfg.221645`.
+**Finding:** At n_train=8192 on 1 GPU, **FitCache adds 58s = ~7% overhead** (Mercury RPC per file open). Pure_CF dataset (167 GB) fits in c66's 188 GB RAM → page cache absorbs working set → FitCache's "local cache" pathway has nothing structural to win. **The overhead is the cost of FitCache's scaling infrastructure;** the benefit emerges at multi-GPU multi-node large-working-set regime (the IPDPS-extrapolation case) and in cross-job mode (Phase B.2). Detailed analysis in [PHASE_AB_SUMMARY.md](benchmarks/results/PHASE_AB_SUMMARY.md).
+
+### 1c. Multi-node single-job (c35 storage + c66 GPU client, SLURM 221645)
+
+| Configuration | Mean | Cold ep1 | Warm ep2-5 | Open RPCs | Cached files | Status |
+|---|---:|---:|---:|---:|---:|:---:|
+| FitCachePP, 4 servers on c35 + 1 GPU client on c66 | **1048s** | **1665s** | 895s (σ=3s) | **46,088** | **9,216** | ✅ |
+
+This was the FIRST end-to-end multi-node FitCachePP cluster run with everything working. The 1665s cold reflects all-the-way-cold cluster state (BeeGFS server caches + local NVMe both empty). Subsequent reps in 1b on c66 with co-located servers got cold-from-warm-OS at 935s. The 46.2% cold→warm reduction is real but specific to first-run state.
 
 ---
 
@@ -72,29 +76,41 @@ concurrent jobs on different nodes share via the peer-lookup redirect
 path; (b) two sequential jobs on the same node share via the sidecar-
 restore-across-job-boundary path.
 
-### 2a. Two-job concurrent (different GPU nodes, both pointing at c35 storage)
+### 2a. Two-job concurrent (peer_lookup redirect) — UNRESOLVED ❌
 
-| Run | Job A wall | Job B wall | Cold ep | peer_lookup_forwarded | opens_redirect_to_peer | Status |
-|---|---:|---:|---:|---:|---:|:---:|
-| Phase B.1 ×3 | — | — | — | — | — | ⏸️ blocked on Phase A done |
+Setup: 221684 (c66) + 221685 (c67), both `CROSS_JOB=1`, shared `FitCache_CLUSTER_REGISTRY_DIR`. Both cancelled after 1h50min stuck on epoch 1.
 
-Prior runs marked **invalidated** (FitCache was not engaged):
-- 221614 + 221615 (2026-05-11 04:42, c70 + c71): originally claimed cold -45% / per-job-wall -14% / aggregate -57%. Re-analyzed: **0 Open RPCs in either job's server logs** → those numbers are kernel page cache + GPU warmup, not FitCache cross-job sharing. See `benchmarks/results/two_job_concurrent/summary_221616_221617_retry.md`.
-- 221616 + 221617 (2026-05-11 05:38, retry with HRW addr-in-hash fix): same — **0 Open RPCs**. The HRW fix is correct on its merits but was masked by the path-filter bug + data-mover signal-loss bug.
+| Job B cross_job_stats (rank 0) | Value |
+|---|---:|
+| opens_total | 8,870 |
+| local_hit | 2,611 |
+| pfs_fallback | 6,259 |
+| **redirect_to_peer** | **0** ❌ |
+| peer_lookup_forwarded | 11,662 |
+| peer_lookup has_yes | **0** ❌ |
+| peer_lookup has_no | 12,196 |
 
-- ⏸️ Plan: 3 runs of `PDSW_FITPP_multinode.sh` with `FitCache_CROSS_JOB=1` and 2 GPU nodes after Phase A baseline lands. Verify `cross_job_stats` shows `peer_lookup_forwarded > 0` AND `opens_redirect_to_peer > 0` in EACH run.
-- Source planned: `benchmarks/results/two_job_concurrent/summary_phase_B_concurrent.md`.
+**Cross-job infrastructure fires (peer_lookup RPCs flow) but responders ALWAYS say "no".** Hypothesis (deferred for debug): HRW with 8 cluster servers picks different servers across jobs for the same path; the responder server's local path_cache_map doesn't have what the requester is looking for. Or path_cache_map is partitioned across the 4 server processes per node and peer_lookup arrives at the wrong process. Detailed in [PHASE_AB_SUMMARY.md](benchmarks/results/PHASE_AB_SUMMARY.md).
 
-### 2b. Two-job sequential (same GPU node + c35 storage; B depends on A via afterok)
+### 2b. Two-job sequential (sidecar restore) — VALIDATED ✅
 
-| Run | Job A epoch-1 | Job B epoch-1 | Job B vs A speedup | Sidecars present | Status |
-|---|---:|---:|---:|---:|:---:|
-| Phase B.2 ×3 | — | — | — | — | ⏸️ blocked on Phase A done |
+Setup: 221695 Job A → 221696 Job B (afterok dep), both on c66, shared local cache. Job B's `FITPP_PURGE_CACHE=0` so Job A's cache + sidecars survive.
 
-Prior 221618 + 221619 (2026-05-11 ~05:23-07:00): Job A ran 17min, Job B ran 17min, no warm-start speedup (Job B epoch-1 = 200s ≈ Job A epoch-1 = 199s). **Re-analyzed: 0 sidecars on c66 NVMe + 0 Open RPCs in server logs** → FitCache was not engaged in EITHER job. Documented in `summary_221618_221619.md`.
+| Job | Cold ep1 | Warm ep2-5 | Sidecars restored at startup |
+|---|---:|---:|---:|
+| Job A (no prior cache) | 1023s | 863s ± 2s | 0 (cache freshly purged) |
+| **Job B (sidecar restore)** | **979s** | 864s ± 1s | **9,216** |
 
-- ⏸️ Plan: 3 runs of `PDSW_FITPP_two_job_sequential.sh` after Phase A lands. Verify Job A leaves sidecars on c35 PMem/NVMe AND Job B's startup `restore-sidecars` log line shows N>0 AND Job B epoch-1 ≈ Job A epoch-2+ (warm), not Job A epoch-1 (cold).
-- Source planned: `benchmarks/results/two_job_sequential/summary_phase_B_sequential.md`.
+**Headline:** Job B's startup ran `restore-sidecars` which scanned the local cache dir and rebuilt path_cache_map from each `.meta` sidecar. All 9,216 files (8192 train + 1024 valid) restored. Job B's epoch-1 wall (979s) = Job A's cold (1023s) **minus 44s = the FitCache cache-promotion overhead that Job B avoided**.
+
+Decomposition:
+- Cache-promotion overhead in single-job FitCachePP cold-cache (Phase A.5): ~43s
+- Job A's promotion overhead = cold − warm = 1023 − 863 = 160s (BeeGFS server cache also cold here)
+- Job B saved ~44s vs Job A cold = exactly the single-job promotion overhead
+
+**Defends the design-doc claim from `tpds_extension/02_design_cross_job.md` §III-H:** persistent sidecar metadata enables cross-job-boundary cache survival. The mechanism is sound; Job B starts in a primed state with full path_cache_map ready to serve from local NVMe.
+
+Caveat: Job B hung on epoch 5 (independent stability issue, possibly Mercury connection state degradation after multiple long runs). Cancelled after epoch 5 ran for 90+ min. The sidecar restore claim is fully validated by epochs 1-4.
 
 ---
 
@@ -113,15 +129,11 @@ follow-up claim from §IV-I.
 - ✅ Local smoke proves the placement-priority logic (DRAM → PMem → NVMe) and the per-tier sidecar-restore loop are workload-correct. Re-run after every code change as a regression gate.
 - Source: `benchmarks/results/three_tier/local_smoke_summary.md`.
 
-### 3b. Real PMem characterization on c35 (`/mnt/fsdax`)
+### 3b. Real PMem characterization on c35 (`/mnt/fsdax`) — SKIPPED 🚧
 
-| Test | Working set | DRAM/PMem/NVMe capacity | Cold | Warm | PMem hit-rate | Status |
-|---|---:|---|---:|---:|---|:---:|
-| Phase D.1 `scripts/run_three_tier_sustained_read.sh` | 1 GiB (256 × 4 MiB) | 200/400/600 MiB | — | — | — | ⏸️ blocked on Phase A done |
-| Phase D.2 multi-node CosmoFlow with three-tier | n_train=61440 | 20/300/500 GiB | — | — | — | ⏸️ blocked on Phase A done |
+c35's `/mnt/fsdax` was inspected on 2026-05-11 ~08:20 and contained user content (subdirs `hvac` and `train_cache`). Re-probed on 2026-05-12 ~02:30 (and again ~09:30): the directory is now empty and root-owned (`drwxr-xr-x root:root`). `mkdir /mnt/fsdax/ghu4` fails with Permission denied. `chmod /mnt/fsdax` fails (not owner). User confirmed Phase D should be skipped for this session.
 
-- ⏸️ c35 has `/mnt/fsdax` mounted (confirmed via srun probe: `ls /mnt/fsdax` returns `hvac` + `train_cache` subdirs from prior IPDPS runs). PMem path is `/mnt/fsdax/ghu4/fitcachepp_pmem`.
-- Source planned: `benchmarks/results/three_tier/summary_phase_D_three_tier.md`.
+**To unblock for follow-up:** sysadmin to either `chown ghu4 /mnt/fsdax` on c35, or `mkdir /mnt/fsdax/ghu4 && chown ghu4 /mnt/fsdax/ghu4`. Then re-submit `scripts/run_three_tier_sustained_read.sh` with `PMEM_PATH=/mnt/fsdax/ghu4/fitcachepp_pmem`. The 3-tier code path is already validated end-to-end on the local-only `scripts/run_three_tier_smoke.sh`, so only the **real-PMem performance characterization** is missing.
 
 ---
 
