@@ -72,10 +72,12 @@ export PATH=/home/ghu4/hvac/rlibrary/miniconda3/envs/hvac_tf/bin:/home/ghu4/hvac
 
 # Tier paths + capacity. NVMe only here (rtx4060ti16g nodes don't have PMem;
 # the three-tier eval lives in PDSW_FITPP_three_tier.sh and runs on c35).
-export FitCache_DRAM_PATH=/mnt/local/ghu4/fitcachepp_train_cache_dram
-export FitCache_NVME_PATH=/mnt/local/ghu4/fitcachepp_train_cache_nvme
-export FitCache_DRAM_CAPACITY=$((100 * 1024 * 1024 * 1024))   # 100 GB
-export FitCache_NVME_CAPACITY=$((500 * 1024 * 1024 * 1024))   # 500 GB
+# Tier paths + capacities. Caller may override (e.g., cross-job runs use
+# per-RUN_TAG'd dirs to avoid collisions on shared /mnt/local).
+export FitCache_DRAM_PATH="${FitCache_DRAM_PATH:-/mnt/local/ghu4/fitcachepp_train_cache_dram}"
+export FitCache_NVME_PATH="${FitCache_NVME_PATH:-/mnt/local/ghu4/fitcachepp_train_cache_nvme}"
+export FitCache_DRAM_CAPACITY="${FitCache_DRAM_CAPACITY:-$((100 * 1024 * 1024 * 1024))}"
+export FitCache_NVME_CAPACITY="${FitCache_NVME_CAPACITY:-$((500 * 1024 * 1024 * 1024))}"
 # NOTE: Drop the trailing /train/ so FitCache_DATA_DIR is the canonical PARENT
 # of both train/ and validation/ subdirs. The LD_PRELOAD client in
 # fitcache_client.cpp:116 does a substring match between a candidate file's
@@ -84,12 +86,14 @@ export FitCache_NVME_CAPACITY=$((500 * 1024 * 1024 * 1024))   # 500 GB
 # Both train.py (--data-dir) and the FitCache shim must agree on this path,
 # or every read passes through to BeeGFS direct and the FitCache pathway
 # stays dormant (root cause of the zero-Open-RPC cluster runs on 2026-05-11).
-export FitCache_DATA_DIR=/mnt/beegfs/ghu4/hvac/cosmoUniverse_2019_05_4parE_tf_v2_mini/train_61440
+export FitCache_DATA_DIR="${FitCache_DATA_DIR:-/mnt/beegfs/ghu4/hvac/cosmoUniverse_2019_05_4parE_tf_v2_mini/train_61440}"
 
 export BBPATH=$FitCache_NVME_PATH
 
-# Single-job baseline: cross-job OFF. Servers behave exactly like IPDPS.
-export FitCache_CROSS_JOB=0
+# Single-job baseline default: cross-job OFF. Servers behave exactly like
+# IPDPS. Caller can override via --export=FitCache_CROSS_JOB=1 (e.g. the
+# two-job concurrent driver in PDSW_FITPP_two_job_concurrent_v2.sh).
+export FitCache_CROSS_JOB="${FitCache_CROSS_JOB:-0}"
 
 # Hand off to the shared launcher PDSW_FITPP_inner.sh — same code path as the
 # two-job and three-tier benchmarks. The inner script handles:
@@ -102,6 +106,8 @@ export FitCache_CROSS_JOB=0
 #     in the server logs — fails loud if zero)
 # Inherits SERVER_NODES / SERVERS_PER_NODE / CLIENT_NODES / FitCache_SERVER_COUNT
 # from the variable defaults above.
-export RESULTS_DIR=/home/ghu4/hvac/FitCachePP/benchmarks/results/single_job_baseline
+# Caller can override RESULTS_DIR (e.g., for cross-job concurrent runs that
+# want per-job dirs); default is the single-job baseline.
+export RESULTS_DIR="${RESULTS_DIR:-/home/ghu4/hvac/FitCachePP/benchmarks/results/single_job_baseline}"
 mkdir -p "$RESULTS_DIR"
 exec /home/ghu4/hvac/FitCachePP/benchmarks/cosmoflow/PDSW_FITPP_inner.sh
