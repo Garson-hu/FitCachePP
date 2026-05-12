@@ -56,6 +56,22 @@ fi
 # Pre-create cache dirs so multiple servers on the same node don't race.
 mkdir -p "$FitCache_DRAM_PATH" "$FitCache_NVME_PATH"
 
+# Sweep stale fitcache_intercept_log.* files in the cosmoflow benchmark dir.
+# These are the LD_PRELOAD client's log4c outputs (one per python PID per
+# run) and accumulate across runs in /home/ghu4/hvac/benchmark/cosmoflow-
+# benchmark-master/. They've already pushed the home quota over the limit
+# once today (causing 221680 to crash on history.csv write).
+# Only sweep files older than 5 minutes so we don't delete anything a
+# currently-running job is still writing to. Errors are non-fatal — quota
+# may already be tight; skip on failure.
+{
+    find /home/ghu4/hvac/benchmark/cosmoflow-benchmark-master \
+         -maxdepth 1 -name 'fitcache_intercept_log.*' -mmin +5 -delete 2>/dev/null
+    n=$(find /home/ghu4/hvac/benchmark/cosmoflow-benchmark-master \
+              -maxdepth 1 -name 'fitcache_intercept_log.*' 2>/dev/null | wc -l)
+    echo "[$(date '+%H:%M:%S')] swept stale intercept logs; $n remain (younger than 5 min, in-use)"
+} || echo "[warn] intercept log sweep failed (continuing)"
+
 # When the same physical cache dir is reused across runs (single-node
 # experiments often pin DRAM/NVMe paths to /mnt/local/ghu4/<fixed>),
 # leftover files from prior runs corrupt the engagement self-check's
