@@ -525,7 +525,8 @@ hg_id_t fitcache_seek_rpc_register(void) {
 // Dataset-identity verification (root_path_hash + manifest_hash
 // match) is intentionally deferred to the sidecar-metadata work,
 // which is when the server will track its own dataset_id. The
-// path-level match is conservative for Phase 2b: the same path
+// path-level match is conservative for the open-time peer-lookup
+// fanout work: the same path
 // implies the same dataset path, which is the dominant correctness
 // case for the bit-for-bit DL training scenario.
 // ============================================================

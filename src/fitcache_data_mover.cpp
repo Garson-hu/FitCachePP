@@ -255,6 +255,79 @@ int fitcache_data_mover_restore_from_sidecars()
     return total_restored;
 }
 
+// ============================================================
+// Cross-job sibling-cache refresh.
+// ------------------------------------------------------------
+// All FitCache server processes on the same node write their cached files
+// (and matching `.meta` sidecars) into the SAME tier directories
+// (FitCache_DRAM_PATH / _PMEM_PATH / _NVME_PATH). But each process's
+// path_cache_map is in-process — it only contains files THIS process
+// promoted. When a peer_lookup_rpc arrives at this process for a file
+// that a *sibling* process on this node has cached, the handler returns
+// has=0 even though the cached file is sitting on the shared local
+// disk and is readable from this process. That's the per-server-process
+// path_cache_map partitioning gap identified in the two-job concurrent
+// cross-job-sharing run analysis.
+//
+// The fix: periodically re-scan the local tier directories and merge any
+// not-yet-known sidecars into THIS process's path_cache_map. After a
+// refresh tick, peer_lookup at this process correctly answers has=1 for
+// anything any sibling on this node has cached, and the existing open-rpc
+// handler path serves the file from local disk via Mercury just as
+// though this process had cached it itself.
+//
+// De-dups against the existing path_cache_map by original_path so a
+// refresh tick never double-inserts or alters used-bytes counters (those
+// are owned by the data-mover thread that physically promoted the file).
+// ============================================================
+std::atomic<bool> fitcache_sibling_refresh_running{false};
+
+int fitcache_data_mover_refresh_from_siblings_once()
+{
+    const char *dram_env = getenv("FitCache_DRAM_PATH");
+    const char *pmem_env = getenv("FitCache_PMEM_PATH");
+    const char *nvme_env = getenv("FitCache_NVME_PATH");
+    if (!dram_env && !pmem_env && !nvme_env) return 0;
+
+    int added = 0;
+    auto adder = [&added](const std::string &cached_path,
+                          const fitcache::fitcache_file_meta_v1 &meta) {
+        std::unique_lock<std::shared_mutex> wlock(cache_mtx);
+        if (path_cache_map.find(meta.original_path) == path_cache_map.end()) {
+            path_cache_map[meta.original_path] = cached_path;
+            ++added;
+        }
+    };
+
+    if (dram_env && dram_env[0]) fitcache::meta_scan_tier_dir(dram_env, adder);
+    if (pmem_env && pmem_env[0]) fitcache::meta_scan_tier_dir(pmem_env, adder);
+    if (nvme_env && nvme_env[0]) fitcache::meta_scan_tier_dir(nvme_env, adder);
+    return added;
+}
+
+void *fitcache_sibling_refresh_fn(void *arg)
+{
+    (void)arg;
+    int interval_sec = 10;
+    if (const char *v = getenv("FitCache_SIBLING_REFRESH_SEC")) {
+        int n = std::atoi(v); if (n > 0) interval_sec = n;
+    }
+    L4C_INFO("sibling-refresh: thread starting, interval=%ds", interval_sec);
+    while (fitcache_sibling_refresh_running.load()) {
+        // Sleep in 1-second slices so shutdown is responsive.
+        for (int i = 0; i < interval_sec && fitcache_sibling_refresh_running.load(); ++i)
+            sleep(1);
+        if (!fitcache_sibling_refresh_running.load()) break;
+        int added = fitcache_data_mover_refresh_from_siblings_once();
+        if (added > 0) {
+            L4C_INFO("sibling-refresh: merged %d new path_cache_map entries "
+                     "from sibling sidecars", added);
+        }
+    }
+    L4C_INFO("sibling-refresh: thread exiting");
+    return NULL;
+}
+
 void *fitcache_data_mover_fn(void *args)
 {
     if(getenv("FitCache_DRAM_PATH")  == NULL)

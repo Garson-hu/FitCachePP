@@ -186,6 +186,20 @@ int fitcache_start_comm_server(void)
                 L4C_WARN("Failed to start cross-job eviction reaper thread");
                 fitcache_eviction_reaper_running.store(false);
             }
+
+            // Cross-job sibling-cache refresh: periodically rescan the
+            // local tier directories and merge any sibling-server-process's
+            // sidecars into THIS process's path_cache_map. Closes the
+            // per-server-process path_cache_map partitioning gap so a
+            // peer_lookup arriving at this server can answer has=1 for
+            // anything any sibling on this node has cached.
+            static pthread_t sibling_refresh_tid;
+            fitcache_sibling_refresh_running.store(true);
+            if (pthread_create(&sibling_refresh_tid, NULL,
+                               fitcache_sibling_refresh_fn, NULL) != 0) {
+                L4C_WARN("Failed to start cross-job sibling-cache refresh thread");
+                fitcache_sibling_refresh_running.store(false);
+            }
         } else {
             L4C_WARN("FitCache_CROSS_JOB=1 but registry_init failed; "
                      "running in single-job mode");
@@ -197,6 +211,7 @@ int fitcache_start_comm_server(void)
 
     if (fitcache::cross_job_enabled()) {
         fitcache_eviction_reaper_running.store(false);
+        fitcache_sibling_refresh_running.store(false);
         fitcache::registry_deregister_server(fitcache_server_rank);
     }
 

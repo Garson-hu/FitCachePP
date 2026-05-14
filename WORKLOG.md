@@ -1,10 +1,10 @@
 # FitCache++ Worklog
 
-### 2026-05-12 — Phase A + B.2 cluster results: single-job baseline complete, sidecar restore validated
+### 2026-05-12 — Single-job CosmoFlow baseline complete, sidecar restore validated; cross-job-concurrent and real-PMem investigation
 
 End-to-end cluster experiments after fixing 6+ session bugs (path-filter mismatch in train.py vs FitCache_DATA_DIR, mpirun-strips-env, parallel-srun-deadlock, PDSW_FITPP.sh hardcoding overrides, FitCache_PMEM_PATH unbound under `set -u`, and the 6 from 2026-05-11).
 
-**Phase A — single-job FitCachePP vs Pure_CF baseline**, all at n_train=8192 on c66 (1 GPU, 188 GB RAM):
+**Single-job FitCachePP-vs-Pure_CF CosmoFlow baseline runs**, all at n_train=8192 on c66 (1 GPU, 188 GB RAM):
 
 | Cell | Mean epoch | Cold ep1 | Warm ep2-5 | σ |
 |---|---:|---:|---:|---:|
@@ -13,28 +13,30 @@ End-to-end cluster experiments after fixing 6+ session bugs (path-filter mismatc
 | FitCachePP, OS-warm ×3 | 905s (reps 2-3, rep 1 cold-cluster=1048) | 940-941 | 897s | < 3s |
 | FitCachePP OS-cold ×1.5 | 899s | 935-936 | 891s | < 2s |
 
-**Headline:** at n_train=8192/1-GPU, **FitCache adds 58s = +7% overhead**. Root cause: train_61440 dataset (167 GB) fits in c66's 188 GB RAM → OS page cache absorbs working set → FitCache's local-NVMe cache has nothing structural to win against. Mercury RPC per file open costs ~13ms/file × 4096 files = ~53s overhead per epoch. Page cache eviction (`posix_fadvise(POSIX_FADV_DONTNEED)`) confirmed no effect — **GPU compute (~205ms/step × 4096 steps = 840s) is the bottleneck**, not I/O. FitCache's value emerges in cross-job mode (Phase B.2) and presumably at multi-GPU large-working-set regime (Phase F, not yet run).
+**Headline:** at n_train=8192/1-GPU, **FitCachePP adds 58s = +7% overhead**. Root cause: train_61440 dataset (167 GB) fits in c66's 188 GB RAM → OS page cache absorbs working set → FitCachePP's local-NVMe cache has nothing structural to win against. Mercury RPC per file open costs ~13ms/file × 4096 files = ~53s overhead per epoch. Page cache eviction (`posix_fadvise(POSIX_FADV_DONTNEED)`) confirmed no effect — **GPU compute (~205ms/step × 4096 steps = 840s) is the bottleneck**, not I/O. FitCachePP's value emerges in cross-job mode (the two-job sequential sidecar-restore run below) and presumably at multi-GPU large-working-set regime (an n_train=61440 multi-GPU run, not yet attempted).
 
-**Phase B.2 — two-job sequential, sidecar restoration across job boundary** (SLURM 221695 → 221696 on c66 via `--dependency=afterok`, shared local cache):
+**Two-job sequential, sidecar restoration across job boundary** (SLURM 221695 → 221696 on c66 via `--dependency=afterok`, shared local cache):
 
 | Job | Cold ep1 | Warm ep2-4 | Sidecars at startup |
 |---|---:|---:|---:|
 | Job A (no prior cache) | 1023s | 863s ± 2s | 0 |
 | **Job B (sidecar restore)** | **979s** | 864s ± 1s | **9,216** |
 
-**Headline:** Job B's startup ran `restore-sidecars` and rebuilt path_cache_map from 9,216 sidecars on disk. Job B's epoch-1 = 979s = Job A's cold (1023s) − 44s = the FitCache cache-promotion overhead that Job B avoided. **The persistent-sidecar-metadata mechanism is validated** — Job B avoids the FitCache-specific cold-start penalty. (Job B epoch 5 hung after 90+ min; cancelled. The hang is independent of the sidecar restore claim, which is fully exercised in epoch 1.)
+**Headline:** Job B's startup ran `restore-sidecars` and rebuilt path_cache_map from 9,216 sidecars on disk. Job B's epoch-1 = 979s = Job A's cold (1023s) − 44s = the FitCachePP cache-promotion overhead that Job B avoided. **The persistent-sidecar-metadata mechanism is validated** — Job B avoids the FitCachePP-specific cold-start penalty. (Job B epoch 5 hung after 90+ min; cancelled. The hang is independent of the sidecar restore claim, which is fully exercised in epoch 1.)
 
-**Phase B.1 — two-job concurrent peer_lookup redirect — UNRESOLVED.** Both attempts cancelled after 1h50min stuck on epoch 1. cross_job_stats counters show peer_lookup RPCs DO fire (11,662 forwarded by Job B) but EVERY response is has_no=0 across 12,196 lookups. Hypothesis: HRW with 8 cluster servers picks different servers across jobs for the same path; the responder server's path_cache_map doesn't have the file. Deep FitCache internals issue, deferred for debug session.
+**Two-job concurrent peer_lookup redirect — UNRESOLVED.** Both attempts cancelled after 1h50min stuck on epoch 1. cross_job_stats counters show peer_lookup RPCs DO fire (11,662 forwarded by Job B) but EVERY response is has_no=0 across 12,196 lookups. Hypothesis: HRW with 8 cluster servers picks different servers across jobs for the same path; the responder server's path_cache_map doesn't have the file. Deeper analysis (HRW imbalance + per-server-process path_cache_map partitioning) in [mmap_and_cross_job_imbalance_analysis.md](benchmarks/results/mmap_and_cross_job_imbalance_analysis.md). Deferred for follow-up code work.
 
-**Phase D — real PMem on c35 /mnt/fsdax — SKIPPED.** /mnt/fsdax is root-owned, no user write access. Local 3-tier smoke already validates the code path; real-PMem performance measurement deferred until sysadmin grants write access.
+**Real DAX-mode PMem hardware evaluation on c35.** `/mnt/fsdax` write access initially blocked (root-owned), unblocked later in the session. Two sustained-read micro-benchmark runs on c35 with `FitCache_PMEM_PATH=/mnt/fsdax`: source-on-local-/tmp gave warm-vs-cold = 0.13x (warm 7.5x slower); source-on-BeeGFS with OS-page-cache eviction gave warm-vs-cold = 0.21x (warm 4.8x slower). The cache-hit path pays ~250 ms per-open RPC overhead that the cache-miss path doesn't; PMem vs NVMe doesn't matter at this work granularity. Tier placement on real PMem works end-to-end. The natural follow-up (CosmoFlow on c35 with three-tier wiring and BeeGFS source) is infeasible: c35 has DAX PMem but no GPU; the rtx4060ti16g GPU nodes have no DAX PMem. Full write-up at [real_pmem_evaluation_on_c35.md](benchmarks/results/three_tier/real_pmem_evaluation_on_c35.md).
 
-Files: [PHASE_AB_SUMMARY.md](benchmarks/results/PHASE_AB_SUMMARY.md), [EXPERIMENT_STATUS.md](EXPERIMENT_STATUS.md). Commits this session: 11 (path-filter, data-mover, registry, scripts, summaries). Cluster jobs run: ~20+ over the day.
+**Workload-generalization run (Megatron-LM + DINOv2) — architectural limit.** Both target workloads use `mmap`-based zero-copy reads (numpy.memmap for Megatron's IndexedDataset; mmap+slice for DINOv2's ImageNet22k tarballs). FitCachePP's LD_PRELOAD client intercepts `open/read/pread` but not `mmap`, so the page-fault reads bypass FitCachePP entirely. Empirical confirmation: `megatron_io_only_iter.py` runs 200 iters in < 5ms with or without LD_PRELOAD; server logs show 0 Open RPC. Analysis at [mmap_and_cross_job_imbalance_analysis.md](benchmarks/results/mmap_and_cross_job_imbalance_analysis.md). Three options for the paper (drop these workloads, add an mmap interceptor, or reframe the FitCachePP contract as syscall-based-I/O only). The reframing-the-contract option is the honest framing.
+
+Files: [single_job_baseline_and_sidecar_restore_summary.md](benchmarks/results/single_job_baseline_and_sidecar_restore_summary.md), [mmap_and_cross_job_imbalance_analysis.md](benchmarks/results/mmap_and_cross_job_imbalance_analysis.md), [real_pmem_evaluation_on_c35.md](benchmarks/results/three_tier/real_pmem_evaluation_on_c35.md), [EXPERIMENT_STATUS.md](EXPERIMENT_STATUS.md). Commits this session: 11 (path-filter, data-mover, registry, scripts, summaries). Cluster jobs run: ~20+ over the day.
 
 **Next steps**
-- Debug Phase B.1: instrument peer_lookup to log requested-path vs available-path mismatch; check if HRW server selection is consistent across job processes.
-- Phase C (Megatron + DINOv2): user prep (conda envs + tokenized corpus + ImageNet-22k metadata).
-- Phase D: sysadmin restore /mnt/fsdax write access on c35.
-- Phase F (optional): one n_train=61440 cell for IPDPS-comparable wall-clock parity.
+- Debug the two-job concurrent cross-job-sharing run: instrument peer_lookup to log requested-path vs available-path mismatch; verify HRW server selection is consistent across job processes; add a sibling-fanout to `fitcache_peer_lookup_rpc_handler` that queries the other server-processes on the same host before answering has_no.
+- Profile the cache-hit open path to identify the ~250 ms-per-open bottleneck (cluster-registry lookup, path_cache_map serialization, redirect protocol).
+- Workload-generalization: decide between picking syscall-based replacement workloads (HuggingFace streaming datasets / per-file PIL.Image / line readers) and implementing the mmap interception layer (substantial — `userfaultfd`-based).
+- Optional n_train=61440 multi-GPU run for IPDPS-comparable wall-clock parity.
 
 ### 2026-05-11 (latest) — Post-engineering hardening pass: HRW addr-in-hash, cross-job telemetry, PMem tier
 
@@ -128,12 +130,12 @@ Caveat noted: c70 and c71 share `/etc/machine-id`, so HRW scores tied across nod
 
 **Push status:** local commits `54fb50d`, `8fb565e`, and the upcoming baseline-result commit are unpushed (no credentials in this environment).
 
-### 2026-05-11 — Cross-job extension engineering work complete (four slices)
+### 2026-05-11 — Cross-job extension engineering work complete (four mechanisms)
 
-Four committed slices land the open/read peer-fanout path, persistent
+Four commits land the open-time peer-fanout path, persistent
 sidecar metadata, refcount-respecting eviction, and the subscriber-lease
 machinery. Engineering scope of the cross-job extension is complete
-(~1,500 LOC over the four slices, within the original ~1,600 LOC budget).
+(~1,500 LOC across these four mechanisms, within the original ~1,600 LOC budget).
 
 **Commits (unpushed, local on `main`):**
 - `c816420` — subscriber-lease management for cross-job eviction protection
@@ -142,7 +144,7 @@ machinery. Engineering scope of the cross-job extension is complete
 - `2c76cc6` — open-time peer-lookup fanout for cross-job cache sharing
 - `6f7585d` — client-side HRW routing for cross-job cache sharing (previously pushed)
 
-**What landed in each slice:**
+**What landed in each mechanism:**
 
 - **Open-time peer-lookup fanout** (`2c76cc6`). Server-side async state
   machine in `fitcache_open_rpc_handler`: on `path_cache_map` miss with
@@ -236,13 +238,13 @@ heartbeat throughout; will be stopped by touching
 - Added cluster endpoint table + routing API in `src/fitcache_cross_job.{h,cpp}`: `select_server_for_path(path, local_server_count)` (cross-job: HRW — highest-random-weight hashing — over the registry's live-server snapshot with a 5-second TTL refresh; single-job: passthrough to `modulo_select`); `slot_to_addr(slot)` for resolving a routing slot to its Mercury address string; `refresh_cluster_endpoints()` for tests. ~110 LOC.
 - Swapped all six routing call sites that previously computed `hash(path) % g_fitcache_server_count` (`fitcache_track_file`, `fitcache_remote_read`, `fitcache_remote_pread`, `fitcache_remote_lseek`, `fitcache_remote_close`, plus the one in `ms_read`) to `fitcache::select_server_for_path(...)`.
 - Extended `fitcache_client_comm_lookup_addr` in `src/fitcache_comm_client.cpp` with a cross-job branch that consults the cluster endpoint table before falling back to `.ports.cfg.${SLURM_JOBID}`. The fallback path preserves IPDPS-mode behaviour when `FitCache_CROSS_JOB=0`.
-- Fixed a placeholder from the cluster-registry slice of work that landed earlier: `fitcache_server.cpp` was passing `addr=""` to `registry_register_server`. It now captures the real Mercury self-addr via the new `fitcache_comm_get_self_addr_string()` getter (populated as a side effect of `fitcache_comm_list_addr` in `src/fitcache_comm.cpp`). Without this, cross-job peer clients would have empty addresses in the registry and never resolve. The change is gated by `FitCache_CROSS_JOB=1` so single-job builds are unaffected.
+- Fixed a placeholder from the cluster-registry work that landed earlier: `fitcache_server.cpp` was passing `addr=""` to `registry_register_server`. It now captures the real Mercury self-addr via the new `fitcache_comm_get_self_addr_string()` getter (populated as a side effect of `fitcache_comm_list_addr` in `src/fitcache_comm.cpp`). Without this, cross-job peer clients would have empty addresses in the registry and never resolve. The change is gated by `FitCache_CROSS_JOB=1` so single-job builds are unaffected.
 - Added a fifth case to `tests/test_cross_job_smoke.cpp` — `test_routing_select_and_slot_addr` — covering slot stability across repeated calls, HRW spread across the live set, addr resolution, and the unknown-slot fallback that `fitcache_client_comm_lookup_addr` relies on. Required test restructuring after hitting the cached-`cross_job_enabled()` gotcha (recorded as `feedback_cross_job_enabled_is_cached.md` in memory).
 - Build clean: pre-existing `wrappers.c`/`ms_read` and `test_open_close.c`/`fclose(int)` warnings remain (documented in `tpds_extension/05_implementation_notes.md`); no new warnings. CMake cache had to be cleared once because the repo was renamed from `FitCache` to `FitCachePP` and the stale `CMakeCache.txt` recorded the old source path.
 - All five smoke tests pass: FNV-1a vectors, HRW balance + churn vs modulo, dataset_id, cluster registry roundtrip + heartbeat staleness + deregister, client-side HRW routing (HRW spread 3/3 servers, slot stable, addr lookup correct).
 - Backward compatibility check: when `FitCache_CROSS_JOB=0` (the default; env-var contract documented in the cross-job design doc at `tpds_extension/02_design_cross_job.md`, "Configuration surface" section), `select_server_for_path` short-circuits to `modulo_select(path, g_fitcache_server_count)` so single-job routing is bit-identical to the IPDPS code.
 
 **Next steps**
-- Open-time peer lookup fanout in `fitcache_open_rpc_handler` (`src/fitcache_comm_server.cpp`): on cache miss, fan out `fitcache_peer_lookup_rpc` (the RPC stub already exists from the cluster-registry slice) to live peers from the cluster registry before falling back to PFS; on a positive response, redirect the server-side fd to read from the peer-job server. ~150 LOC. This is the change that actually achieves cache sharing across jobs.
+- Open-time peer lookup fanout in `fitcache_open_rpc_handler` (`src/fitcache_comm_server.cpp`): on cache miss, fan out `fitcache_peer_lookup_rpc` (the RPC stub already exists from the cluster-registry work) to live peers from the cluster registry before falling back to PFS; on a positive response, redirect the server-side fd to read from the peer-job server. ~150 LOC. This is the change that actually achieves cache sharing across jobs.
 - Sidecar metadata persistence (`<file>.meta` per cached file) + reference counting + real eviction (`unlink` on evict — currently only the metadata map is touched) + `subscribe`/`release` RPCs. ~530 LOC.
 - After the durability work lands, run a 2-job smoke test on ARC, then run the bit-equivalence check (`FitCache_CROSS_JOB=0` vs the IPDPS configs) to defend the zero-regression-vs-IPDPS-single-job claim.

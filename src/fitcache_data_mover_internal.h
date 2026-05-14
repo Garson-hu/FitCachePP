@@ -47,4 +47,27 @@ int fitcache_data_mover_restore_from_sidecars();
 void *fitcache_eviction_reaper_fn(void *arg);
 extern std::atomic<bool> fitcache_eviction_reaper_running;
 
+// Cross-job sibling-cache refresh: scan local tier directories for *.meta
+// sidecars and merge any not-yet-known entries into path_cache_map. Every
+// FitCache server process on the same node writes its cached files into
+// the SAME tier directories (FitCache_DRAM_PATH / _PMEM_PATH / _NVME_PATH),
+// so a sibling server-process on the same node has written sidecars that
+// this process can pick up by rescanning. Without this, peer_lookup
+// queries to this server return has_no for paths a sibling cached — the
+// per-server-process path_cache_map partitions the local cache view.
+//
+// Single-shot variant: scans once and merges any newly-discovered
+// sidecars; returns the number of entries added. De-dupes against the
+// existing path_cache_map (does not double-count or alter used-bytes
+// counters; those are owned by the process that actually promoted the
+// file).
+int fitcache_data_mover_refresh_from_siblings_once();
+
+// Background thread entry point: loops on the single-shot refresh every
+// FitCache_SIBLING_REFRESH_SEC seconds (default 10s). Active under
+// FitCache_CROSS_JOB=1 only; exits when fitcache_sibling_refresh_running
+// goes false.
+void *fitcache_sibling_refresh_fn(void *arg);
+extern std::atomic<bool> fitcache_sibling_refresh_running;
+
 #endif //__FitCache_DATA_MOVER_INTERNAL_H__

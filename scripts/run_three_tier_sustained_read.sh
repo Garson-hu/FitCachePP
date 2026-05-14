@@ -45,23 +45,55 @@ PMEM_PATH=${PMEM_PATH:-/tmp/fitcachepp_sr_pmem_$$}
 NVME_PATH=${NVME_PATH:-/tmp/fitcachepp_sr_nvme_$$}
 
 SR_ROOT=/tmp/fitcachepp_sustained_read_$$
-mkdir -p "$SR_ROOT"/{dataset,registry,cwd,logs}
+mkdir -p "$SR_ROOT"/{registry,cwd,logs}
 mkdir -p "$DRAM_PATH" "$PMEM_PATH" "$NVME_PATH"
+
+# DATASET_DIR: optional override. When set, place the dataset there (e.g. a
+# BeeGFS path) instead of under /tmp. The smoke's measured "cold pass" only
+# stresses the cache-vs-source ratio if the source is on slow storage and
+# the source files are not already in the OS page cache (we evict below).
+# When DATASET_DIR is unset, fall back to /tmp behaviour for portability.
+DATASET_DIR=${DATASET_DIR:-$SR_ROOT/dataset}
+mkdir -p "$DATASET_DIR"
+DATASET_PERSISTENT=1
+if [ "$DATASET_DIR" = "$SR_ROOT/dataset" ]; then
+    DATASET_PERSISTENT=0
+fi
+
 echo "[setup] root: $SR_ROOT"
 echo "[setup] DRAM: $DRAM_PATH"
 echo "[setup] PMem: $PMEM_PATH"
 echo "[setup] NVMe: $NVME_PATH"
+echo "[setup] dataset: $DATASET_DIR (persistent=$DATASET_PERSISTENT)"
 
 # 256 files * 4 MiB
 N_FILES=${N_FILES:-256}
 FILE_SIZE_MIB=${FILE_SIZE_MIB:-4}
-for i in $(seq 0 $((N_FILES - 1))); do
-    head -c $((FILE_SIZE_MIB * 1024 * 1024)) /dev/urandom > "$SR_ROOT/dataset/file_$(printf %04d $i).bin"
-done
-echo "[setup] generated $N_FILES files of $FILE_SIZE_MIB MiB each = $((N_FILES * FILE_SIZE_MIB)) MiB total"
+# Reuse existing dataset if it has the expected file count + sizes, so a
+# DATASET_DIR pinned to BeeGFS doesn't have to regenerate 1 GiB of urandom
+# on every smoke run.
+EXISTING_COUNT=$(find "$DATASET_DIR" -maxdepth 1 -type f -name 'file_*.bin' 2>/dev/null | wc -l)
+if [ "$EXISTING_COUNT" -eq "$N_FILES" ]; then
+    echo "[setup] reusing existing dataset at $DATASET_DIR ($N_FILES files)"
+else
+    echo "[setup] generating dataset at $DATASET_DIR ($N_FILES files of $FILE_SIZE_MIB MiB)"
+    for i in $(seq 0 $((N_FILES - 1))); do
+        head -c $((FILE_SIZE_MIB * 1024 * 1024)) /dev/urandom > "$DATASET_DIR/file_$(printf %04d $i).bin"
+    done
+fi
+echo "[setup] dataset total: $((N_FILES * FILE_SIZE_MIB)) MiB"
+
+# Drop the OS page cache for the dataset before the warm-up pass so the
+# warm-up actually pays disk/PFS read cost. Without this, a previous run
+# (or the dataset-generation `head -c` above) leaves the source files
+# fully in RAM and both passes get RAM-speed source reads, hiding any
+# cache-vs-source difference. evict_page_cache.py uses
+# posix_fadvise(POSIX_FADV_DONTNEED) — no sudo required.
+echo "[setup] evicting source dataset from OS page cache before warm-up"
+python3 "$REPO/scripts/evict_page_cache.py" "$DATASET_DIR" 2>&1 | sed 's/^/  /'
 
 cd "$SR_ROOT/cwd"
-export FitCache_DATA_DIR=$SR_ROOT/dataset
+export FitCache_DATA_DIR=$DATASET_DIR
 export FitCache_CLUSTER_REGISTRY_DIR=$SR_ROOT/registry
 export FitCache_HEARTBEAT_SEC=10
 export FitCache_LOG_LEVEL=500
@@ -88,7 +120,7 @@ fi
 echo
 echo "=== Warm-up pass (populate cache) ==="
 T0=$(date +%s.%N)
-LD_PRELOAD=$CLIENT_LIB "$HARNESS_BIN" "$SR_ROOT/dataset" > "$SR_ROOT/logs/client_warmup.log" 2>&1
+LD_PRELOAD=$CLIENT_LIB "$HARNESS_BIN" "$DATASET_DIR" > "$SR_ROOT/logs/client_warmup.log" 2>&1
 RC=$?
 T1=$(date +%s.%N)
 WARMUP_S=$(awk "BEGIN { print $T1 - $T0 }")
@@ -110,11 +142,20 @@ PMEM_N=$(count_tier "$PMEM_PATH")
 NVME_N=$(count_tier "$NVME_PATH")
 echo "[result] tier population: dram=$DRAM_N pmem=$PMEM_N nvme=$NVME_N (target=$N_FILES)"
 
+# Evict the source dataset from OS page cache again before steady-state.
+# Otherwise the warm-up just left a full copy of the dataset in RAM and
+# steady-state reads would hit page cache regardless of which tier they
+# resolve to — so we can't measure cache-vs-source. Note: tier files in
+# DRAM_PATH/PMEM_PATH/NVME_PATH are kept hot intentionally (those ARE the
+# cache). Only the source is evicted.
+echo "[setup] evicting source dataset from OS page cache before steady-state"
+python3 "$REPO/scripts/evict_page_cache.py" "$DATASET_DIR" 2>&1 | sed 's/^/  /'
+
 echo
 echo "=== Steady-state pass (4x re-reads, mostly warm hits) ==="
 T0=$(date +%s.%N)
 for round in 1 2 3 4; do
-    LD_PRELOAD=$CLIENT_LIB "$HARNESS_BIN" "$SR_ROOT/dataset" > "$SR_ROOT/logs/client_steady_$round.log" 2>&1
+    LD_PRELOAD=$CLIENT_LIB "$HARNESS_BIN" "$DATASET_DIR" > "$SR_ROOT/logs/client_steady_$round.log" 2>&1
     if [ $? -ne 0 ]; then
         echo "[fatal] steady round $round failed" >&2
         kill -9 "$SID" 2>/dev/null
@@ -148,4 +189,9 @@ echo "  tier distribution:     dram=$DRAM_N pmem=$PMEM_N nvme=$NVME_N"
 
 if [ "${KEEP:-0}" = "0" ]; then
     rm -rf "$SR_ROOT" "$DRAM_PATH" "$PMEM_PATH" "$NVME_PATH"
+    if [ "$DATASET_PERSISTENT" = "0" ]; then
+        rm -rf "$DATASET_DIR"
+    else
+        echo "[cleanup] keeping persistent dataset at $DATASET_DIR"
+    fi
 fi

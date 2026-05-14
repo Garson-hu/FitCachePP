@@ -521,26 +521,268 @@ static int test_subscriber_lease_roundtrip() {
     return 0;
 }
 
+// Sibling-cache-refresh de-dup contract test.
+//
+// The production refresh function `fitcache_data_mover_refresh_from_siblings_once`
+// (in fitcache_data_mover.cpp, server-side) uses `meta_scan_tier_dir` with a
+// visitor that adds (meta.original_path -> cached_path) into the in-process
+// path_cache_map IFF the original_path isn't already present. This test
+// recreates that visitor in isolation against a synthetic tier directory and
+// verifies the invariants that the production thread relies on:
+//   1. After a refresh against a fresh tier dir with two sidecars, an empty
+//      map ends with both entries.
+//   2. After pre-populating one of those entries (simulating "this server
+//      process already had file X in its own path_cache_map"), a second
+//      refresh tick adds zero entries (the de-dup guard fires).
+//   3. The cached_path stored in the map matches the on-disk data file.
+static int test_sibling_cache_refresh_dedup() {
+    using namespace fitcache;
+
+    fs::path tmp = fs::temp_directory_path() /
+                   ("fitcache_test_sibrefresh_" + std::to_string(getpid()));
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    // Two synthetic cached files written by a "sibling" server process.
+    fs::path data_a = tmp / "siblingA" / "fileA.bin";
+    fs::path data_b = tmp / "siblingB" / "fileB.bin";
+    fs::create_directories(data_a.parent_path());
+    fs::create_directories(data_b.parent_path());
+    std::ofstream(data_a).put('a');
+    std::ofstream(data_b).put('b');
+
+    CHECK(meta_write_sidecar(data_a.string(),
+              meta_make_initial("/orig/fileA.bin", 1, 0)) == 0,
+          "write sidecar A failed");
+    CHECK(meta_write_sidecar(data_b.string(),
+              meta_make_initial("/orig/fileB.bin", 1, 0)) == 0,
+          "write sidecar B failed");
+
+    // Simulated path_cache_map (the production version is a global keyed by
+    // original_path; here we use a local copy to test the visitor logic
+    // without linking the server's globals).
+    std::map<std::string, std::string> sim_map;
+
+    auto adder = [&](const std::string &cached_path,
+                     const fitcache_file_meta_v1 &meta) {
+        if (sim_map.find(meta.original_path) == sim_map.end()) {
+            sim_map[meta.original_path] = cached_path;
+        }
+    };
+
+    // Tick 1: empty starting map -> both sidecars should land in the map.
+    int visited_1 = meta_scan_tier_dir(tmp.string(), adder);
+    CHECK(visited_1 == 2, "first refresh tick should visit 2 sidecars");
+    CHECK(sim_map.size() == 2, "map should contain both entries after tick 1");
+    CHECK(sim_map["/orig/fileA.bin"] == data_a.string(),
+          "fileA cached_path mismatch");
+    CHECK(sim_map["/orig/fileB.bin"] == data_b.string(),
+          "fileB cached_path mismatch");
+    std::printf("  ok: refresh tick 1 merged 2 sibling-written entries\n");
+
+    // Tick 2: map already has both entries -> the de-dup guard should fire,
+    // no entries added.
+    size_t before = sim_map.size();
+    int added_tick_2 = 0;
+    auto counting_adder = [&](const std::string &cached_path,
+                              const fitcache_file_meta_v1 &meta) {
+        if (sim_map.find(meta.original_path) == sim_map.end()) {
+            sim_map[meta.original_path] = cached_path;
+            ++added_tick_2;
+        }
+    };
+    int visited_2 = meta_scan_tier_dir(tmp.string(), counting_adder);
+    CHECK(visited_2 == 2, "second tick should still visit both sidecars");
+    CHECK(added_tick_2 == 0, "second tick should add zero entries (de-dup)");
+    CHECK(sim_map.size() == before, "map size should be unchanged after tick 2");
+    std::printf("  ok: refresh tick 2 added 0 entries (de-dup contract holds)\n");
+
+    // Tick 3: a sibling caches a brand-new file C between ticks. The next
+    // refresh tick should merge only C, not re-add A or B.
+    fs::path data_c = tmp / "siblingC" / "fileC.bin";
+    fs::create_directories(data_c.parent_path());
+    std::ofstream(data_c).put('c');
+    CHECK(meta_write_sidecar(data_c.string(),
+              meta_make_initial("/orig/fileC.bin", 1, 0)) == 0,
+          "write sidecar C failed");
+
+    int added_tick_3 = 0;
+    auto counting_adder_3 = [&](const std::string &cached_path,
+                                const fitcache_file_meta_v1 &meta) {
+        if (sim_map.find(meta.original_path) == sim_map.end()) {
+            sim_map[meta.original_path] = cached_path;
+            ++added_tick_3;
+        }
+    };
+    int visited_3 = meta_scan_tier_dir(tmp.string(), counting_adder_3);
+    CHECK(visited_3 == 3, "third tick should visit all 3 sidecars");
+    CHECK(added_tick_3 == 1, "third tick should add exactly 1 new entry");
+    CHECK(sim_map["/orig/fileC.bin"] == data_c.string(),
+          "fileC cached_path mismatch after refresh tick 3");
+    std::printf("  ok: refresh tick 3 picked up 1 new sibling-cached file\n");
+
+    fs::remove_all(tmp);
+    return 0;
+}
+
+// Regression test for the cross-node registry race that broke two-job
+// concurrent peer_lookup sharing on 2026-05-13 (slurm 221833/221834 on
+// c66+c67). Two flaws compounded: registry_heartbeat only rewrote the
+// heartbeat key, and registry_gc_stale touched every file in the shared
+// registry dir — including files owned by other hosts. A transient
+// BeeGFS-flock-induced stale heartbeat on a peer's file then let our gc
+// strip server.<rank>.addr, and the peer's next heartbeat (which only
+// wrote heartbeat) never restored it. registry_live_servers requires
+// server.<rank>.addr to surface a server, so the peer became invisible.
+//
+// This test simulates the race directly:
+//   (a) Stand up our own per-server file.
+//   (b) Manually wipe addr from the file (the "other node's gc" effect).
+//   (c) Call registry_heartbeat and verify addr is rewritten.
+//   (d) Plant a peer-hostname's file with a stale heartbeat. Call
+//       registry_gc_stale and verify the peer's addr survives (gc must
+//       only touch our-hostname files).
+static int test_registry_heartbeat_self_heal_and_gc_scope() {
+    // registry_init was already called by an earlier test in this binary
+    // and the bound directory is cached in registry-internal statics. We
+    // can't re-bind it. So we work with the already-bound nodes dir,
+    // re-creating it on disk (an earlier test may have removed the tmp).
+    // Long enough that our heartbeat survives the test.
+    setenv("FitCache_HEARTBEAT_SEC", "60", 1);
+
+    const char *bound_env = std::getenv("FitCache_CLUSTER_REGISTRY_DIR");
+    CHECK(bound_env && bound_env[0],
+          "expected FitCache_CLUSTER_REGISTRY_DIR set by a prior test");
+    fs::path nodes_dir = fs::path(bound_env) / "registry.v1" / "nodes";
+    fs::create_directories(nodes_dir);
+    // Wipe any leftover files from the previous test's routing setup so
+    // we control the populace of this directory.
+    for (auto &e : fs::directory_iterator(nodes_dir)) fs::remove(e.path());
+
+    // Self-registration. registry_register_server uses g_self_hostname,
+    // which is captured by registry_init at first call; we don't override
+    // that here. The test only cares that our own per-server file is the
+    // one heartbeat writes to.
+    fitcache::ServerEndpoint self;
+    self.rank      = 0;
+    self.addr      = "ofi+tcp;ofi_rxm://127.0.0.1:9991";
+    self.node_uuid = "self-uuid";
+    self.jobid     = "9991";
+    self.live      = true;
+    CHECK(fitcache::registry_register_server(self) == 0,
+          "register_server failed in race test");
+
+    // Find the per-server file actually written by the register call.
+    fs::path self_file;
+    for (auto &e : fs::directory_iterator(nodes_dir)) {
+        std::string fname = e.path().filename().string();
+        if (fname.find("_rank0.txt") != std::string::npos) {
+            self_file = e.path(); break;
+        }
+    }
+    CHECK(!self_file.empty(), "register_server did not write a per-server file");
+
+    auto read_kv = [&](const fs::path &p) {
+        std::map<std::string, std::string> kv;
+        std::ifstream f(p);
+        std::string line;
+        while (std::getline(f, line)) {
+            auto eq = line.find('=');
+            if (eq != std::string::npos) {
+                kv[line.substr(0, eq)] = line.substr(eq + 1);
+            }
+        }
+        return kv;
+    };
+
+    {
+        auto kv = read_kv(self_file);
+        CHECK(kv["server.0.addr"] == self.addr,
+              "register did not write addr");
+    }
+    std::printf("  ok: register wrote addr\n");
+
+    // (b) Simulate another node's gc stripping addr/uuid/jobid (the
+    //     pre-fix race effect). Heartbeat survives.
+    {
+        std::ofstream f(self_file);
+        f << "server.0.heartbeat=" << std::time(nullptr) << "\n";
+    }
+    {
+        auto kv = read_kv(self_file);
+        CHECK(kv.find("server.0.addr") == kv.end(),
+              "test setup: addr wipe failed to take");
+    }
+    std::printf("  ok: simulated peer-gc addr wipe applied\n");
+
+    // (c) Heartbeat must restore the full key set (self-healing).
+    CHECK(fitcache::registry_heartbeat(0) == 0,
+          "heartbeat after wipe failed");
+    {
+        auto kv = read_kv(self_file);
+        CHECK(kv["server.0.addr"] == self.addr,
+              "heartbeat did NOT restore addr (self-heal regression)");
+        CHECK(kv["server.0.rank"] == "0",
+              "heartbeat did NOT restore rank");
+        CHECK(kv["server.0.jobid"] == self.jobid,
+              "heartbeat did NOT restore jobid");
+    }
+    std::printf("  ok: heartbeat restored addr/rank/jobid after wipe\n");
+
+    // (d) Plant a peer-hostname's file with stale heartbeat. Call gc.
+    //     Peer file's addr must SURVIVE — gc only touches our hostname.
+    fs::path peer_file = nodes_dir / "peerhost_rank0.txt";
+    {
+        std::ofstream f(peer_file);
+        // Heartbeat far in the past (would trip gc if gc were unscoped).
+        f << "server.0.rank=0\n";
+        f << "server.0.addr=ofi+tcp;ofi_rxm://10.0.0.99:9999\n";
+        f << "server.0.node_uuid=peer-uuid\n";
+        f << "server.0.jobid=peer-job\n";
+        f << "server.0.heartbeat=1\n";  // 1970-01-01, definitely stale
+    }
+
+    setenv("FitCache_HEARTBEAT_SEC", "1", 1);  // makes stale window 3s
+    CHECK(fitcache::registry_gc_stale() == 0, "gc returned error");
+    {
+        auto kv = read_kv(peer_file);
+        CHECK(kv["server.0.addr"] == "ofi+tcp;ofi_rxm://10.0.0.99:9999",
+              "peer addr was wiped by gc (scope regression — gc must "
+              "only touch current-hostname files)");
+    }
+    std::printf("  ok: gc left peer-hostname file untouched\n");
+
+    // Tidy up so we don't leave files behind for subsequent test runs in
+    // this build dir.
+    for (auto &e : fs::directory_iterator(nodes_dir)) fs::remove(e.path());
+    return 0;
+}
+
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
     std::printf("FitCache++ cross-job smoke test\n");
-    std::printf("[1/8] FNV-1a vectors...\n");
+    std::printf("[1/10] FNV-1a vectors...\n");
     test_fnv1a_stable();
-    std::printf("[2/8] HRW routing...\n");
+    std::printf("[2/10] HRW routing...\n");
     test_hrw_basic();
-    std::printf("[3/8] dataset_id...\n");
+    std::printf("[3/10] dataset_id...\n");
     test_dataset_id();
-    std::printf("[4/8] cluster registry roundtrip (will sleep ~4s for stale "
+    std::printf("[4/10] cluster registry roundtrip (will sleep ~4s for stale "
                 "heartbeat check)...\n");
     test_registry_roundtrip();
-    std::printf("[5/8] client-side routing (select_server_for_path + slot_to_addr)...\n");
+    std::printf("[5/10] client-side routing (select_server_for_path + slot_to_addr)...\n");
     test_routing_select_and_slot_addr();
-    std::printf("[6/8] sidecar persistent metadata...\n");
+    std::printf("[6/10] sidecar persistent metadata...\n");
     test_sidecar_persistent_meta();
-    std::printf("[7/8] eviction victim selection (refcount-protected, lowest-access)...\n");
+    std::printf("[7/10] eviction victim selection (refcount-protected, lowest-access)...\n");
     test_eviction_victim_selection();
-    std::printf("[8/8] subscriber-lease roundtrip (subscribe/release)...\n");
+    std::printf("[8/10] subscriber-lease roundtrip (subscribe/release)...\n");
     test_subscriber_lease_roundtrip();
+    std::printf("[9/10] sibling-cache refresh de-dup contract...\n");
+    test_sibling_cache_refresh_dedup();
+    std::printf("[10/10] heartbeat self-heal + gc hostname scope (regression for "
+                "the 2026-05-13 cross-node addr-wipe race)...\n");
+    test_registry_heartbeat_self_heal_and_gc_scope();
     std::printf("\nALL SMOKE TESTS PASSED\n");
     return 0;
 }

@@ -73,6 +73,13 @@ char        g_nodes_dir_buf   [kRegPathMax] = {0};    // .../registry.v1/nodes
 char        g_datasets_dir_buf[kRegPathMax] = {0};    // .../registry.v1/datasets
 char        g_self_hostname_buf[256] = {0};
 char        g_self_node_uuid_buf[256] = {0};
+// Cached self-registration values populated by registry_register_server; used
+// by registry_heartbeat to rewrite the full key set on every tick so the
+// per-server file is self-healing if another node's gc race wipes our addr.
+// See the long-form rationale comment on registry_heartbeat.
+char        g_self_addr_buf [512] = {0};
+char        g_self_jobid_buf[64]  = {0};
+int         g_self_rank           = -1;
 bool        g_initialized = false;
 std::mutex  g_init_mutex;
 
@@ -83,6 +90,8 @@ inline std::string g_nodes_dir()     { return std::string(g_nodes_dir_buf);     
 inline std::string g_datasets_dir()  { return std::string(g_datasets_dir_buf);  }
 inline std::string g_self_hostname() { return std::string(g_self_hostname_buf); }
 inline std::string g_self_node_uuid(){ return std::string(g_self_node_uuid_buf);}
+inline std::string g_self_addr()     { return std::string(g_self_addr_buf);     }
+inline std::string g_self_jobid()    { return std::string(g_self_jobid_buf);    }
 
 int heartbeat_sec() {
     const char *v = std::getenv("FitCache_HEARTBEAT_SEC");
@@ -340,6 +349,13 @@ int registry_register_server(const ServerEndpoint &self) {
     if (!g_initialized) return -1;
     std::string path = per_server_file(self.rank);
     std::string node_uuid = g_self_node_uuid();
+    // Cache self addr/jobid/rank so registry_heartbeat can re-write the full
+    // key set on every tick; see the rationale comment on registry_heartbeat.
+    std::strncpy(g_self_addr_buf,  self.addr.c_str(),  sizeof(g_self_addr_buf)  - 1);
+    std::strncpy(g_self_jobid_buf, self.jobid.c_str(), sizeof(g_self_jobid_buf) - 1);
+    g_self_addr_buf [sizeof(g_self_addr_buf)  - 1] = '\0';
+    g_self_jobid_buf[sizeof(g_self_jobid_buf) - 1] = '\0';
+    g_self_rank = self.rank;
     int rc = rmw_kv_file(path, [&](auto &kv) {
         std::string p = "server." + std::to_string(self.rank) + ".";
         kv[p + "rank"]      = std::to_string(self.rank);
@@ -356,12 +372,32 @@ int registry_register_server(const ServerEndpoint &self) {
     return rc;
 }
 
+// Heartbeat is idempotent re-registration. We rewrite addr/node_uuid/rank/
+// jobid/uid alongside the refreshed heartbeat timestamp so the per-server
+// file is self-healing under any wipe. This closes the cross-node gc race
+// where another job's registry_gc_stale (which iterates every file in the
+// shared dir) sees a transient stale heartbeat on this server's file —
+// caused by occasional BeeGFS flock contention pushing one heartbeat past
+// the 30s stale window — and strips server.<rank>.addr/uuid/jobid. Before
+// this fix, the next heartbeat only wrote back the heartbeat key, leaving
+// the file addr-less, and registry_live_servers() (which requires
+// server.<rank>.addr to surface a server) silently dropped this server
+// from the cluster view. Concurrent two-job runs then degenerated into
+// per-node single-job clusters with 100% peer_lookup has_no.
 int registry_heartbeat(int rank) {
     if (!g_initialized) return -1;
     std::string path = per_server_file(rank);
+    std::string node_uuid = g_self_node_uuid();
+    std::string self_addr  = g_self_addr();
+    std::string self_jobid = g_self_jobid();
     return rmw_kv_file(path, [&](auto &kv) {
-        std::string key = "server." + std::to_string(rank) + ".heartbeat";
-        kv[key] = std::to_string(now_unix());
+        std::string p = "server." + std::to_string(rank) + ".";
+        kv[p + "rank"]      = std::to_string(rank);
+        if (!self_addr.empty())  kv[p + "addr"]      = self_addr;
+        if (!node_uuid.empty()) kv[p + "node_uuid"] = node_uuid;
+        if (!self_jobid.empty()) kv[p + "jobid"]    = self_jobid;
+        kv[p + "uid"]       = std::to_string(getuid());
+        kv[p + "heartbeat"] = std::to_string(now_unix());
     });
 }
 
@@ -496,6 +532,11 @@ int registry_gc_stale() {
     uint64_t now = now_unix();
     uint64_t stale = static_cast<uint64_t>(heartbeat_sec()) * kHeartbeatStaleMultiplier;
     int gc_count = 0;
+    // Only touch files owned by THIS hostname. Each node garbage-collects its
+    // own per-server files; we never modify another node's. This eliminates
+    // the cross-node race where a transient stale heartbeat on a peer's file
+    // (BeeGFS flock contention) lets us strip its addr key out from under it.
+    const std::string self_host_prefix = g_self_hostname() + "_rank";
     for (const auto &entry : fs::directory_iterator(nodes_dir, ec)) {
         if (ec) break;
         if (!entry.is_regular_file(ec)) continue;
@@ -504,6 +545,9 @@ int registry_gc_stale() {
         // (registry_init's orphan-tmp sweep is what removes them; gc
         // shouldn't try to interpret them as live registry state.)
         if (entry.path().filename().string().find(".tmp.") != std::string::npos) continue;
+        // Hostname scope guard (see comment above on self_host_prefix).
+        const std::string fname = entry.path().filename().string();
+        if (fname.compare(0, self_host_prefix.size(), self_host_prefix) != 0) continue;
         std::string path = entry.path().string();
 
         rmw_kv_file(path, [&](auto &kv) {

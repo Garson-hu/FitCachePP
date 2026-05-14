@@ -38,7 +38,7 @@ This is the first cluster run where FitCache is verifiably engaged.
 Cold-vs-warm gap: 216 - 200 = **16s (8%)**. Small because `n_train=1024`
 doesn't actually stress I/O much — only 1024 .tfrecord files (≈ 8 GB)
 fit easily in c66's free RAM, so even the "warm" epochs are kernel-page-
-cached. The Phase A.1 step (re-run at `n_train=8192` or higher) will
+cached. Re-running at `n_train=8192` or higher will
 amplify the gap by exercising actual cache spill into the FitCache tiers.
 
 ## Why this is still a quotable result

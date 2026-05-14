@@ -46,7 +46,7 @@ Plus `np.load(extra_full_path, mmap_mode="r")` for the metadata. So DINOv2 mmaps
 
 Option 3 is the honest framing for the paper.
 
-## What we already have for Phase C
+## What we already have for the workload-generalization runs
 
 - Synthetic tokenized corpus prepared: `/mnt/beegfs/ghu4/hvac/megatron_pile_train_001/pile_slice_text_document_text_document.{bin,idx}` (5.9 MB + 977 KB).
 - GPT2 tokenizer assets cached: `/mnt/beegfs/ghu4/hvac/megatron_assets/gpt2-{vocab.json,merges.txt}`.

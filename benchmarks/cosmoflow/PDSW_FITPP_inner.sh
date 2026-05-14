@@ -19,14 +19,20 @@
 
 set -u
 
+# Resolve site (sets FITPP_REPO / FITPP_SERVER_BIN / FITPP_RESULTS_ROOT /
+# FITPP_COSMOFLOW_DIR / FITPP_SERVERS_PER_NODE_DEFAULT / etc.).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/../sites/_resolve.sh"
+
 NODE="$(hostname -s)"
-GPUS_PER_NODE="${GPUS_PER_NODE:-1}"
-SERVERS_PER_NODE="${SERVERS_PER_NODE:-4}"
-SERVER_BIN=/home/ghu4/hvac/FitCachePP/build/src/fitcache_server
+GPUS_PER_NODE="${GPUS_PER_NODE:-$FITPP_GPUS_PER_NODE_DEFAULT}"
+SERVERS_PER_NODE="${SERVERS_PER_NODE:-$FITPP_SERVERS_PER_NODE_DEFAULT}"
+SERVER_BIN="$FITPP_SERVER_BIN"
 
 # Each caller pre-sets RESULTS_DIR. Default to a generic per-job dir under
-# benchmarks/results/ if not.
-RESULTS_DIR="${RESULTS_DIR:-/home/ghu4/hvac/FitCachePP/benchmarks/results/job_${SLURM_JOB_ID}}"
+# the site's results root if not.
+RESULTS_DIR="${RESULTS_DIR:-${FITPP_RESULTS_ROOT}/job_${SLURM_JOB_ID}}"
 mkdir -p "$RESULTS_DIR"
 
 # Run the server processes with $RESULTS_DIR as their CWD so log4c's per-pid
@@ -58,16 +64,15 @@ mkdir -p "$FitCache_DRAM_PATH" "$FitCache_NVME_PATH"
 
 # Sweep stale fitcache_intercept_log.* files in the cosmoflow benchmark dir.
 # These are the LD_PRELOAD client's log4c outputs (one per python PID per
-# run) and accumulate across runs in /home/ghu4/hvac/benchmark/cosmoflow-
-# benchmark-master/. They've already pushed the home quota over the limit
-# once today (causing 221680 to crash on history.csv write).
-# Only sweep files older than 5 minutes so we don't delete anything a
-# currently-running job is still writing to. Errors are non-fatal — quota
-# may already be tight; skip on failure.
+# run) and accumulate across runs in $FITPP_COSMOFLOW_DIR. They've already
+# pushed the home quota over the limit once on arc (causing 221680 to crash
+# on history.csv write). Only sweep files older than 5 minutes so we don't
+# delete anything a currently-running job is still writing to. Errors are
+# non-fatal — quota may already be tight; skip on failure.
 {
-    find /home/ghu4/hvac/benchmark/cosmoflow-benchmark-master \
+    find "$FITPP_COSMOFLOW_DIR" \
          -maxdepth 1 -name 'fitcache_intercept_log.*' -mmin +5 -delete 2>/dev/null
-    n=$(find /home/ghu4/hvac/benchmark/cosmoflow-benchmark-master \
+    n=$(find "$FITPP_COSMOFLOW_DIR" \
               -maxdepth 1 -name 'fitcache_intercept_log.*' 2>/dev/null | wc -l)
     echo "[$(date '+%H:%M:%S')] swept stale intercept logs; $n remain (younger than 5 min, in-use)"
 } || echo "[warn] intercept log sweep failed (continuing)"
@@ -109,7 +114,7 @@ sleep 5
 # to the CosmoFlow command.
 TOTAL_GPUS=$GPUS_PER_NODE
 HOROVOD_HOSTLIST="${NODE}:${GPUS_PER_NODE}"
-CLIENT_LAUNCHER="${FITCACHE_CLIENT_LAUNCHER:-/home/ghu4/hvac/FitCachePP/benchmarks/cosmoflow/command_CF_FITPP.sh}"
+CLIENT_LAUNCHER="${FITCACHE_CLIENT_LAUNCHER:-${SCRIPT_DIR}/command_CF_FITPP.sh}"
 echo "[$(date '+%H:%M:%S')] client launcher: $CLIENT_LAUNCHER"
 # Megatron's pretrain script uses torchrun internally; CosmoFlow's uses
 # horovodrun. The horovodrun wrapper is only needed for Horovod jobs.

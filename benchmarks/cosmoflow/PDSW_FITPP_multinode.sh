@@ -94,7 +94,7 @@ cd "$RESULTS_DIR"
 
 # n_train: caller can override via FITPP_N_TRAIN. Default 61440 (the IPDPS
 # full dataset — apples-to-IPDPS-FitCache wall-clock). Use 8192 for a
-# faster-iterating Phase A.1 run.
+# faster-iterating multi-node single-job baseline run.
 export FITPP_N_TRAIN=${FITPP_N_TRAIN:-61440}
 echo "FITPP_N_TRAIN=$FITPP_N_TRAIN  (IPDPS used 61440)"
 

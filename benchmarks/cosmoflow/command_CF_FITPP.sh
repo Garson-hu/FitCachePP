@@ -10,10 +10,15 @@
 # instead of the IPDPS MS_READ shim.
 
 set -x
+# Resolve site (FITPP_COSMOFLOW_DIR / FITPP_PYTHON_TF / FITPP_CLIENT_LIB).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/../sites/_resolve.sh"
+
 # train.py reads configs/cosmo.yaml via a CWD-relative path, so cd into the
 # cosmoflow benchmark dir before launching. Mirrors what the IPDPS PDSW_*.sh
 # achieves implicitly because they're sbatched from that dir.
-cd /home/ghu4/hvac/benchmark/cosmoflow-benchmark-master/
+cd "$FITPP_COSMOFLOW_DIR"/
 
 # --data-dir override forces train.py to read from the SAME path the FitCache
 # LD_PRELOAD client filters on (FitCache_DATA_DIR). Without this, configs/cosmo.yaml's
@@ -32,33 +37,43 @@ N_TRAIN_ARG=()
 if [ -n "${FITPP_N_TRAIN:-}" ]; then
     N_TRAIN_ARG=(--n-train "$FITPP_N_TRAIN")
 fi
-# FITPP_SEED override — different seeds across jobs in Phase B.1 cross-job
-# concurrent so the two jobs access files in DIFFERENT orders. With the
-# default --seed=0 in both jobs, they race on the same file at the same
-# time, peer_lookup always sees an empty cache (file not yet promoted on
-# either side), and cross-job sharing never fires. Different seeds give
-# Job A a chance to populate the cache BEFORE Job B asks for the file.
+# FITPP_SEED override — different seeds across jobs in the two-job
+# concurrent cross-job-sharing run so the two jobs access files in
+# DIFFERENT orders. With the default --seed=0 in both jobs, they race
+# on the same file at the same time, peer_lookup always sees an empty
+# cache (file not yet promoted on either side), and cross-job sharing
+# never fires. Different seeds give Job A a chance to populate the
+# cache BEFORE Job B asks for the file.
 SEED_ARG=()
 if [ -n "${FITPP_SEED:-}" ]; then
     SEED_ARG=(--seed "$FITPP_SEED")
 fi
+# FITPP_N_EPOCHS override — drop from the cosmo.yaml default of 5 down to e.g.
+# 3 when running at n_train=61440 so the wall-clock per pilot stays in a few
+# hours instead of ~9 h. The cold+warm signal lands within the first 2 epochs.
+EPOCHS_ARG=()
+if [ -n "${FITPP_N_EPOCHS:-}" ]; then
+    EPOCHS_ARG=(--n-epochs "$FITPP_N_EPOCHS")
+fi
 
 if [ "${FITPP_PURE_CF:-0}" = "1" ]; then
-    # Pure_CF baseline: no LD_PRELOAD, no FitCache. train.py reads BeeGFS
+    # Pure_CF baseline: no LD_PRELOAD, no FitCache. train.py reads PFS
     # directly via the standard POSIX path. Same --data-dir + --n-train
     # so the only variable vs FitCachePP is the cache pathway itself.
     echo "[command_CF_FITPP.sh] FITPP_PURE_CF=1: running WITHOUT LD_PRELOAD (Pure_CF baseline)"
-    /home/ghu4/hvac/rlibrary/miniconda3/envs/hvac_tf/bin/python3 \
-        /home/ghu4/hvac/benchmark/cosmoflow-benchmark-master/train.py -d \
+    "$FITPP_PYTHON_TF" \
+        "$FITPP_COSMOFLOW_DIR"/train.py -d \
         --data-dir "$FitCache_DATA_DIR" \
         "${N_TRAIN_ARG[@]}" \
+        "${EPOCHS_ARG[@]}" \
         "${SEED_ARG[@]}"
 else
-    LD_PRELOAD=/home/ghu4/hvac/FitCachePP/build/src/libfitcache_client.so \
-        /home/ghu4/hvac/rlibrary/miniconda3/envs/hvac_tf/bin/python3 \
-        /home/ghu4/hvac/benchmark/cosmoflow-benchmark-master/train.py -d \
+    LD_PRELOAD="$FITPP_CLIENT_LIB" \
+        "$FITPP_PYTHON_TF" \
+        "$FITPP_COSMOFLOW_DIR"/train.py -d \
         --data-dir "$FitCache_DATA_DIR" \
         "${N_TRAIN_ARG[@]}" \
+        "${EPOCHS_ARG[@]}" \
         "${SEED_ARG[@]}"
 fi
 

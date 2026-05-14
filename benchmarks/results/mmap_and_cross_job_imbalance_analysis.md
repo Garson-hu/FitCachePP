@@ -1,44 +1,44 @@
-# Phase C (workload generalization) + Phase B.1 deeper analysis
+# mmap-based workloads bypass LD_PRELOAD + cross-job-concurrent HRW-imbalance / per-server-process path_cache_map analysis
 
 **Date:** 2026-05-12
 **Status:** two architectural-limit findings landed this session; both require follow-up code work beyond the LD_PRELOAD intercept layer.
 
-## Finding 1 — Phase C: Megatron-LM AND DINOv2 both use mmap, bypassing LD_PRELOAD
+## Finding 1 — Megatron-LM and DINOv2 both use mmap, bypassing LD_PRELOAD
 
-Both target workloads for the TPDS workload-generalization eval use memory-mapped I/O:
+Both target workloads for the TPDS workload-generalization evaluation use memory-mapped I/O:
 
 - **Megatron-LM** (`megatron/core/datasets/indexed_dataset.py:280`): `numpy.memmap(idx_path, mode="r")` for the .idx and again for the .bin. Each training step calls `dataset.get(doc_idx, length=N)` which returns slices of the mmap'd memoryview. Token reads are **page faults**, not `read()` syscalls.
 
 - **DINOv2** (`dinov2/data/datasets/image_net_22k.py:65`): `mmap(fileno=f.fileno(), length=0, access=ACCESS_READ)` for each per-class .tar bundle. `mapped_data = class_mmap[start_offset:end_offset]` is again a page-faulted byte-slice, not `read()`.
 
-FitCache's LD_PRELOAD client (`libfitcache_client.so`) intercepts `open`, `open64`, `read`, `pread`, `lseek`, `fopen`, `fopen64`, `close`, `fsync`, `fclose` — **but not `mmap`**. So when Megatron/DINOv2 access their data via memory slicing, FitCache sees zero traffic.
+FitCachePP's LD_PRELOAD client (`libfitcache_client.so`) intercepts `open`, `open64`, `read`, `pread`, `lseek`, `fopen`, `fopen64`, `close`, `fsync`, `fclose` — **but not `mmap`**. So when Megatron/DINOv2 access their data via memory slicing, FitCachePP sees zero traffic.
 
-**Empirical confirmation:** ran `megatron_io_only_iter.py` (uses Megatron's `IndexedDataset` to issue the same `get()` calls a real training step would) — 200 iters in < 5ms (~45k iters/s, pure memory speed). With or without `LD_PRELOAD=libfitcache_client.so`, behavior is identical and FitCache server logs show 0 Open RPC.
+**Empirical confirmation:** ran `megatron_io_only_iter.py` (uses Megatron's `IndexedDataset` to issue the same `get()` calls a real training step would) — 200 iters in < 5ms (~45k iters/s, pure memory speed). With or without `LD_PRELOAD=libfitcache_client.so`, behavior is identical and the FitCachePP server logs show 0 Open RPC.
 
 ### Options for the paper
 
-1. **Drop Megatron + DINOv2** from the workload-generalization eval. Replace with syscall-based workloads:
+1. **Drop Megatron-LM + DINOv2** from the workload-generalization evaluation. Replace with syscall-based workloads:
    - HuggingFace `datasets.load_dataset(..., streaming=True)` — iterates files via standard read.
    - ResNet50 on ImageNet using per-file PIL.Image.open (not tar-bundled).
    - Raw text classification with line-by-line readers.
 
-2. **Add an `mmap` interceptor** to libfitcache_client.so. For paths matching `FitCache_DATA_DIR`, replace `mmap` with a userspace buffer backed by the FitCache cache; intercept the resulting page faults via `userfaultfd`. Substantial work (weeks); not in this session.
+2. **Add an `mmap` interceptor** to libfitcache_client.so. For paths matching `FitCache_DATA_DIR`, replace `mmap` with a userspace buffer backed by the FitCachePP cache; intercept the resulting page faults via `userfaultfd`. Substantial work (weeks); not in this session.
 
-3. **Re-frame the FitCache contract**: "FitCache++ accelerates workloads with syscall-based I/O (open/read/pread). Workloads using mmap-based zero-copy I/O require an additional mmap-interception layer outside the LD_PRELOAD scope. Megatron-LM and DINOv2 fall in this category; their integration is future work."
+3. **Re-frame the FitCachePP contract**: "FitCachePP accelerates workloads with syscall-based I/O (open/read/pread). Workloads using mmap-based zero-copy I/O require an additional mmap-interception layer outside the LD_PRELOAD scope. Megatron-LM and DINOv2 fall in this category; their integration is future work."
 
 Option 3 is the honest framing. CosmoFlow (TFRecordDataset) uses standard reads so the IPDPS evaluation is unaffected. The workload-generalization claim narrows to "syscall-based workloads beyond CosmoFlow/DeepCAM."
 
-### Phase C artifacts that remain useful
+### Artifacts that remain useful for any future syscall-based workload run
 
 - Synthetic tokenized corpus: `/mnt/beegfs/ghu4/hvac/megatron_pile_train_001/pile_slice_text_document_text_document.{bin,idx}` (5.9 MB + 977 KB).
 - GPT2 tokenizer: `/mnt/beegfs/ghu4/hvac/megatron_assets/gpt2-{vocab.json,merges.txt}`.
 - `dpu_torch` conda env with PyTorch 2.5.1 + nltk + einops + omegaconf + transformers.
 - I/O-only iterator script: `benchmarks/megatron/megatron_io_only_iter.py`.
-- Access-pattern smokes (use harness_read_files with read syscalls — these PASS but exercise FitCache's path-filter, NOT the actual Megatron/DINOv2 mmap path).
+- Access-pattern smokes (use harness_read_files with read syscalls — these PASS but exercise FitCachePP's path-filter, NOT the actual Megatron/DINOv2 mmap path).
 
-## Finding 2 — Phase B.1: HRW imbalance + per-server path_cache_map partitioning
+## Finding 2 — Two-job concurrent cross-job-sharing: HRW imbalance + per-server-process path_cache_map partitioning
 
-The seed-divergence fix (FITPP_SEED=1 vs 2) was correct for the same-order-race issue identified earlier, but Phase B.1 retry still shows `has_yes=0 / opens_redirect_to_peer=0` after 14 minutes of runtime. Per-rank cross_job_stats reveals the deeper cause:
+The seed-divergence fix (`FITPP_SEED=1` vs 2) was correct for the same-order-race issue identified earlier, but the retry still shows `has_yes=0 / opens_redirect_to_peer=0` after 14 minutes of runtime. Per-rank cross_job_stats reveals the deeper cause:
 
 | Job | rank=0 opens | rank=1 opens | rank=2 opens | rank=3 opens | Total | has_yes |
 |---|---:|---:|---:|---:|---:|---:|
@@ -65,13 +65,13 @@ Option (a) is the smallest, most localized change. Add a sibling-fanout to `fitc
 
 ## Combined status for the TPDS submission
 
-| Claim | Status this session |
-|---|---|
-| Zero-regression-vs-IPDPS-single-job | ✅ defended (Phase A + bit-equivalence smoke) |
-| Single-job FitCache+CosmoFlow at multi-node scale | ✅ defended (Phase A first run 221645 with 46k Open RPCs, 9216 cached files) |
-| Cross-job sidecar restore | ✅ defended (Phase B.2: Job B saved 44s via 9216-file sidecar restore) |
-| Cross-job concurrent peer_lookup redirect | ⚠️ HRW imbalance + per-server path_cache_map issue; needs fix (a) above |
-| Workload generalization (Megatron + DINOv2) | ❌ both use mmap; need mmap interceptor OR different workloads |
-| Three-tier on real PMem (c35 /mnt/fsdax) | 🚧 blocked on sysadmin write access |
+| Claim | Defended by | Status this session |
+|---|---|---|
+| Zero-regression-vs-IPDPS-single-job | single-job FitCachePP-vs-Pure_CF baseline + bit-equivalence smoke | ✅ defended |
+| Single-job FitCachePP+CosmoFlow at multi-node scale | single-job CosmoFlow baseline first run 221645 with 46k Open RPCs and 9216 cached files | ✅ defended |
+| Cross-job sidecar restore | two-job sequential sidecar-restore: Job B saved 44s via 9216-file sidecar restore | ✅ defended |
+| Cross-job concurrent peer_lookup redirect | two-job concurrent run | ⚠️ HRW imbalance + per-server path_cache_map issue; needs fix (a) above |
+| Workload generalization (Megatron-LM + DINOv2) | the workload-generalization run | ❌ both use mmap; need mmap interceptor OR different workloads |
+| Three-tier on real PMem (c35 /mnt/fsdax) | sustained-read micro-benchmark on c35 | 🚧 code-path validated; quantitative GPU+PMem speedup blocked by cluster topology (no node has both) |
 
-The two ⚠️/❌ items are the open follow-ups. Phase B.1's fix (sibling-fanout in peer_lookup_handler) is ~50 LOC + a smoke test — small, scoped. The workload-generalization story needs a strategy decision: pick syscall-based workloads, or build the mmap interceptor (substantial).
+The two ⚠️/❌ items are the open follow-ups. The two-job concurrent fix (sibling-fanout in peer_lookup_handler) is ~50 LOC + a smoke test — small, scoped. The workload-generalization story needs a strategy decision: pick syscall-based workloads, or build the mmap interceptor (substantial).
