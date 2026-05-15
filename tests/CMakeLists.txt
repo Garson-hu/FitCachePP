@@ -14,6 +14,7 @@ add_executable(test_cross_job_smoke
     ${CMAKE_SOURCE_DIR}/src/cross_job/fitcache_dataset_id.cpp
     ${CMAKE_SOURCE_DIR}/src/cross_job/fitcache_cluster_registry.cpp
     ${CMAKE_SOURCE_DIR}/src/cross_job/fitcache_persistent_meta.cpp
+    ${CMAKE_SOURCE_DIR}/src/client/fitcache_mmap_tracker.cpp
     ${CMAKE_SOURCE_DIR}/src/common/fitcache_logging.c)
 # fitcache_logging.h #errors out if neither symbol is defined; pick CLIENT
 # arbitrarily — the test exercises shared utility code that doesn't depend

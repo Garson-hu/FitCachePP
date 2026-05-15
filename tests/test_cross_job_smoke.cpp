@@ -794,33 +794,85 @@ static int test_peer_rpc_timeout_config() {
     return 0;
 }
 
+// Smoke for the mmap-interceptor's addr→length tracker module
+// (src/client/fitcache_mmap_tracker.{h,cpp}). The full LD_PRELOAD path
+// requires a running FitCache server; this just locks in the bookkeeping
+// contract that the mmap wrapper depends on for correct munmap cleanup.
+extern "C" {
+void   fitcache_mmap_tracker_record(void *addr, size_t length);
+size_t fitcache_mmap_tracker_lookup(void *addr);
+void   fitcache_mmap_tracker_drop(void *addr);
+}
+static int test_mmap_tracker_bookkeeping() {
+    int dummy_a = 0, dummy_b = 0;
+    void *a = &dummy_a, *b = &dummy_b;
+
+    CHECK(fitcache_mmap_tracker_lookup(a) == 0,
+          "unknown addr should look up as 0");
+    CHECK(fitcache_mmap_tracker_lookup(nullptr) == 0,
+          "NULL addr should look up as 0");
+    std::printf("  ok: empty-state lookups return 0\n");
+
+    fitcache_mmap_tracker_record(a, 4096);
+    fitcache_mmap_tracker_record(b, 8192);
+    CHECK(fitcache_mmap_tracker_lookup(a) == 4096,
+          "addr a should look up as 4096");
+    CHECK(fitcache_mmap_tracker_lookup(b) == 8192,
+          "addr b should look up as 8192");
+    std::printf("  ok: record + lookup roundtrip (a=4096, b=8192)\n");
+
+    // record-twice should overwrite the previous length.
+    fitcache_mmap_tracker_record(a, 16384);
+    CHECK(fitcache_mmap_tracker_lookup(a) == 16384,
+          "re-record should overwrite length");
+    std::printf("  ok: re-record overwrites previous length\n");
+
+    fitcache_mmap_tracker_drop(a);
+    CHECK(fitcache_mmap_tracker_lookup(a) == 0,
+          "drop should clear the entry");
+    CHECK(fitcache_mmap_tracker_lookup(b) == 8192,
+          "drop of a should not affect b");
+    std::printf("  ok: drop clears one entry without touching others\n");
+
+    // NULL-record is a no-op (we'd otherwise dereference junk on lookup).
+    fitcache_mmap_tracker_record(nullptr, 1234);
+    CHECK(fitcache_mmap_tracker_lookup(nullptr) == 0,
+          "NULL-record should be ignored");
+    std::printf("  ok: NULL-record is a no-op\n");
+
+    fitcache_mmap_tracker_drop(b);  // tidy up
+    return 0;
+}
+
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
     std::printf("FitCache++ cross-job smoke test\n");
-    std::printf("[1/11] FNV-1a vectors...\n");
+    std::printf("[1/12] FNV-1a vectors...\n");
     test_fnv1a_stable();
-    std::printf("[2/11] HRW routing...\n");
+    std::printf("[2/12] HRW routing...\n");
     test_hrw_basic();
-    std::printf("[3/11] dataset_id...\n");
+    std::printf("[3/12] dataset_id...\n");
     test_dataset_id();
-    std::printf("[4/11] cluster registry roundtrip (will sleep ~4s for stale "
+    std::printf("[4/12] cluster registry roundtrip (will sleep ~4s for stale "
                 "heartbeat check)...\n");
     test_registry_roundtrip();
-    std::printf("[5/11] client-side routing (select_server_for_path + slot_to_addr)...\n");
+    std::printf("[5/12] client-side routing (select_server_for_path + slot_to_addr)...\n");
     test_routing_select_and_slot_addr();
-    std::printf("[6/11] sidecar persistent metadata...\n");
+    std::printf("[6/12] sidecar persistent metadata...\n");
     test_sidecar_persistent_meta();
-    std::printf("[7/11] eviction victim selection (refcount-protected, lowest-access)...\n");
+    std::printf("[7/12] eviction victim selection (refcount-protected, lowest-access)...\n");
     test_eviction_victim_selection();
-    std::printf("[8/11] subscriber-lease roundtrip (subscribe/release)...\n");
+    std::printf("[8/12] subscriber-lease roundtrip (subscribe/release)...\n");
     test_subscriber_lease_roundtrip();
-    std::printf("[9/11] sibling-cache refresh de-dup contract...\n");
+    std::printf("[9/12] sibling-cache refresh de-dup contract...\n");
     test_sibling_cache_refresh_dedup();
-    std::printf("[10/11] heartbeat self-heal + gc hostname scope (regression for "
+    std::printf("[10/12] heartbeat self-heal + gc hostname scope (regression for "
                 "the 2026-05-13 cross-node addr-wipe race)...\n");
     test_registry_heartbeat_self_heal_and_gc_scope();
-    std::printf("[11/11] peer-RPC timeout config (env var + counter) ...\n");
+    std::printf("[11/12] peer-RPC timeout config (env var + counter) ...\n");
     test_peer_rpc_timeout_config();
+    std::printf("[12/12] mmap-interceptor addr-length tracker bookkeeping ...\n");
+    test_mmap_tracker_bookkeeping();
     std::printf("\nALL SMOKE TESTS PASSED\n");
     return 0;
 }

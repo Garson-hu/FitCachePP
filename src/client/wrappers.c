@@ -409,19 +409,121 @@ ssize_t WRAP_DECL(readv)(int fd, const struct iovec *iov, int iovcnt)
 	return __real_readv(fd, iov, iovcnt);
 
 }
+#include "fitcache_mmap_tracker.h"
+
 /*
-   void* WRAP_DECL(mmap)(void *addr, ssize_t length, int prot, int flags, int fd, off_t offset)
-   {
-   MAP_OR_FAIL(mmap);
-   if (path)
-   {
-   L4C_INFO("MMAP to tracked file %s Length %ld Offset %ld",path, length, offset);
-   }
+ * mmap wrapper — the centerpiece of the 2026-05-15 mmap-interceptor work.
+ *
+ * BACKGROUND: prior to this, FitCache's LD_PRELOAD client wrapped open /
+ * read / pread but NOT mmap. Numpy.memmap (Megatron-LM's IndexedDataset)
+ * and DINOv2's ImageNet22k tarball-slice loader both use mmap. Page faults
+ * on those mappings bypass FitCache entirely, the data flows straight from
+ * the PFS, and the local NVMe tier never gets exercised. The
+ * workload-generalization runs on ARC measured "0 Open RPC" on those
+ * workloads as a result (see benchmarks/results/arc/workload_generalization/
+ * megatron_mmap_limitation.md).
+ *
+ * STRATEGY: for mmap on a FitCache-tracked fd, allocate an anonymous
+ * mapping of the same length, eager-populate it via the existing FitCache
+ * read path (ms_read → server RPC → cached-file pread → bulk transfer),
+ * and return the anonymous addr. Subsequent pointer-style accesses on
+ * that addr hit RAM, not the PFS. munmap reverses the transformation
+ * using the (addr → length) tracker.
+ *
+ * TRADEOFF: eager populate means a multi-GB file pays its full read cost
+ * at mmap time rather than lazily on first page fault. For training jobs
+ * that touch most of the dataset every epoch this is a wash; for sparse
+ * mmap users it's an overcharge. A lazier variant (mmap the cached file
+ * directly via a get_cached_path RPC) is the natural follow-up.
+ *
+ * EXCLUSIONS: MAP_ANONYMOUS / fd<0 (no file), MAP_SHARED (write-back is
+ * out of scope), MAP_FIXED (must honor user addr; would defeat the
+ * anonymous redirect), or any untracked fd → passthrough to real mmap.
+ */
+void* WRAP_DECL(mmap)(void *addr, size_t length, int prot, int flags,
+                      int fd, off_t offset)
+{
+    MAP_OR_FAIL(mmap);
+    MAP_OR_FAIL(munmap);
 
-   return __real_mmap(addr,length, prot, flags, fd, offset);
+    if (g_disable_redirect || tl_disable_redirect)
+        return __real_mmap(addr, length, prot, flags, fd, offset);
 
-   }
-   */
+    /* Bypass the redirect for any case we can't safely intercept. */
+    if (fd < 0 || length == 0 ||
+        (flags & MAP_ANONYMOUS) || (flags & MAP_SHARED) ||
+        (flags & MAP_FIXED))
+        return __real_mmap(addr, length, prot, flags, fd, offset);
+
+    const char *path = fitcache_get_path(fd);
+    if (!path)
+        return __real_mmap(addr, length, prot, flags, fd, offset);
+
+    if (DEBUG_HU)
+        L4C_INFO("mmap on tracked fd %d path %s len %zu off %ld prot 0x%x flags 0x%x",
+                 fd, path, length, (long)offset, prot, flags);
+
+    /* Allocate anonymous backing memory; PROT_WRITE so we can populate it.
+     * We'll mprotect down to the user-requested prot at the end. */
+    void *buf = __real_mmap(NULL, length,
+                            PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (buf == MAP_FAILED) {
+        if (DEBUG_HU)
+            L4C_INFO("mmap: anon-backing allocation failed for tracked fd %d", fd);
+        return __real_mmap(addr, length, prot, flags, fd, offset);
+    }
+
+    /* Populate from the FitCache cached copy via the existing pread path.
+     * ms_read returns the number of bytes actually read; anything less than
+     * `length` is treated as logical EOF — the anonymous pages past that
+     * point are already zero-filled, matching file-backed mmap-past-EOF
+     * behaviour closely enough for the workloads we care about. */
+    ssize_t got = ms_read(fd, buf, length, offset);
+    if (got < 0) {
+        /* Last-ditch: try a real pread on the user fd (fastest fallback
+         * for the case where the FitCache server is offline). */
+        got = __real_pread(fd, buf, length, offset);
+    }
+    if (got < 0) {
+        if (DEBUG_HU)
+            L4C_INFO("mmap: read into anon mapping failed for %s (got=%ld); "
+                     "falling back to real mmap", path, (long)got);
+        __real_munmap(buf, length);
+        return __real_mmap(addr, length, prot, flags, fd, offset);
+    }
+
+    /* Apply the caller-requested protection, if it's stricter than what we
+     * allocated with. mprotect is page-aligned by construction since `buf`
+     * came back from mmap. */
+    if (prot != (PROT_READ | PROT_WRITE)) {
+        if (mprotect(buf, length, prot) != 0 && DEBUG_HU) {
+            L4C_INFO("mmap: mprotect on anon mapping returned errno=%d "
+                     "(continuing — read access still works)", errno);
+        }
+    }
+
+    /* Track addr → length so the munmap wrapper unmaps the right region. */
+    fitcache_mmap_tracker_record(buf, length);
+    if (DEBUG_HU)
+        L4C_INFO("mmap: redirected to anon %p (populated %ld of %zu requested bytes)",
+                 buf, (long)got, length);
+    return buf;
+}
+
+int WRAP_DECL(munmap)(void *addr, size_t length)
+{
+    MAP_OR_FAIL(munmap);
+    /* Look up the length we recorded at mmap time. User length may be wrong
+     * (numpy.memmap sometimes rounds), but the size from the tracker is
+     * authoritative for mappings we own. */
+    size_t tracked_len = fitcache_mmap_tracker_lookup(addr);
+    if (tracked_len > 0) {
+        fitcache_mmap_tracker_drop(addr);
+        return __real_munmap(addr, tracked_len);
+    }
+    return __real_munmap(addr, length);
+}
 void export_stats_to_file(const char *filename) {
 	FILE *file = fopen(filename, "w");
 	if (!file) {

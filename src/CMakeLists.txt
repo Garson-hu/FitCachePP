@@ -33,6 +33,7 @@ add_library(fitcache_client SHARED
     client/fitcache_client.cpp
     client/wrappers.c
     client/fitcache_multi_source_read.cpp
+    client/fitcache_mmap_tracker.cpp
     client/fitcache_real_functions.cpp
     comm/fitcache_comm.cpp
     comm/fitcache_comm_client.cpp
