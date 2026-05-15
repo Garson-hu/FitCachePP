@@ -13,10 +13,10 @@
  * on success, non-zero on first failure (with a message).
  */
 
-#include "../src/fitcache_dataset_id.h"
-#include "../src/fitcache_cross_job.h"
-#include "../src/fitcache_cluster_registry.h"
-#include "../src/fitcache_persistent_meta.h"
+#include "fitcache_dataset_id.h"
+#include "fitcache_cross_job.h"
+#include "fitcache_cluster_registry.h"
+#include "fitcache_persistent_meta.h"
 
 #include <cassert>
 #include <cstdint>
