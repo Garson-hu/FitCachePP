@@ -67,7 +67,7 @@ for i in $(seq 1 "$N_RUNS"); do
             benchmarks/cosmoflow/TPDS_FITPP.sh)
     JOBIDS+=("$JOB_PURE_CF")
 
-    echo "replicate $i submitted: FCP=$JOB_FITCACHEPP  PCF=$JOB_PURE_CF"
+    echo "replicate $i submitted: FitCachePP=$JOB_FITCACHEPP  Pure_CF=$JOB_PURE_CF"
 done
 
 # Persist the job-id list + run config alongside the outputs so the parser
