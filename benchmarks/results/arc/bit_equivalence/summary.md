@@ -59,7 +59,7 @@ All 24 hashes (8 source + 8 off-pass cache + 8 on-pass cache) match:
   payload contents under both `CROSS_JOB` settings, not the full cluster
   cross-job protocol. The full protocol is exercised separately by
   `scripts/smoke/run_two_server_smoke.sh` (peer-lookup + redirect) and the
-  cluster experiments under `benchmarks/cosmoflow/PDSW_FITPP_two_job_*.sh`.
+  cluster experiments under `benchmarks/cosmoflow/TPDS_FITPP_two_job_*.sh`.
 - NVMe tier is empty in this run because the 2 MiB dataset fits entirely
   in the 100 MiB DRAM budget; no eviction is triggered. A larger smoke
   would exercise tier-spill, but tier-spill correctness is orthogonal to

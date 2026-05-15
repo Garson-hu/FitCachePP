@@ -18,9 +18,9 @@ accelerates non-CosmoFlow workloads with different I/O shapes:
   - [scripts/smoke/run_megatron_access_pattern_smoke.sh](../../scripts/smoke/run_megatron_access_pattern_smoke.sh) — `.bin` + `.idx` pair. PASS as of commit `c6c25ee` (the data-mover signal-loss fix made the 2-file case work).
   - [scripts/smoke/run_dinov2_access_pattern_smoke.sh](../../scripts/smoke/run_dinov2_access_pattern_smoke.sh) — 4 classes × 10 images + 2 metadata files. PASS — 42/42 cached + 42/42 sidecars + sha256 match.
 - **Cluster sbatch templates** that wire each model's training command through `LD_PRELOAD=libfitcache_client.so`:
-  - [benchmarks/megatron/PDSW_FITPP_megatron.sh](../../benchmarks/megatron/PDSW_FITPP_megatron.sh) + [command_megatron_FITPP.sh](../../benchmarks/megatron/command_megatron_FITPP.sh)
-  - [benchmarks/dinov2/PDSW_FITPP_dinov2.sh](../../benchmarks/dinov2/PDSW_FITPP_dinov2.sh) + [command_dinov2_FITPP.sh](../../benchmarks/dinov2/command_dinov2_FITPP.sh)
-- **`PDSW_FITPP_inner.sh`** now honors `FITCACHE_CLIENT_LAUNCHER` so the same launcher serves CosmoFlow, Megatron, and DINOv2 — no fork.
+  - [benchmarks/megatron/TPDS_FITPP_megatron.sh](../../benchmarks/megatron/TPDS_FITPP_megatron.sh) + [command_megatron_FITPP.sh](../../benchmarks/megatron/command_megatron_FITPP.sh)
+  - [benchmarks/dinov2/TPDS_FITPP_dinov2.sh](../../benchmarks/dinov2/TPDS_FITPP_dinov2.sh) + [command_dinov2_FITPP.sh](../../benchmarks/dinov2/command_dinov2_FITPP.sh)
+- **`TPDS_FITPP_inner.sh`** now honors `FITCACHE_CLIENT_LAUNCHER` so the same launcher serves CosmoFlow, Megatron, and DINOv2 — no fork.
 
 ## What the user still needs to do before submission
 
@@ -30,7 +30,7 @@ accelerates non-CosmoFlow workloads with different I/O shapes:
    `/home/ghu4/hvac/rlibrary/miniconda3/envs/megatron/`. Megatron requires
    apex's fused kernels (`pip install nvidia-apex` will not work; build
    from source with `--cuda_ext --cpp_ext`). Adjust `MEGATRON_PYTHON` in
-   `PDSW_FITPP_megatron.sh` if you put it elsewhere.
+   `TPDS_FITPP_megatron.sh` if you put it elsewhere.
 2. **Tokenizer assets.** Download `gpt2-vocab.json` + `gpt2-merges.txt`
    from HuggingFace and place under
    `/mnt/beegfs/ghu4/hvac/megatron_assets/`. Adjust
@@ -43,7 +43,7 @@ accelerates non-CosmoFlow workloads with different I/O shapes:
    (note: `text_document` is the prefix, Megatron appends `.bin`/`.idx`).
 4. **Submit:**
    ```bash
-   sbatch /home/ghu4/hvac/FitCachePP/benchmarks/megatron/PDSW_FITPP_megatron.sh
+   sbatch /home/ghu4/hvac/FitCachePP/benchmarks/megatron/TPDS_FITPP_megatron.sh
    ```
 
 ### DINOv2
@@ -69,7 +69,7 @@ accelerates non-CosmoFlow workloads with different I/O shapes:
    ViT-S/14 for a smoke run). Adjust `DINOV2_CONFIG` to point at it.
 5. **Submit:**
    ```bash
-   sbatch /home/ghu4/hvac/FitCachePP/benchmarks/dinov2/PDSW_FITPP_dinov2.sh
+   sbatch /home/ghu4/hvac/FitCachePP/benchmarks/dinov2/TPDS_FITPP_dinov2.sh
    ```
 
 ## What the runs will defend
@@ -82,7 +82,7 @@ For each workload, the relevant claim from `04_experiment_plan.md` §IV-H:
   comparable read-bound workload shape).
 - **Cross-job sharing.** Two concurrent Megatron jobs reading the same
   tokenized corpus get cross-cache hits via the HRW + peer-lookup
-  redirect path. Run `PDSW_FITPP_megatron.sh` twice with different
+  redirect path. Run `TPDS_FITPP_megatron.sh` twice with different
   `SLURM_JOBID` against the same `FitCache_CLUSTER_REGISTRY_DIR` — the
   second job's epoch-1 should hit the first's cache.
 - **Workload-shape robustness.** The Megatron `.bin`/`.idx` shape
@@ -92,7 +92,7 @@ For each workload, the relevant claim from `04_experiment_plan.md` §IV-H:
 
 ## What to verify after each run
 
-The engagement self-check at the end of `PDSW_FITPP_inner.sh` already
+The engagement self-check at the end of `TPDS_FITPP_inner.sh` already
 prints either:
 ```
 FitCache engaged: <N> Open RPCs handled across all servers; <M> files cached.

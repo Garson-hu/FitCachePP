@@ -9,7 +9,7 @@
 # Usage:
 #   bash scripts/frontier_sanity_run.sh
 #
-# Submits two jobs. Each runs PDSW_FITPP.sh on 1 Frontier node. The
+# Submits two jobs. Each runs TPDS_FITPP.sh on 1 Frontier node. The
 # FitCachePP job goes through libfitcache_client.so + 4 fitcache_server
 # processes on local NVMe; the Pure_CF job runs train.py directly against
 # the Lustre dataset.
@@ -45,7 +45,7 @@ RESULTS_DIR="$PWD/$FCP_DIR" \
 sbatch "${SBATCH_BASE[@]}" \
     -J FitCachePP_sanity \
     -o "$FCP_DIR/FitCachePP-%j.out" \
-    benchmarks/cosmoflow/PDSW_FITPP.sh
+    benchmarks/cosmoflow/TPDS_FITPP.sh
 
 echo "--- submitting Pure_CF sanity ---"
 RESULTS_DIR="$PWD/$PCF_DIR" \
@@ -53,7 +53,7 @@ FITPP_PURE_CF=1 \
 sbatch "${SBATCH_BASE[@]}" \
     -J Pure_CF_sanity \
     -o "$PCF_DIR/Pure_CF-%j.out" \
-    benchmarks/cosmoflow/PDSW_FITPP.sh
+    benchmarks/cosmoflow/TPDS_FITPP.sh
 
 echo "--- queued ---"
 squeue -u "$USER" 2>&1 | tail -5

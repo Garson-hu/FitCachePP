@@ -22,12 +22,12 @@ subtrees referenced inline. **Headline summary:**
 ## Experiment 1: Single-job baseline (FitCachePP vs IPDPS-FitCache vs Pure_CF)
 
 **Goal**: defend the zero-regression-vs-IPDPS-single-job claim and the
-shape parity with the IPDPS PDSW_Exps numbers. Foundation for §V's
+shape parity with the IPDPS TPDS_Exps numbers. Foundation for §V's
 single-job comparison block.
 
 **App**: CosmoFlow on `cosmoUniverse_2019_05_4parE_tf_v2_mini/train_61440/`,
-4 FitCache servers + 1 GPU client, sbatched via PDSW_FITPP_multinode.sh
-(c35 storage + GPU node client) to mirror the IPDPS PDSW_Exps.sh layout.
+4 FitCache servers + 1 GPU client, sbatched via TPDS_FITPP_multinode.sh
+(c35 storage + GPU node client) to mirror the IPDPS TPDS_Exps.sh layout.
 
 ### 1a. Single-node smoke (c66 only, FitCache servers + client co-located, n_train=1024)
 
@@ -174,8 +174,8 @@ I/O shapes.
 - 🚧 Megatron-LM source cloned at `/home/ghu4/hvac/benchmark/Megatron-LM` (shallow, 64 MB source-only).
 - 🚧 DINOv2 source cloned at `/home/ghu4/hvac/benchmark/dinov2` (shallow, 6.9 MB source-only).
 - 🚧 Cluster sbatch scripts ready to submit once datasets exist:
-  - [benchmarks/megatron/PDSW_FITPP_megatron.sh](benchmarks/megatron/PDSW_FITPP_megatron.sh) + [command_megatron_FITPP.sh](benchmarks/megatron/command_megatron_FITPP.sh)
-  - [benchmarks/dinov2/PDSW_FITPP_dinov2.sh](benchmarks/dinov2/PDSW_FITPP_dinov2.sh) + [command_dinov2_FITPP.sh](benchmarks/dinov2/command_dinov2_FITPP.sh)
+  - [benchmarks/megatron/TPDS_FITPP_megatron.sh](benchmarks/megatron/TPDS_FITPP_megatron.sh) + [command_megatron_FITPP.sh](benchmarks/megatron/command_megatron_FITPP.sh)
+  - [benchmarks/dinov2/TPDS_FITPP_dinov2.sh](benchmarks/dinov2/TPDS_FITPP_dinov2.sh) + [command_dinov2_FITPP.sh](benchmarks/dinov2/command_dinov2_FITPP.sh)
 - Source: `benchmarks/results/arc/workload_generalization/setup_and_run.md`.
 
 ---
@@ -236,7 +236,7 @@ workload-generalization experiments produce their primary numbers.
 | **Registry rename-EBUSY storm on BeeGFS**: write_atomic's `rename(tmp, final)` fails EBUSY when the destination has an open fd (rmw flow). Orphan `.tmp.<pid>` files accumulate; gc rmw's them, generating chained `.tmp.A.tmp.B.tmp.C` filenames and a self-perpetuating EBUSY cascade. | inspecting `fitcache_server_log` from 221621 — chained tmp filenames in error messages. | `0602e71` (in-place truncate+write under flock + iterator filter for `.tmp.*` files + orphan sweep at registry_init) | Log-pollution only, but masked actual error signals in the cluster logs and may have delayed legitimate heartbeat refreshes. |
 | **`log_cross_job_stats` final-dump flushes to nowhere**: `signal_exit` calls `std::exit(0)` which bypasses `log4c_fini()`. The SIGINT/SIGTERM-final cross_job_stats line gets buffered and dropped. | engagement self-check found 0 Open RPC log lines despite obvious activity. | `35d8443` (`log4c_fini()` before `std::exit`) | Visibility-only; no behavioral impact on training. |
 | **Engagement self-check too narrow**: grepped only INFO-level log lines. With `FitCache_LOG_LEVEL=500` (NOTICE), all `L4C_INFO` is filtered → check thinks FitCache wasn't engaged when it actually was. | 221630 produced cold 385s + obvious FitCache slowdown but check fired the warning. | `d5d7000` (bumped log level to 600 + added cached-file-count signal as backup) | Visibility-only. |
-| **PDSW_FITPP.sh bypassed inner.sh**: had its own server-launch via `mpirun -N 1`, never picked up the cd-to-RESULTS_DIR / FitCache_PORTS_CFG_DIR / engagement-check fixes. | log4c files for 221621/221630 didn't land in `$RESULTS_DIR` despite the inner.sh fix. | `8c9baa9` (single-job baseline now `exec`s inner.sh) | All single-job cluster runs through 221634 had divergent CWD / log placement. |
+| **TPDS_FITPP.sh bypassed inner.sh**: had its own server-launch via `mpirun -N 1`, never picked up the cd-to-RESULTS_DIR / FitCache_PORTS_CFG_DIR / engagement-check fixes. | log4c files for 221621/221630 didn't land in `$RESULTS_DIR` despite the inner.sh fix. | `8c9baa9` (single-job baseline now `exec`s inner.sh) | All single-job cluster runs through 221634 had divergent CWD / log placement. |
 | **`set -u` unbound `FitCache_PMEM_PATH` in single-job runs**: engagement self-check loop fails on single-job baselines that don't enable PMem. | 221634 SLURM exit 1:0 despite training succeeding. | `6a2a9df` (`${FitCache_PMEM_PATH:-}` parameter expansion) | Spurious exit code only; training data was correct. |
 
 ---

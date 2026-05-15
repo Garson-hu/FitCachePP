@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# PDSW_FITPP_inner.sh
+# TPDS_FITPP_inner.sh
 #
 # Common launcher for the FitCache++ CosmoFlow benchmarks. Spawns
 # SERVERS_PER_NODE FitCache++ servers on the local SLURM-allocated node
@@ -14,14 +14,14 @@
 #
 # The inner script knows nothing about the batch script's experiment intent;
 # it just brings up the FitCache++ servers + Horovod client and tears them
-# down. Callers (PDSW_FITPP.sh / PDSW_FITPP_two_job_*.sh) wrap with the
+# down. Callers (TPDS_FITPP.sh / TPDS_FITPP_two_job_*.sh) wrap with the
 # specific FitCache_CROSS_JOB / registry / cache-path config they need.
 
 set -u
 
 # Resolve site (sets FITPP_REPO / FITPP_SERVER_BIN / FITPP_RESULTS_ROOT /
 # FITPP_COSMOFLOW_DIR / FITPP_SERVERS_PER_NODE_DEFAULT / etc.).
-# Same sbatch-script-copy fallback as PDSW_FITPP.sh.
+# Same sbatch-script-copy fallback as TPDS_FITPP.sh.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 if [ -z "$SCRIPT_DIR" ] || [ ! -d "$SCRIPT_DIR/../sites" ]; then
     if [ -n "${FITPP_REPO:-}" ] && [ -d "$FITPP_REPO/benchmarks/sites" ]; then

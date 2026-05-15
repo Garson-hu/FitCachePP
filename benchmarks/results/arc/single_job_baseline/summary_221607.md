@@ -19,7 +19,7 @@
 | 5 | 186 | warm |
 | **sum** | **1113** | training time only |
 
-Cold/warm speedup: 362s → 188s ≈ **1.93x** (matches the IPDPS PDSW_FIT shape — confirms the cache is doing its job).
+Cold/warm speedup: 362s → 188s ≈ **1.93x** (matches the IPDPS TPDS_FIT shape — confirms the cache is doing its job).
 
 ## Cross-job paths quiescent in single-job mode
 
@@ -42,5 +42,5 @@ that's the deferred unit-test-scale bit-equivalence harness.
 - `FitCachePP-221607.out` — SLURM stdout (Horovod + train.py output)
 - `server_221607_id0.log` ... `server_221607_id3.log` — per-server stderr
 - `horovodrun_221607.log` — horovodrun teed output (currently empty; the
-  redirection was added to `PDSW_FITPP_inner.sh` after this run, so 221607
+  redirection was added to `TPDS_FITPP_inner.sh` after this run, so 221607
   has no separate horovod log)

@@ -2,7 +2,7 @@
 
 ### 2026-05-12 — Single-job CosmoFlow baseline complete, sidecar restore validated; cross-job-concurrent and real-PMem investigation
 
-End-to-end cluster experiments after fixing 6+ session bugs (path-filter mismatch in train.py vs FitCache_DATA_DIR, mpirun-strips-env, parallel-srun-deadlock, PDSW_FITPP.sh hardcoding overrides, FitCache_PMEM_PATH unbound under `set -u`, and the 6 from 2026-05-11).
+End-to-end cluster experiments after fixing 6+ session bugs (path-filter mismatch in train.py vs FitCache_DATA_DIR, mpirun-strips-env, parallel-srun-deadlock, TPDS_FITPP.sh hardcoding overrides, FitCache_PMEM_PATH unbound under `set -u`, and the 6 from 2026-05-11).
 
 **Single-job FitCachePP-vs-Pure_CF CosmoFlow baseline runs**, all at n_train=8192 on c66 (1 GPU, 188 GB RAM):
 
@@ -46,7 +46,7 @@ Picked up after the two-job concurrent cross-job sharing run on c70 + c71 surfac
 - **Cross-job telemetry counters** (`src/fitcache_cross_job.{h,cpp}` + comm-server bumps + heartbeat-thread emit). Eight atomic counters for the open + peer-lookup events (`opens_total`, `opens_local_hit`, `opens_redirect_to_peer`, `opens_pfs_fallback`, `peer_lookup_forwarded`, `peer_lookup_handled`, `peer_lookup_has_yes`, `peer_lookup_has_no`). Periodic L4C_INFO line emitted from the heartbeat thread when `FitCache_CROSS_JOB=1`, gated so single-job runs stay silent. Verified in the bit-equivalence smoke: 8-file workload produced `opens_total=8 pfs_fallback=8 peer_lookup forwarded=0 handled=0`.
 - **Bit-equivalence smoke** (`scripts/smoke/run_bit_equivalence_smoke.sh` + `benchmarks/results/arc/bit_equivalence/summary.md`). Defends the zero-regression-vs-IPDPS-single-job claim at the byte level: runs the same 8-file synthetic workload with `FitCache_CROSS_JOB=0` and `=1` (single-server, no peers), per-file sha256 of cached payloads must match across passes and against source. PASS. Re-run after the PMem changes; still PASS.
 - **Opt-in PMem tier** (`src/fitcache_cache_policy.h`: added `CACHE_TIER_PMEM = 4`; `src/fitcache_data_mover.cpp`: env vars `FitCache_PMEM_PATH` / `FitCache_PMEM_CAPACITY`, placement priority DRAM → PMem → NVMe, per-tier `g_pmem_used_bytes`, restore-sidecars loop scans PMem dir, eviction reaper handles the third tier). Dormant when env vars unset — the bit-equivalence smoke confirms zero behavior change in that case.
-- **Three-tier pilot scripts** (`benchmarks/cosmoflow/PDSW_FITPP_three_tier.sh` for the CosmoFlow + Horovod variant; `scripts/smoke/run_three_tier_sustained_read.sh` for a CPU-only sustained-read micro-benchmark). Local smoke `scripts/smoke/run_three_tier_smoke.sh` verified 4/4/4 placement split across DRAM/PMem/NVMe and full restoration of all 12 files from sidecars per-tier across server restart. Cluster pilot deferred: c35 (the known-PMem candidate) is in the `cascade` partition (CPU-only); CosmoFlow + Horovod needs a GPU node that also has DAX PMem, which the cluster doesn't obviously have.
+- **Three-tier pilot scripts** (`benchmarks/cosmoflow/TPDS_FITPP_three_tier.sh` for the CosmoFlow + Horovod variant; `scripts/smoke/run_three_tier_sustained_read.sh` for a CPU-only sustained-read micro-benchmark). Local smoke `scripts/smoke/run_three_tier_smoke.sh` verified 4/4/4 placement split across DRAM/PMem/NVMe and full restoration of all 12 files from sidecars per-tier across server restart. Cluster pilot deferred: c35 (the known-PMem candidate) is in the `cascade` partition (CPU-only); CosmoFlow + Horovod needs a GPU node that also has DAX PMem, which the cluster doesn't obviously have.
 
 Concurrent retry (SLURM 221616 + 221617 on c70 + c71) ran after the HRW fix landed: both jobs completed in ~16:15, cold epoch 200s, warm epochs 185-189s. Direct routing-balance check across the two nodes wasn't possible from this run because the per-server log4c output (where the `Open RPC: requested path` lines land) didn't end up in `$RESULTS_DIR` — only the heartbeat-error log got captured. Result + observations at `benchmarks/results/arc/two_job_concurrent/summary_221616_221617_retry.md`.
 
@@ -69,7 +69,7 @@ Plus the HRW addr-in-hash commit that landed before this session.
 
 **Next steps**
 - When Job B (SLURM 221619) finishes, record the sequential-result summary in `benchmarks/results/arc/two_job_sequential/` — expecting Job B epoch-1 to be warm (~190s) instead of cold (~362s), defending the sidecar-rebuild-survives-job-boundary claim.
-- Capture per-server log4c output into `$RESULTS_DIR` in `PDSW_FITPP_inner.sh` so future cluster runs can do an opens-per-node tally directly.
+- Capture per-server log4c output into `$RESULTS_DIR` in `TPDS_FITPP_inner.sh` so future cluster runs can do an opens-per-node tally directly.
 - Investigate the `registry_gc_stale` rename-busy storm root cause if it recurs in a clean fresh run.
 - Submit the three-tier pilot when a node with both a GPU and a DAX PMem mount is identified; otherwise run `scripts/smoke/run_three_tier_sustained_read.sh` on c35 for a CPU-only three-tier characterisation.
 
@@ -92,10 +92,10 @@ Also tightened `cluster_registry.cpp::rmw_kv_file` to ensure the parent director
 **Smoke harness result:** 5 peer_lookup hits, 5 server-side `FITCACHE_OPEN_REDIRECT`s, 5 client-side redirects handled, all 8 files read end-to-end. Cross-job sharing is **proven on real Mercury** for the first time. Committed locally as `54fb50d`.
 
 **Benchmark scripts** under `benchmarks/cosmoflow/`:
-- `PDSW_FITPP.sh` — single-job FitCache++ baseline (`FitCache_CROSS_JOB=0`)
-- `PDSW_FITPP_inner.sh` — shared launcher (per-node servers + horovodrun)
-- `PDSW_FITPP_two_job_sequential.sh` — Job B sbatched with `--dependency=afterok` after Job A
-- `PDSW_FITPP_two_job_concurrent.sh` — both jobs sbatched in parallel on different nodes
+- `TPDS_FITPP.sh` — single-job FitCache++ baseline (`FitCache_CROSS_JOB=0`)
+- `TPDS_FITPP_inner.sh` — shared launcher (per-node servers + horovodrun)
+- `TPDS_FITPP_two_job_sequential.sh` — Job B sbatched with `--dependency=afterok` after Job A
+- `TPDS_FITPP_two_job_concurrent.sh` — both jobs sbatched in parallel on different nodes
 - `command_CF_FITPP.sh` — horovodrun command body with `cd` to the cosmoflow benchmark dir
 Committed locally as `8fb565e`.
 

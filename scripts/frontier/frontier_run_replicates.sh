@@ -54,7 +54,7 @@ for i in $(seq 1 "$N_RUNS"); do
         sbatch --parsable "${SBATCH_BASE[@]}" \
             -J "FCP_rep${i}" \
             -o "$FCP_DIR/FitCachePP-%j.out" \
-            benchmarks/cosmoflow/PDSW_FITPP.sh)
+            benchmarks/cosmoflow/TPDS_FITPP.sh)
     JOBIDS+=("$JOB_FCP")
 
     # Pure_CF replicate
@@ -64,7 +64,7 @@ for i in $(seq 1 "$N_RUNS"); do
         sbatch --parsable "${SBATCH_BASE[@]}" \
             -J "PCF_rep${i}" \
             -o "$PCF_DIR/Pure_CF-%j.out" \
-            benchmarks/cosmoflow/PDSW_FITPP.sh)
+            benchmarks/cosmoflow/TPDS_FITPP.sh)
     JOBIDS+=("$JOB_PCF")
 
     echo "replicate $i submitted: FCP=$JOB_FCP  PCF=$JOB_PCF"

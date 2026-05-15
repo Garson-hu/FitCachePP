@@ -3,10 +3,10 @@
 # command_megatron_FITPP.sh
 #
 # LD_PRELOAD'd Megatron-LM pretraining command. Invoked by
-# PDSW_FITPP_inner.sh as the client-side launcher when
+# TPDS_FITPP_inner.sh as the client-side launcher when
 # FITCACHE_CLIENT_LAUNCHER points here.
 #
-# Assumes PDSW_FITPP_megatron.sh has exported MEGATRON_TRAIN_CMD (bash array)
+# Assumes TPDS_FITPP_megatron.sh has exported MEGATRON_TRAIN_CMD (bash array)
 # and MEGATRON_PYTHON.
 
 set -x

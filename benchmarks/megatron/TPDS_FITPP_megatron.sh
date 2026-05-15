@@ -21,7 +21,7 @@
 #   sbatch -p "$FITPP_SLURM_PARTITION" \
 #          ${FITPP_SLURM_ACCOUNT:+--account=$FITPP_SLURM_ACCOUNT} \
 #          -o "$FITPP_RESULTS_ROOT/megatron/FitCachePP_megatron-%j.out" \
-#          benchmarks/megatron/PDSW_FITPP_megatron.sh
+#          benchmarks/megatron/TPDS_FITPP_megatron.sh
 
 # Resolve site (sets $FITPP_REPO and friends). Under sbatch, BASH_SOURCE
 # points at /var/spool/slurmd/.../slurm_script — fall back to $FITPP_REPO.
@@ -107,4 +107,4 @@ export MEGATRON_PYTHON
 # Hand off to the shared launcher. FITCACHE_CLIENT_LAUNCHER selects the
 # Megatron-specific torchrun wrapper instead of CosmoFlow's.
 export FITCACHE_CLIENT_LAUNCHER="$FITPP_REPO/benchmarks/megatron/command_megatron_FITPP.sh"
-exec "$FITPP_REPO/benchmarks/cosmoflow/PDSW_FITPP_inner.sh"
+exec "$FITPP_REPO/benchmarks/cosmoflow/TPDS_FITPP_inner.sh"

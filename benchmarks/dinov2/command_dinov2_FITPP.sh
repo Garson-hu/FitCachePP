@@ -3,7 +3,7 @@
 # command_dinov2_FITPP.sh
 #
 # LD_PRELOAD'd DINOv2 SSL pretraining command. Invoked by
-# PDSW_FITPP_inner.sh as the client-side launcher when
+# TPDS_FITPP_inner.sh as the client-side launcher when
 # FITCACHE_CLIENT_LAUNCHER points here.
 
 set -x

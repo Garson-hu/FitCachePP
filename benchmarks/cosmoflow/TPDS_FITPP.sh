@@ -4,7 +4,7 @@
 #
 # Single-job FitCache++ baseline benchmark (CosmoFlow on cosmoUniverse-mini).
 # Runs FitCache++ in single-job mode (FitCache_CROSS_JOB=0). Wall-clock and
-# per-batch I/O numbers should match the IPDPS PDSW_FIT.sh runs in
+# per-batch I/O numbers should match the IPDPS TPDS_FIT.sh runs in
 # logs/pdsw/ — defends the zero-regression-vs-IPDPS-single-job claim.
 #
 # IMPORTANT: this script is site-portable. The SLURM partition, output path,
@@ -16,9 +16,9 @@
 #   sbatch -p "$FITPP_SLURM_PARTITION" \
 #          ${FITPP_SLURM_ACCOUNT:+--account=$FITPP_SLURM_ACCOUNT} \
 #          -o "$FITPP_RESULTS_ROOT/single_job_baseline/FitCachePP-%j.out" \
-#          benchmarks/cosmoflow/PDSW_FITPP.sh
+#          benchmarks/cosmoflow/TPDS_FITPP.sh
 #
-# (driver scripts like PDSW_FITPP_two_job_concurrent_v2.sh handle this for you.)
+# (driver scripts like TPDS_FITPP_two_job_concurrent_v2.sh handle this for you.)
 #
 # Server count = 4, all on the single client/server node. Matches the
 # 4-servers-per-node default for non-trivial datasets.
@@ -122,10 +122,10 @@ export BBPATH=$FitCache_NVME_PATH
 
 # Single-job baseline default: cross-job OFF. Servers behave exactly like
 # IPDPS. Caller can override via --export=FitCache_CROSS_JOB=1 (e.g. the
-# two-job concurrent driver in PDSW_FITPP_two_job_concurrent_v2.sh).
+# two-job concurrent driver in TPDS_FITPP_two_job_concurrent_v2.sh).
 export FitCache_CROSS_JOB="${FitCache_CROSS_JOB:-0}"
 
-# Hand off to the shared launcher PDSW_FITPP_inner.sh — same code path as the
+# Hand off to the shared launcher TPDS_FITPP_inner.sh — same code path as the
 # two-job and three-tier benchmarks. The inner script handles:
 #   - cd into RESULTS_DIR so log4c files land alongside the rest of the
 #     job's outputs (not the repo root)
@@ -140,4 +140,4 @@ export FitCache_CROSS_JOB="${FitCache_CROSS_JOB:-0}"
 # want per-job dirs); default is the single-job baseline.
 export RESULTS_DIR="${RESULTS_DIR:-${FITPP_RESULTS_ROOT}/single_job_baseline}"
 mkdir -p "$RESULTS_DIR"
-exec "$SCRIPT_DIR/PDSW_FITPP_inner.sh"
+exec "$SCRIPT_DIR/TPDS_FITPP_inner.sh"

@@ -20,7 +20,7 @@
 #   sbatch -p "$FITPP_SLURM_PARTITION" \
 #          ${FITPP_SLURM_ACCOUNT:+--account=$FITPP_SLURM_ACCOUNT} \
 #          -o "$FITPP_RESULTS_ROOT/dinov2/FitCachePP_dinov2-%j.out" \
-#          benchmarks/dinov2/PDSW_FITPP_dinov2.sh
+#          benchmarks/dinov2/TPDS_FITPP_dinov2.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 if [ -z "$SCRIPT_DIR" ] || [ ! -d "$SCRIPT_DIR/../sites" ]; then
@@ -82,4 +82,4 @@ export DINOV2_TRAIN_CMD=(
 )
 
 export FITCACHE_CLIENT_LAUNCHER="$FITPP_REPO/benchmarks/dinov2/command_dinov2_FITPP.sh"
-exec "$FITPP_REPO/benchmarks/cosmoflow/PDSW_FITPP_inner.sh"
+exec "$FITPP_REPO/benchmarks/cosmoflow/TPDS_FITPP_inner.sh"

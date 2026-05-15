@@ -3,7 +3,7 @@
 # command_CF_FITPP.sh
 #
 # LD_PRELOAD'd CosmoFlow training command, FitCache++ variant. Invoked by
-# horovodrun on each client rank from the PDSW_FITPP*.sh launchers. Mirrors
+# horovodrun on each client rank from the TPDS_FITPP*.sh launchers. Mirrors
 # the existing /home/ghu4/hvac/benchmark/cosmoflow-benchmark-master/command_MS_Read.sh
 # but swaps to the FitCache++ libfitcache_client.so so the cross-job code paths
 # (FitCache_CROSS_JOB=1, cluster registry, peer-lookup fanout) are exercised
@@ -12,7 +12,7 @@
 set -x
 # Resolve site (FITPP_COSMOFLOW_DIR / FITPP_PYTHON_TF / FITPP_CLIENT_LIB).
 # horovodrun copies us to a temp dir under sbatch, so apply the same fallback
-# as PDSW_FITPP.sh.
+# as TPDS_FITPP.sh.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 if [ -z "$SCRIPT_DIR" ] || [ ! -d "$SCRIPT_DIR/../sites" ]; then
     if [ -n "${FITPP_REPO:-}" ] && [ -d "$FITPP_REPO/benchmarks/sites" ]; then
@@ -23,7 +23,7 @@ fi
 source "$SCRIPT_DIR/../sites/_resolve.sh"
 
 # train.py reads configs/cosmo.yaml via a CWD-relative path, so cd into the
-# cosmoflow benchmark dir before launching. Mirrors what the IPDPS PDSW_*.sh
+# cosmoflow benchmark dir before launching. Mirrors what the IPDPS TPDS_*.sh
 # achieves implicitly because they're sbatched from that dir.
 cd "$FITPP_COSMOFLOW_DIR"/
 
@@ -33,7 +33,7 @@ cd "$FITPP_COSMOFLOW_DIR"/
 # fitcache_client.cpp:116 doesn't match — every read passes through to
 # BeeGFS direct and the FitCache server pathway stays dormant (root cause
 # of the zero-Open-RPC cluster runs on 2026-05-11).
-# N_TRAIN override: caller (the outer PDSW_FITPP*.sh script) sets
+# N_TRAIN override: caller (the outer TPDS_FITPP*.sh script) sets
 # FITPP_N_TRAIN to scale the workload. Default 1024 = the configs/cosmo.yaml
 # default (small smoke). For real comparisons against the IPDPS published
 # numbers, set FITPP_N_TRAIN=61440 (the full dataset IPDPS used). For a

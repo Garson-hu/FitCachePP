@@ -2,7 +2,7 @@
 #
 # Site config for the NCSU ARC cluster (BeeGFS PFS, rtx4060ti16g partition,
 # /mnt/local NVMe per compute node, /mnt/fsdax PMem on c35). Mirrors the
-# values that lived in PDSW_FITPP.sh / PDSW_FITPP_inner.sh / command_CF_FITPP.sh
+# values that lived in TPDS_FITPP.sh / TPDS_FITPP_inner.sh / command_CF_FITPP.sh
 # before the multi-site refactor.
 
 # ---- repo layout ----
