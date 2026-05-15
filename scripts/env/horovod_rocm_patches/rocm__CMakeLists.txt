@@ -1,0 +1,35 @@
+message(STATUS "Build Horovod for ROCm (Frontier ROCm-6.x patch: use FindHIP.cmake macros explicitly + enable_language(HIP) fallback)")
+
+# Frontier ROCm-6.0 ships hip_add_library only via the legacy FindHIP module
+# at /opt/rocm-X/lib/cmake/hip/FindHIP.cmake — NOT via the modern
+# hip-config.cmake at the same dir. The upstream horovod-0.28.1
+# CMakeLists.txt set CMAKE_MODULE_PATH from a never-populated HIP_PATH
+# variable (typo'd `HCC_APTH` guard prevented the right path from being
+# set), so cmake picked the CONFIG-mode hip package which doesn't expose
+# the hip_add_library macro and the build broke with
+#   "Unknown CMake command 'hip_add_library'" .
+#
+# Fix: point CMAKE_MODULE_PATH at the real FindHIP.cmake dir, then load
+# it explicitly. include(FindHIP) defines hip_add_library and friends.
+if (NOT DEFINED ENV{ROCM_PATH})
+  message(FATAL_ERROR "ROCM_PATH env not set; cannot locate FindHIP.cmake")
+endif()
+set(_FITPP_ROCM_PATH "$ENV{ROCM_PATH}")
+list(APPEND CMAKE_MODULE_PATH "${_FITPP_ROCM_PATH}/lib/cmake/hip")
+list(APPEND CMAKE_PREFIX_PATH "${_FITPP_ROCM_PATH}" "${_FITPP_ROCM_PATH}/lib/cmake/hip")
+set(HIP_PATH    "${_FITPP_ROCM_PATH}")
+set(HCC_PATH    "${_FITPP_ROCM_PATH}")
+set(HCC_HOME    "${_FITPP_ROCM_PATH}")
+set(HIP_CLANG_PATH "${_FITPP_ROCM_PATH}/llvm/bin")
+include(FindHIP)
+
+set(HIP_HCC_FLAGS ${HIP_HCC_FLAGS};-D__HIP_PLATFORM_AMD__=1;-fPIC)
+set(HIP_HIPCC_FLAGS ${HIP_HIPCC_FLAGS};-fPIC)
+list(APPEND HIP_HCC_FLAGS_RELEASE -O3 -fPIC)
+list(APPEND HIP_HCC_FLAGS_DEBUG -G -fPIC)
+
+list(APPEND HIP_HIPCC_FLAGS -D_GLIBCXX_USE_CXX11_ABI=1 -fPIC)
+hip_add_library(horovod_cuda_kernels STATIC hip_kernels.cu)
+target_compile_definitions(horovod_cuda_kernels PRIVATE _GLIBCXX_USE_CXX11_ABI=1)
+hip_add_library(compatible_horovod_cuda_kernels STATIC hip_kernels.cu)
+target_compile_definitions(compatible_horovod_cuda_kernels PRIVATE _GLIBCXX_USE_CXX11_ABI=0)

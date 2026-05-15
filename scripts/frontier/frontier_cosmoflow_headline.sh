@@ -54,6 +54,13 @@ TOTAL_SERVERS=$((N_NODES * SERVERS_PER_NODE))
 N_TRAIN="${FITPP_N_TRAIN:-524288}"
 N_EPOCHS="${FITPP_N_EPOCHS:-3}"
 WALLTIME="${WALLTIME:-12:00:00}"
+# When set (e.g. QOS=debug), inserted as `#SBATCH --qos=$QOS`. The Frontier
+# `debug` QoS gives much shorter queue times but caps wall to 2h and allows
+# only one job per user — use for one side at a time during debug iteration.
+QOS="${QOS:-}"
+# Optional: only submit one side this invocation. Set SIDES="FitCachePP" or
+# SIDES="Pure_CF" to skip the other. Default is both.
+SIDES_ENV="${SIDES:-FitCachePP Pure_CF}"
 COSMOFLOW_DATA="${COSMOFLOW_DATA:-${FITPP_PFS_DATA_ROOT}/cosmoflow/cosmoUniverse_2019_05_4parE_tf_v2}"
 
 if [ ! -d "$COSMOFLOW_DATA/train" ]; then
@@ -80,6 +87,10 @@ submit_side() {
     if [ "$SIDE" = "FitCachePP" ]; then
         USE_LD_PRELOAD="LD_PRELOAD=\"\$FITPP_CLIENT_LIB\""
     fi
+    local QOS_LINE=""
+    if [ -n "$QOS" ]; then
+        QOS_LINE="#SBATCH -q $QOS"
+    fi
     cat > "$JOB_DIR/job.sh" <<EOF
 #!/bin/bash
 #SBATCH -J cosmoflow_${SIDE}
@@ -88,6 +99,7 @@ submit_side() {
 #SBATCH -C nvme
 #SBATCH -p $FITPP_SLURM_PARTITION
 #SBATCH --account=$FITPP_SLURM_ACCOUNT
+${QOS_LINE}
 #SBATCH -o $JOB_DIR/cosmoflow_${SIDE}-%j.out
 
 export FITPP_SITE=frontier
@@ -183,15 +195,23 @@ EOF
     sbatch --parsable "$JOB_DIR/job.sh"
 }
 
-JOB_FITCACHEPP=$(submit_side FitCachePP)
-JOB_PURE_CF=$(submit_side Pure_CF)
-echo "FitCachePP run: $JOB_FITCACHEPP   -> $ROOT_DIR/FitCachePP/"
-echo "Pure_CF    run: $JOB_PURE_CF      -> $ROOT_DIR/Pure_CF/"
+JOB_FITCACHEPP=""
+JOB_PURE_CF=""
+case " $SIDES_ENV " in
+    *" FitCachePP "*) JOB_FITCACHEPP=$(submit_side FitCachePP) ;;
+esac
+case " $SIDES_ENV " in
+    *" Pure_CF "*)    JOB_PURE_CF=$(submit_side Pure_CF) ;;
+esac
+[ -n "$JOB_FITCACHEPP" ] && echo "FitCachePP run: $JOB_FITCACHEPP   -> $ROOT_DIR/FitCachePP/"
+[ -n "$JOB_PURE_CF" ]    && echo "Pure_CF    run: $JOB_PURE_CF      -> $ROOT_DIR/Pure_CF/"
 
 cat > "$ROOT_DIR/manifest.txt" <<EOF
 run_tag=$RUN_TAG
-job_fitcachepp=$JOB_FITCACHEPP
-job_pure_cf=$JOB_PURE_CF
+job_fitcachepp=${JOB_FITCACHEPP:-(not submitted this invocation)}
+job_pure_cf=${JOB_PURE_CF:-(not submitted this invocation)}
+qos=${QOS:-default}
+sides=$SIDES_ENV
 n_nodes=$N_NODES
 gpus_per_node=$GPUS_PER_NODE
 servers_per_node=$SERVERS_PER_NODE
