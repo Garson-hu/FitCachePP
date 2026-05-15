@@ -16,7 +16,10 @@
 #include "fitcache_data_mover_internal.h"
 #include "fitcache_cache_policy.h"
 #include "fitcache_cross_job.h"
+#include "fitcache_cluster_registry.h"  // registry_record_file_presence (Option 1)
 #include "fitcache_persistent_meta.h"
+#include "fitcache_comm.h"               // fitcache_comm_get_self_addr_string,
+                                          // fitcache_broadcast_register_file (Option 2)
 using namespace std;
 namespace fs = std::filesystem;
 
@@ -524,6 +527,32 @@ void *fitcache_data_mover_fn(void *args)
                         L4C_INFO("Data mover: wrote sidecar for %s",
                                  filename.c_str());
                     }
+
+                    // Cross-job has_yes=0 fix Option 1: record our presence
+                    // on PFS so peer-job servers can find us in their
+                    // peer_lookup_rpc handlers. This closes the race where
+                    // a peer queries us between open-time (path_cache_map
+                    // empty) and now (cache populated) — the PFS record is
+                    // durable and is consulted in addition to path_cache_map.
+                    const std::string &self_addr =
+                        fitcache_comm_get_self_addr_string();
+                    if (!self_addr.empty()) {
+                        int prc = fitcache::registry_record_file_presence(
+                            original_path, self_addr,
+                            fitcache::get_self_dataset_manifest_hash());
+                        if (prc == 0 && DEBUG_HU) {
+                            L4C_INFO("Data mover: recorded PFS presence for %s",
+                                     original_path.c_str());
+                        }
+                    }
+
+                    // Cross-job has_yes=0 fix Option 2: broadcast a
+                    // register-file RPC to every live peer so their
+                    // in-memory remote_presence_map gets updated without
+                    // needing a PFS read on every peer_lookup. PFS presence
+                    // (Option 1) is the durable source-of-truth; this RPC
+                    // is the fast in-cluster path.
+                    fitcache_broadcast_register_file(original_path);
                 }
 
             } catch (const fs::filesystem_error& e)

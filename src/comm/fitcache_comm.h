@@ -80,6 +80,19 @@ MERCURY_GEN_PROC(fitcache_peer_lookup_in_t,
 MERCURY_GEN_PROC(fitcache_peer_lookup_out_t,
     ((int32_t)(has))((int32_t)(tier))((hg_string_t)(serve_addr)))
 
+// Cross-job register-file RPC (Option 2 of the has_yes=0 fix).
+// Sent by a server S that has just finished caching file X to every other
+// live peer P. The peer records (path -> serve_addr=S_addr) in its in-memory
+// remote_presence_map; future peer_lookup_rpc queries hitting P for X will
+// then return has=1 with serve_addr=S_addr — even though P never cached X
+// locally. The RPC is fire-and-forget (response is informational); senders
+// don't block on the broadcast.
+MERCURY_GEN_PROC(fitcache_register_file_in_t,
+    ((hg_string_t)(path))((hg_string_t)(serve_addr))
+    ((uint64_t)(dataset_manifest_hash)))
+MERCURY_GEN_PROC(fitcache_register_file_out_t,
+    ((int32_t)(status)))
+
 
 //General
 void fitcache_init_comm(hg_bool_t listen);
@@ -156,6 +169,43 @@ hg_id_t fitcache_peer_lookup_rpc_register_client(void);
 // fanning out peer-lookup queries on cache miss in cross-job mode. Returns 0
 // if the server hasn't registered the RPC yet.
 hg_id_t fitcache_peer_lookup_get_id(void);
+
+// Cross-job register-file RPC (Option 2). Server-side registration; the
+// handler updates the in-memory remote_presence_map. Called once at server
+// startup.
+hg_id_t fitcache_register_file_rpc_register_server(void);
+
+// Returns the register-file hg_id_t. Used by fitcache_broadcast_register_file
+// to fire the RPC at every live peer.
+hg_id_t fitcache_register_file_get_id(void);
+
+// Broadcast a register-file RPC to every live peer in the cluster registry,
+// announcing that this server now caches `path`. Best-effort: peers that
+// can't be reached are silently skipped (the PFS presence record from
+// Option 1 still covers them on the next lookup). No-op outside cross-job
+// mode. Called from the data_mover thread after a successful cache copy.
+void fitcache_broadcast_register_file(const std::string &path);
+
+// Look up `path` in this server's remote_presence_map (populated by inbound
+// register-file RPCs from other servers). Returns the serve_addr of the
+// most recent registering server, or an empty string if no one has registered
+// the path remotely. Used by fitcache_peer_lookup_rpc_handler to answer
+// has=1 even when this server doesn't cache the file locally.
+std::string fitcache_remote_presence_lookup(const std::string &path);
+
+// Test-only: returns the count of distinct (path) entries in the local
+// remote_presence_map. Used by test_cross_job_smoke.
+size_t fitcache_remote_presence_count();
+
+// Test-only: clears the remote_presence_map. Used to reset state between
+// test cases. Not safe to call while RPC handlers may be reading.
+void fitcache_remote_presence_clear_for_test();
+
+// Test-only: synthesise a remote_presence_map entry without round-tripping
+// through Mercury. Lets unit tests verify the read-side lookup logic
+// independently of network reachability.
+void fitcache_remote_presence_insert_for_test(const std::string &path,
+                                              const std::string &addr);
 
 // Forward declarations for per-file sync context and state structures
 struct fitcache_file_sync_context;

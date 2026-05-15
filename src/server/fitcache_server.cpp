@@ -144,6 +144,11 @@ int fitcache_start_comm_server(void)
     if (fitcache::cross_job_enabled()) {
         if (fitcache::registry_init() == 0) {
             fitcache_peer_lookup_rpc_register_server();
+            // Cross-job has_yes=0 fix Option 2: register the inbound RPC
+            // handler so peers can announce file presence to us. The data
+            // mover's broadcast helper requires this id to be registered
+            // before it can fan out.
+            fitcache_register_file_rpc_register_server();
 
             fitcache::ServerEndpoint self;
             self.rank      = fitcache_server_rank;

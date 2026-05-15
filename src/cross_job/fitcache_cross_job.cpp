@@ -27,6 +27,7 @@ extern "C" {
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -380,6 +381,42 @@ void cross_job_counter_bump_peer_lookup_handled()    { g_peer_lookup_handled.fet
 void cross_job_counter_bump_peer_lookup_has_yes()    { g_peer_lookup_has_yes.fetch_add(1, std::memory_order_relaxed); }
 void cross_job_counter_bump_peer_lookup_has_no()     { g_peer_lookup_has_no.fetch_add(1, std::memory_order_relaxed); }
 void cross_job_counter_bump_peer_lookup_timeout()    { g_peer_lookup_timeout.fetch_add(1, std::memory_order_relaxed); }
+
+// ----------------------------------------------------------------------------
+// Remote presence map (Option 2 storage layer).
+// Pure C++; no Mercury dependency. The Mercury-side RPC handler that fills
+// this map lives in src/comm/fitcache_comm_server.cpp.
+// ----------------------------------------------------------------------------
+namespace {
+
+std::shared_mutex                            g_remote_presence_mtx;
+std::unordered_map<std::string, std::string> g_remote_presence_path_to_addr;
+
+}  // namespace
+
+std::string remote_presence_lookup(const std::string &path) {
+    std::shared_lock<std::shared_mutex> rlock(g_remote_presence_mtx);
+    auto it = g_remote_presence_path_to_addr.find(path);
+    return (it == g_remote_presence_path_to_addr.end()) ? std::string()
+                                                        : it->second;
+}
+
+size_t remote_presence_count() {
+    std::shared_lock<std::shared_mutex> rlock(g_remote_presence_mtx);
+    return g_remote_presence_path_to_addr.size();
+}
+
+void remote_presence_clear_for_test() {
+    std::unique_lock<std::shared_mutex> wlock(g_remote_presence_mtx);
+    g_remote_presence_path_to_addr.clear();
+}
+
+void remote_presence_insert(const std::string &path,
+                            const std::string &addr) {
+    if (path.empty() || addr.empty()) return;
+    std::unique_lock<std::shared_mutex> wlock(g_remote_presence_mtx);
+    g_remote_presence_path_to_addr[path] = addr;
+}
 
 void log_cross_job_stats(int server_rank) {
     CrossJobCounters cur = cross_job_counters_snapshot();

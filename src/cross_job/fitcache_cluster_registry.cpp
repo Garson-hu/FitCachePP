@@ -580,4 +580,257 @@ int registry_gc_stale() {
     return 0;
 }
 
+// ----------------------------------------------------------------------------
+// Per-file presence index (Option 1).
+// ----------------------------------------------------------------------------
+namespace {
+
+constexpr uint64_t kDefaultPresenceStaleSec = 180;  // 3x kDefaultHeartbeatSec
+
+// 160-bit SHA-1 of the path, hex-encoded. We only need a stable wide hash to
+// bucket presence files on PFS; cryptographic strength is not required and
+// FNV-1a 64-bit would also work, but SHA-1 gives us 40 hex chars which spreads
+// directory entries more uniformly across the 2x2 bucket dirs and avoids
+// adversarial collisions when datasets contain many filenames with shared
+// prefixes (cosmoflow's tfrecord names share a long common prefix).
+//
+// Implementation: minimal-deps inline SHA-1 over std::string. Output: 40-char
+// lower-case hex. SHA-1 is in the C++ stdlib in C++23 but not C++20, so we
+// roll our own 20-line implementation rather than pull a new dependency.
+//
+// NOTE: this is "use SHA-1 for hashing, not for security" — collision risk
+// for a few million file paths is negligible (2^-80 birthday bound).
+std::string sha1_hex(const std::string &s) {
+    uint32_t h[5] = {0x67452301u, 0xEFCDAB89u, 0x98BADCFEu, 0x10325476u, 0xC3D2E1F0u};
+    auto rotl = [](uint32_t v, int b){ return (v << b) | (v >> (32 - b)); };
+
+    std::vector<uint8_t> buf(s.begin(), s.end());
+    uint64_t bit_len = static_cast<uint64_t>(buf.size()) * 8ULL;
+    buf.push_back(0x80);
+    while (buf.size() % 64 != 56) buf.push_back(0x00);
+    for (int i = 7; i >= 0; --i) buf.push_back((bit_len >> (i*8)) & 0xff);
+
+    for (size_t off = 0; off + 64 <= buf.size(); off += 64) {
+        uint32_t w[80];
+        for (int i = 0; i < 16; ++i) {
+            w[i] = (uint32_t(buf[off+4*i  ]) << 24) | (uint32_t(buf[off+4*i+1]) << 16)
+                 | (uint32_t(buf[off+4*i+2]) <<  8) |  uint32_t(buf[off+4*i+3]);
+        }
+        for (int i = 16; i < 80; ++i) {
+            w[i] = rotl(w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16], 1);
+        }
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+        for (int i = 0; i < 80; ++i) {
+            uint32_t f, k;
+            if      (i < 20) { f = (b & c) | ((~b) & d);            k = 0x5A827999u; }
+            else if (i < 40) { f = b ^ c ^ d;                        k = 0x6ED9EBA1u; }
+            else if (i < 60) { f = (b & c) | (b & d) | (c & d);      k = 0x8F1BBCDCu; }
+            else             { f = b ^ c ^ d;                        k = 0xCA62C1D6u; }
+            uint32_t t = rotl(a, 5) + f + e + k + w[i];
+            e = d; d = c; c = rotl(b, 30); b = a; a = t;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+    }
+    char out[41];
+    for (int i = 0; i < 5; ++i) std::snprintf(out + i*8, 9, "%08x", h[i]);
+    out[40] = 0;
+    return std::string(out, 40);
+}
+
+std::string presence_dir_for_hash(const std::string &hash40) {
+    return std::string(g_registry_root_buf) + "/presence/"
+         + hash40.substr(0, 2) + "/" + hash40.substr(2, 2);
+}
+
+std::string presence_file_for_path(const std::string &path) {
+    std::string h = sha1_hex(path);
+    return presence_dir_for_hash(h) + "/" + h + ".txt";
+}
+
+bool parse_presence_line(const std::string &line, FilePresenceHolder &out) {
+    // Format: "<addr>\t<unix_ts>\t<dataset_manifest_hash>"
+    auto t1 = line.find('\t');
+    if (t1 == std::string::npos) return false;
+    auto t2 = line.find('\t', t1 + 1);
+    if (t2 == std::string::npos) return false;
+    out.addr           = line.substr(0, t1);
+    out.last_seen_unix = std::strtoull(line.c_str() + t1 + 1, nullptr, 10);
+    out.dataset_manifest_hash =
+        std::strtoull(line.c_str() + t2 + 1, nullptr, 10);
+    return !out.addr.empty();
+}
+
+}  // namespace
+
+uint64_t presence_stale_sec() {
+    static uint64_t cached = 0;
+    static bool     cached_set = false;
+    if (!cached_set) {
+        const char *v = std::getenv("FitCache_PRESENCE_STALE_SEC");
+        if (v) {
+            int n = std::atoi(v);
+            cached = (n > 0) ? static_cast<uint64_t>(n) : kDefaultPresenceStaleSec;
+        } else {
+            cached = kDefaultPresenceStaleSec;
+        }
+        cached_set = true;
+    }
+    return cached;
+}
+
+int registry_record_file_presence(const std::string &path,
+                                  const std::string &addr,
+                                  uint64_t dataset_manifest_hash) {
+    if (!g_initialized) return -1;
+    if (path.empty() || addr.empty()) return -1;
+
+    const std::string file = presence_file_for_path(path);
+    const std::string dir  = fs::path(file).parent_path().string();
+    {
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        if (ec) {
+            L4C_WARN("presence: cannot ensure %s: %s",
+                     dir.c_str(), ec.message().c_str());
+            return -1;
+        }
+    }
+
+    char line[1024];
+    int n = std::snprintf(line, sizeof(line), "%s\t%lu\t%lu\n",
+                          addr.c_str(),
+                          (unsigned long)now_unix(),
+                          (unsigned long)dataset_manifest_hash);
+    if (n <= 0 || n >= static_cast<int>(sizeof(line))) {
+        L4C_WARN("presence: line too long for %s (n=%d)", path.c_str(), n);
+        return -1;
+    }
+
+    // O_APPEND + single write() < PIPE_BUF is atomic on POSIX. No flock
+    // needed because each (addr) is written by only one server process; if
+    // the same server records the same path twice, both lines persist and
+    // the reader keeps only the latest (highest ts) per addr.
+    int fd = open(file.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) {
+        L4C_WARN("presence: open %s: %s", file.c_str(), std::strerror(errno));
+        return -1;
+    }
+    ssize_t w = ::write(fd, line, static_cast<size_t>(n));
+    int saved_errno = errno;
+    close(fd);
+    if (w != n) {
+        L4C_WARN("presence: short write to %s (wrote %zd of %d, errno=%d)",
+                 file.c_str(), w, n, saved_errno);
+        return -1;
+    }
+    return 0;
+}
+
+std::vector<FilePresenceHolder> registry_lookup_file_presence(
+        const std::string &path, uint64_t max_age_sec) {
+    std::vector<FilePresenceHolder> out;
+    if (!g_initialized || path.empty()) return out;
+
+    const std::string file = presence_file_for_path(path);
+    std::ifstream f(file);
+    if (!f) return out;   // not registered
+
+    const uint64_t now = now_unix();
+    const uint64_t age = (max_age_sec == 0) ? presence_stale_sec() : max_age_sec;
+
+    // Dedupe by addr; keep latest ts per addr.
+    std::unordered_map<std::string, FilePresenceHolder> latest_per_addr;
+    std::string line;
+    while (std::getline(f, line)) {
+        FilePresenceHolder h;
+        if (!parse_presence_line(line, h)) continue;
+        if (h.last_seen_unix == 0) continue;
+        if (now > h.last_seen_unix && (now - h.last_seen_unix) > age) continue;
+        auto it = latest_per_addr.find(h.addr);
+        if (it == latest_per_addr.end() || h.last_seen_unix > it->second.last_seen_unix) {
+            latest_per_addr[h.addr] = h;
+        }
+    }
+    out.reserve(latest_per_addr.size());
+    for (auto &kv : latest_per_addr) out.push_back(kv.second);
+    return out;
+}
+
+int registry_gc_file_presence(int max_files) {
+    if (!g_initialized) return -1;
+    const std::string root = std::string(g_registry_root_buf) + "/presence";
+    std::error_code ec;
+    if (!fs::exists(root, ec)) return 0;
+
+    int scanned = 0, rewritten = 0;
+    const uint64_t now  = now_unix();
+    const uint64_t age  = presence_stale_sec();
+
+    // Two-level bucket dirs.
+    for (const auto &lvl1 : fs::directory_iterator(root, ec)) {
+        if (ec) break;
+        if (!lvl1.is_directory(ec)) continue;
+        for (const auto &lvl2 : fs::directory_iterator(lvl1.path(), ec)) {
+            if (ec) break;
+            if (!lvl2.is_directory(ec)) continue;
+            for (const auto &entry : fs::directory_iterator(lvl2.path(), ec)) {
+                if (ec) break;
+                if (!entry.is_regular_file(ec)) continue;
+                if (scanned >= max_files) return rewritten;
+                ++scanned;
+                std::ifstream f(entry.path());
+                if (!f) continue;
+                std::vector<std::string> fresh;
+                std::unordered_map<std::string, std::pair<uint64_t, std::string>>
+                    latest;  // addr -> (ts, raw_line)
+                std::string line;
+                while (std::getline(f, line)) {
+                    FilePresenceHolder h;
+                    if (!parse_presence_line(line, h)) continue;
+                    if (now > h.last_seen_unix && (now - h.last_seen_unix) > age) continue;
+                    auto it = latest.find(h.addr);
+                    if (it == latest.end() || h.last_seen_unix > it->second.first) {
+                        latest[h.addr] = {h.last_seen_unix, line};
+                    }
+                }
+                f.close();
+
+                // Rewrite only if the deduped + filtered set is strictly
+                // smaller than the on-disk file's line count (otherwise no
+                // point in churning the inode).
+                bool need_rewrite = false;
+                {
+                    std::ifstream f2(entry.path());
+                    int line_count = 0;
+                    std::string ln;
+                    while (std::getline(f2, ln)) ++line_count;
+                    if (line_count > static_cast<int>(latest.size())) need_rewrite = true;
+                }
+                if (!need_rewrite) continue;
+
+                const std::string tmp = entry.path().string() + ".gc.tmp."
+                                      + std::to_string(getpid());
+                std::ofstream out(tmp);
+                if (!out) continue;
+                for (auto &kv : latest) out << kv.second.second << "\n";
+                out.flush();
+                if (!out) {
+                    std::remove(tmp.c_str());
+                    continue;
+                }
+                out.close();
+                if (std::rename(tmp.c_str(), entry.path().c_str()) == 0) {
+                    ++rewritten;
+                } else {
+                    std::remove(tmp.c_str());
+                }
+            }
+        }
+    }
+    if (rewritten > 0) {
+        L4C_INFO("presence: gc rewrote %d files (scanned=%d)", rewritten, scanned);
+    }
+    return rewritten;
+}
+
 }  // namespace fitcache

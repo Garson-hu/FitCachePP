@@ -175,6 +175,25 @@ void cross_job_counter_bump_peer_lookup_timeout();
 // `server_rank` is informational so cluster experiments can grep per-server.
 void log_cross_job_stats(int server_rank);
 
+// ----------------------------------------------------------------------------
+// Remote presence map (Option 2 of the has_yes=0 fix).
+//
+// Lives here, not in fitcache_comm_server.cpp, because the data structure is
+// pure C++ with no Mercury dependency and we want the smoke tests
+// (test_cross_job_smoke) to be able to exercise it without linking the
+// Mercury-backed comm layer. The actual fitcache_register_file_rpc_handler
+// and fitcache_broadcast_register_file (which DO use Mercury) live in
+// fitcache_comm_server.cpp and call into the accessors below.
+//
+// Populated by inbound register-file RPCs from peer servers. Read by
+// fitcache_peer_lookup_rpc_handler when its own path_cache_map misses.
+// Concurrency: internally uses a shared_mutex; safe for any thread.
+std::string remote_presence_lookup(const std::string &path);
+size_t      remote_presence_count();
+void        remote_presence_clear_for_test();
+void        remote_presence_insert(const std::string &path,
+                                   const std::string &addr);
+
 }  // namespace fitcache
 
 #endif  // __cplusplus

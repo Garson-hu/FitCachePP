@@ -14,11 +14,13 @@
 #include <cerrno>
 #include <chrono>
 #include <map>
+#include <shared_mutex>
 #include <string>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 // External server ID variable declared in fitcache_server.cpp
@@ -51,6 +53,39 @@ static hg_id_t g_peer_lookup_id = 0;
 
 hg_id_t fitcache_peer_lookup_get_id(void) {
     return g_peer_lookup_id;
+}
+
+// hg_id_t for fitcache_register_file_rpc — captured at registration time
+// so the data-mover broadcast helper can find peers.
+static hg_id_t g_register_file_id = 0;
+
+hg_id_t fitcache_register_file_get_id(void) {
+    return g_register_file_id;
+}
+
+// ============================================================
+// Cross-job has_yes=0 fix Option 2: thin C-side wrappers over the in-memory
+// remote_presence_map. The state itself lives in
+// src/cross_job/fitcache_cross_job.cpp (so the smoke test can link to it
+// without Mercury); the Mercury-backed register-file RPC handler below
+// writes into it via fitcache::remote_presence_insert.
+// ============================================================
+
+std::string fitcache_remote_presence_lookup(const std::string &path) {
+    return fitcache::remote_presence_lookup(path);
+}
+
+size_t fitcache_remote_presence_count() {
+    return fitcache::remote_presence_count();
+}
+
+void fitcache_remote_presence_clear_for_test() {
+    fitcache::remote_presence_clear_for_test();
+}
+
+void fitcache_remote_presence_insert_for_test(const std::string &path,
+                                              const std::string &addr) {
+    fitcache::remote_presence_insert(path, addr);
 }
 
 // State carried across all peer_lookup callbacks for one in-flight open.
@@ -630,30 +665,76 @@ fitcache_peer_lookup_rpc_handler(hg_handle_t handle)
 
     fitcache::cross_job_counter_bump_peer_lookup_handled();
 
-    bool found = false;
+    // Source-of-truth resolution order (cross-job has_yes=0 fix):
+    //   1. local path_cache_map  — fastest, in-memory, this server cached it.
+    //   2. remote_presence_map   — fastest cluster-wide path (Option 2 RPC).
+    //   3. PFS presence index    — durable cluster-wide path (Option 1).
+    //
+    // Steps 2+3 let us answer has=1 with a remote serve_addr even if THIS
+    // server never cached the file — closing the prior gap where peer_lookup
+    // fan-out hit a peer that hadn't seen the path, returned has=0, and the
+    // client fell through to PFS even though some other peer had it cached.
+
+    // Step 1: local cache hit?
+    bool local_found = false;
     {
         std::shared_lock<std::shared_mutex> rlock(cache_mtx);
         auto it = path_cache_map.find(in.path);
-        found = (it != path_cache_map.end());
+        local_found = (it != path_cache_map.end());
     }
-
     const std::string &my_addr = fitcache_comm_get_self_addr_string();
 
-    if (found) {
+    if (local_found) {
         fitcache::cross_job_counter_bump_peer_lookup_has_yes();
         out.has        = 1;
         out.tier       = (int32_t)CACHE_TIER_DRAM;
         out.serve_addr = const_cast<char *>(my_addr.c_str());
-        L4C_INFO("peer_lookup: rank=%d path=%s -> HAS (serve_addr=%s)",
+        L4C_INFO("peer_lookup: rank=%d path=%s -> HAS local (serve_addr=%s)",
                  server_rank, in.path, my_addr.c_str());
-    } else {
-        fitcache::cross_job_counter_bump_peer_lookup_has_no();
-        out.has        = 0;
-        out.tier       = 0;
-        out.serve_addr = const_cast<char *>("");
-        L4C_INFO("peer_lookup: rank=%d path=%s -> NOT HAS",
-                 server_rank, in.path);
+        HG_Respond(handle, NULL, NULL, &out);
+        HG_Free_input(handle, &in);
+        HG_Destroy(handle);
+        return (hg_return_t)ret;
     }
+
+    // Step 2: remote presence (Option 2 — in-memory map populated by inbound
+    // register-file RPCs from peers).
+    std::string remote_addr = fitcache_remote_presence_lookup(in.path);
+
+    // Step 3: PFS presence index (Option 1 — durable). Read only if step 2
+    // came up empty, to avoid an unnecessary PFS read on the hot path. The
+    // returned list may include this server's own addr — filter that out
+    // (we already know we don't have it locally, so a stale self-entry
+    // would be a false positive).
+    if (remote_addr.empty()) {
+        auto holders = fitcache::registry_lookup_file_presence(in.path);
+        for (const auto &h : holders) {
+            if (!h.addr.empty() && h.addr != my_addr) {
+                remote_addr = h.addr;
+                break;
+            }
+        }
+    }
+
+    if (!remote_addr.empty()) {
+        fitcache::cross_job_counter_bump_peer_lookup_has_yes();
+        out.has        = 1;
+        out.tier       = (int32_t)CACHE_TIER_DRAM;
+        out.serve_addr = const_cast<char *>(remote_addr.c_str());
+        L4C_INFO("peer_lookup: rank=%d path=%s -> HAS remote (serve_addr=%s)",
+                 server_rank, in.path, remote_addr.c_str());
+        HG_Respond(handle, NULL, NULL, &out);
+        HG_Free_input(handle, &in);
+        HG_Destroy(handle);
+        return (hg_return_t)ret;
+    }
+
+    fitcache::cross_job_counter_bump_peer_lookup_has_no();
+    out.has        = 0;
+    out.tier       = 0;
+    out.serve_addr = const_cast<char *>("");
+    L4C_INFO("peer_lookup: rank=%d path=%s -> NOT HAS",
+             server_rank, in.path);
     (void)in.dataset_root_hash;       // TODO: dataset_id verification
     (void)in.dataset_manifest_hash;   // ditto
 
@@ -672,4 +753,116 @@ fitcache_peer_lookup_rpc_register_server(void)
         fitcache_peer_lookup_rpc_handler);
     g_peer_lookup_id = tmp;
     return tmp;
+}
+
+// ============================================================
+// Cross-job register-file RPC handler (Option 2 incoming).
+// Records (path -> serve_addr) in this server's remote_presence_map.
+// Reply is fire-and-forget — we still HG_Respond so the sender's callback
+// fires and the handle is released, but the sender doesn't act on the
+// response.
+// ============================================================
+static hg_return_t
+fitcache_register_file_rpc_handler(hg_handle_t handle)
+{
+    fitcache_register_file_in_t  in;
+    fitcache_register_file_out_t out;
+    int ret = HG_Get_input(handle, &in);
+    assert(ret == HG_SUCCESS);
+
+    std::string path = (in.path && in.path[0]) ? in.path : std::string();
+    std::string addr = (in.serve_addr && in.serve_addr[0]) ? in.serve_addr : std::string();
+
+    if (!path.empty() && !addr.empty()) {
+        // Overwrite is the right semantic: the most recent register-file RPC
+        // wins for any given path. If two servers race to register the same
+        // path, the loser is harmless (a subsequent peer_lookup will land on
+        // one of them, the client gets redirected, and the cache hits).
+        fitcache::remote_presence_insert(path, addr);
+    }
+    L4C_INFO("register_file: rank=%d path=%s serve_addr=%s -> recorded",
+             server_rank, path.c_str(), addr.c_str());
+    (void)in.dataset_manifest_hash;
+
+    out.status = 0;
+    HG_Respond(handle, NULL, NULL, &out);
+    HG_Free_input(handle, &in);
+    HG_Destroy(handle);
+    return (hg_return_t)ret;
+}
+
+hg_id_t
+fitcache_register_file_rpc_register_server(void)
+{
+    hg_id_t tmp = MERCURY_REGISTER(
+        hg_class, "fitcache_register_file_rpc",
+        fitcache_register_file_in_t, fitcache_register_file_out_t,
+        fitcache_register_file_rpc_handler);
+    g_register_file_id = tmp;
+    return tmp;
+}
+
+// Outbound broadcast: send a register_file_rpc to every other live peer
+// in the cluster registry. The Mercury forward is async and fire-and-forget
+// from our point of view — the response callback drops the handle and
+// frees its output. We don't block on completion (the data_mover wants to
+// return to its next promotion as soon as possible).
+namespace {
+
+// Callback for outbound register-file RPC: free the response, destroy the
+// handle, drop our refcount. Nothing else to do — the sender is
+// fire-and-forget.
+hg_return_t register_file_forward_cb(const struct hg_cb_info *info) {
+    hg_handle_t h = info->info.forward.handle;
+    if (info->ret == HG_SUCCESS) {
+        fitcache_register_file_out_t out;
+        if (HG_Get_output(h, &out) == HG_SUCCESS) {
+            HG_Free_output(h, &out);
+        }
+    }
+    HG_Destroy(h);
+    return HG_SUCCESS;
+}
+
+}  // namespace
+
+void fitcache_broadcast_register_file(const std::string &path) {
+    if (!fitcache::cross_job_enabled()) return;
+    if (g_register_file_id == 0) return;
+    if (path.empty()) return;
+
+    const std::string &my_addr = fitcache_comm_get_self_addr_string();
+    if (my_addr.empty()) return;
+
+    std::vector<fitcache::ServerEndpoint> live = fitcache::registry_live_servers();
+    if (live.empty()) return;
+
+    fitcache_register_file_in_t in;
+    in.path                   = const_cast<char *>(path.c_str());
+    in.serve_addr             = const_cast<char *>(my_addr.c_str());
+    in.dataset_manifest_hash  = fitcache::get_self_dataset_manifest_hash();
+
+    int forwarded = 0;
+    for (const auto &peer : live) {
+        if (!peer.live || peer.addr.empty() || peer.addr == my_addr) continue;
+        hg_addr_t peer_hg = NULL;
+        if (HG_Addr_lookup2(hg_class, peer.addr.c_str(), &peer_hg) != HG_SUCCESS
+            || peer_hg == NULL) continue;
+        hg_handle_t h = NULL;
+        if (HG_Create(hg_context, peer_hg, g_register_file_id, &h) != HG_SUCCESS) {
+            HG_Addr_free(hg_class, peer_hg);
+            continue;
+        }
+        hg_return_t hr = HG_Forward(h, register_file_forward_cb, NULL, &in);
+        HG_Addr_free(hg_class, peer_hg);
+        if (hr != HG_SUCCESS) {
+            HG_Destroy(h);
+            continue;
+        }
+        ++forwarded;
+    }
+    if (forwarded > 0) {
+        L4C_INFO("register_file: rank=%d broadcast %s to %d peers",
+                 server_rank, path.c_str(), forwarded);
+    }
 }
