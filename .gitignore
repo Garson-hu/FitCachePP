@@ -10,7 +10,6 @@
 
 fitcache_server_log.*
 .ports.cfg.*
-/tpds_extension
 # Track benchmark summaries (.md, .yaml, etc.) under benchmarks/results/
 # but skip the raw per-run artifacts: SLURM .out files, log4c logs, and the
 # horovodrun stdout captures. Per-run sbatch shell scripts auto-generated
