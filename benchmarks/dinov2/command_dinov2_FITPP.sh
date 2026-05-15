@@ -3,12 +3,22 @@
 # command_dinov2_FITPP.sh
 #
 # LD_PRELOAD'd DINOv2 SSL pretraining command. Invoked by
-# PDSW_FITPP_inner.sh when FITCACHE_CLIENT_LAUNCHER points at this script.
+# PDSW_FITPP_inner.sh as the client-side launcher when
+# FITCACHE_CLIENT_LAUNCHER points here.
 
 set -x
-cd /home/ghu4/hvac/benchmark/dinov2/
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+if [ -z "$SCRIPT_DIR" ] || [ ! -d "$SCRIPT_DIR/../sites" ]; then
+    if [ -n "${FITPP_REPO:-}" ] && [ -d "$FITPP_REPO/benchmarks/sites" ]; then
+        SCRIPT_DIR="$FITPP_REPO/benchmarks/dinov2"
+    fi
+fi
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/../sites/_resolve.sh"
 
-LD_PRELOAD=/home/ghu4/hvac/FitCachePP/build/src/libfitcache_client.so \
+cd "$FITPP_DINOV2_DIR/"
+
+LD_PRELOAD="$FITPP_CLIENT_LIB" \
     "${DINOV2_TRAIN_CMD[@]}"
 
 echo "DONE $(hostname)"

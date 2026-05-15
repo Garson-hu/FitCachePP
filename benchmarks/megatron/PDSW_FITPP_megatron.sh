@@ -1,80 +1,83 @@
 #!/bin/bash
-#SBATCH -p rtx4060ti16g
 #SBATCH -t 1-00:00:00
 #SBATCH -J FITPP_megatron
-#SBATCH -o /home/ghu4/hvac/FitCachePP/benchmarks/results/megatron/FitCachePP_megatron-%j.out
 #
 # Megatron-LM workload-generalization run (FitCache++ wrapping a GPT-style
 # LLM pretraining job). Defends the workload-generalization claim from
 # tpds_extension/04_experiment_plan.md §IV-H by routing Megatron's
 # indexed-binary I/O through FitCache.
 #
-# Prerequisites the user must satisfy before submission:
-#   1. Megatron-LM source tree at /home/ghu4/hvac/benchmark/Megatron-LM
-#      (already cloned; --depth 1 source only, no datasets/weights).
-#   2. Tokenized data at MEGATRON_DATA_PREFIX (e.g., RedPajama or a Pile
-#      slice run through tools/preprocess_data.py). Megatron expects a
-#      paired <prefix>.bin (token blob) and <prefix>.idx (offset table).
-#   3. Tokenizer files at MEGATRON_VOCAB_FILE + MEGATRON_MERGE_FILE
-#      (gpt2-vocab.json + gpt2-merges.txt).
-#   4. PyTorch + CUDA + apex installed in the python env at
-#      /home/ghu4/hvac/rlibrary/miniconda3/envs/<env_name>. Megatron
-#      requires apex's fused kernels.
+# NOTE: this workload is currently mmap-blocked — Megatron uses numpy.memmap
+# for .bin/.idx access, which the LD_PRELOAD client does not intercept
+# (see benchmarks/results/arc/workload_generalization/megatron_mmap_limitation.md).
+# Script is preserved + ported as portable scaffolding for when an mmap
+# interceptor lands.
 #
-# What this script does:
-#   1. Sets FitCache_DATA_DIR to the dataset root (parent of the .bin/.idx
-#      files), so the LD_PRELOAD client's substring path-filter
-#      (fitcache_client.cpp:116) catches every Megatron data open.
-#   2. Sets the env vars FitCache_PORTS_CFG_DIR / log paths via
-#      PDSW_FITPP_inner.sh (server cd's to RESULTS_DIR, log4c lands here).
-#   3. Launches Megatron's pretrain_gpt.py through LD_PRELOAD'd python
-#      via torchrun. The training command opens .bin/.idx repeatedly;
-#      FitCache promotes them into the local cache tier on first read,
-#      and serves subsequent epochs from cache.
+# IMPORTANT: this script is site-portable. Pass partition/account/output on
+# the sbatch CLI:
+#
+#   FITPP_SITE=frontier
+#   source benchmarks/sites/${FITPP_SITE}.sh
+#   sbatch -p "$FITPP_SLURM_PARTITION" \
+#          ${FITPP_SLURM_ACCOUNT:+--account=$FITPP_SLURM_ACCOUNT} \
+#          -o "$FITPP_RESULTS_ROOT/megatron/FitCachePP_megatron-%j.out" \
+#          benchmarks/megatron/PDSW_FITPP_megatron.sh
 
-# ---------------- USER CONFIGURATION (edit before submission) ----------------
-MEGATRON_DATA_PREFIX="${MEGATRON_DATA_PREFIX:-/mnt/beegfs/ghu4/hvac/megatron_pile_train_001/pile_slice_text_document}"
-MEGATRON_VOCAB_FILE="${MEGATRON_VOCAB_FILE:-/mnt/beegfs/ghu4/hvac/megatron_assets/gpt2-vocab.json}"
-MEGATRON_MERGE_FILE="${MEGATRON_MERGE_FILE:-/mnt/beegfs/ghu4/hvac/megatron_assets/gpt2-merges.txt}"
-MEGATRON_PYTHON="${MEGATRON_PYTHON:-/home/ghu4/hvac/rlibrary/miniconda3/envs/megatron/bin/python3}"
+# Resolve site (sets $FITPP_REPO and friends). Under sbatch, BASH_SOURCE
+# points at /var/spool/slurmd/.../slurm_script — fall back to $FITPP_REPO.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+if [ -z "$SCRIPT_DIR" ] || [ ! -d "$SCRIPT_DIR/../sites" ]; then
+    if [ -n "${FITPP_REPO:-}" ] && [ -d "$FITPP_REPO/benchmarks/sites" ]; then
+        SCRIPT_DIR="$FITPP_REPO/benchmarks/megatron"
+    elif [ -n "${SLURM_SUBMIT_DIR:-}" ] && [ -d "$SLURM_SUBMIT_DIR/benchmarks/sites" ]; then
+        SCRIPT_DIR="$SLURM_SUBMIT_DIR/benchmarks/megatron"
+    else
+        echo "ERROR: cannot locate benchmarks/sites — set FITPP_REPO" >&2
+        exit 1
+    fi
+fi
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/../sites/_resolve.sh"
+
+# ---------------- USER CONFIGURATION (overrides via env) ----------------
+# Defaults pull dataset paths from the site config; override per submission
+# if your slice lives elsewhere.
+MEGATRON_DATA_PREFIX="${MEGATRON_DATA_PREFIX:-${FITPP_MEGATRON_CORPUS_PREFIX}}"
+MEGATRON_VOCAB_FILE="${MEGATRON_VOCAB_FILE:-${FITPP_MEGATRON_TOKENIZER_DIR}/gpt2-vocab.json}"
+MEGATRON_MERGE_FILE="${MEGATRON_MERGE_FILE:-${FITPP_MEGATRON_TOKENIZER_DIR}/gpt2-merges.txt}"
+MEGATRON_PYTHON="${MEGATRON_PYTHON:-${FITPP_PYTHON_TORCH}}"
 TRAIN_ITERS="${TRAIN_ITERS:-1000}"
-GPUS_PER_NODE="${GPUS_PER_NODE:-1}"
-# ----------------------------------------------------------------------------
+GPUS_PER_NODE="${GPUS_PER_NODE:-$FITPP_GPUS_PER_NODE_DEFAULT}"
+# ------------------------------------------------------------------------
 
 # FitCache_DATA_DIR is the PARENT of the .bin/.idx pair so the substring
 # path-filter catches both.
 export FitCache_DATA_DIR="$(dirname "$MEGATRON_DATA_PREFIX")"
 
-# Server topology — same shape as the CosmoFlow scripts.
 NODE_DEFAULT="$(scontrol show hostnames $SLURM_JOB_NODELIST 2>/dev/null | head -1)"
-NODE_DEFAULT="${NODE_DEFAULT:-c66}"
 export SERVER_NODES="${SERVER_NODES:-$NODE_DEFAULT}"
 export CLIENT_NODES="${CLIENT_NODES:-$NODE_DEFAULT}"
-export SERVERS_PER_NODE="${SERVERS_PER_NODE:-4}"
-export FitCache_SERVER_COUNT="${FitCache_SERVER_COUNT:-4}"
+export SERVERS_PER_NODE="${SERVERS_PER_NODE:-$FITPP_SERVERS_PER_NODE_DEFAULT}"
+export FitCache_SERVER_COUNT="${FitCache_SERVER_COUNT:-$SERVERS_PER_NODE}"
 
 export FitCache_LOG_LEVEL=600
 export RDMAV_FORK_SAFE=1
-export PKG_CONFIG_PATH=$PKG_CONFIG_PATH:/home/ghu4/hvac/log4c-1.2.4/install/lib/pkgconfig:/home/ghu4/hvac/rlibrary/mercury2.0.1/lib/pkgconfig
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/ghu4/hvac/log4c-1.2.4/install/lib:/home/ghu4/hvac/rlibrary/mercury2.0.1/lib
-export PATH=/home/ghu4/hvac/mercury-2.0.1/build/bin:$PATH
 
-# Tier paths for the cache.
-export FitCache_DRAM_PATH=/mnt/local/ghu4/fitcachepp_megatron_dram
-export FitCache_NVME_PATH=/mnt/local/ghu4/fitcachepp_megatron_nvme
-export FitCache_DRAM_CAPACITY=$((100 * 1024 * 1024 * 1024))   # 100 GiB
-export FitCache_NVME_CAPACITY=$((500 * 1024 * 1024 * 1024))   # 500 GiB
-export BBPATH=$FitCache_NVME_PATH
+# Tier paths under the site's per-node cache root.
+export FitCache_DRAM_PATH="${FitCache_DRAM_PATH:-${FITPP_LOCAL_CACHE_ROOT}/fitcachepp_megatron_dram}"
+export FitCache_NVME_PATH="${FitCache_NVME_PATH:-${FITPP_LOCAL_CACHE_ROOT}/fitcachepp_megatron_nvme}"
+export FitCache_DRAM_CAPACITY="${FitCache_DRAM_CAPACITY:-$((100 * 1024 * 1024 * 1024))}"
+export FitCache_NVME_CAPACITY="${FitCache_NVME_CAPACITY:-$((500 * 1024 * 1024 * 1024))}"
+export BBPATH="$FitCache_NVME_PATH"
 
-# Cross-job ON for the workload-generalization runs (so two Megatron jobs
-# pointed at the same dataset can share cache content via the registry).
-export FitCache_CROSS_JOB=1
-export FitCache_CLUSTER_REGISTRY_DIR=/mnt/beegfs/ghu4/fitcachepp_registry_megatron
+# Cross-job ON so two Megatron jobs at the same dataset share the cache.
+export FitCache_CROSS_JOB="${FitCache_CROSS_JOB:-1}"
+export FitCache_CLUSTER_REGISTRY_DIR="${FitCache_CLUSTER_REGISTRY_DIR:-${FITPP_PFS_REGISTRY_ROOT}/megatron}"
 
-export RESULTS_DIR=/home/ghu4/hvac/FitCachePP/benchmarks/results/megatron
+export RESULTS_DIR="${RESULTS_DIR:-${FITPP_RESULTS_ROOT}/megatron}"
 mkdir -p "$RESULTS_DIR" "$FitCache_CLUSTER_REGISTRY_DIR"
 
-# The Megatron training command — built up here, exec'd via LD_PRELOAD by
+# The Megatron training command — exec'd via LD_PRELOAD by
 # command_megatron_FITPP.sh which the inner launcher invokes.
 export MEGATRON_TRAIN_CMD=(
   torchrun
@@ -82,7 +85,7 @@ export MEGATRON_TRAIN_CMD=(
     --nnodes=1
     --master_addr=localhost
     --master_port=6000
-    /home/ghu4/hvac/benchmark/Megatron-LM/pretrain_gpt.py
+    "$FITPP_MEGATRON_DIR/pretrain_gpt.py"
     --num-layers 12 --hidden-size 768 --num-attention-heads 12
     --seq-length 1024 --max-position-embeddings 1024
     --micro-batch-size 4 --global-batch-size 16
@@ -96,12 +99,12 @@ export MEGATRON_TRAIN_CMD=(
     --tokenizer-type GPT2BPETokenizer
     --split 949,50,1
     --log-interval 10 --eval-interval 100 --eval-iters 5
-    --save-interval 100000   # don't bother saving in the smoke
+    --save-interval 100000
     --no-async-tensor-model-parallel-allreduce
 )
+export MEGATRON_PYTHON
 
-# Hand off to the shared launcher. We override CLIENT_COMMAND so the
-# inner.sh runs Megatron's torchrun-wrapped pretrain instead of the
-# CosmoFlow command_CF_FITPP.sh.
-export FITCACHE_CLIENT_LAUNCHER=/home/ghu4/hvac/FitCachePP/benchmarks/megatron/command_megatron_FITPP.sh
-exec /home/ghu4/hvac/FitCachePP/benchmarks/cosmoflow/PDSW_FITPP_inner.sh
+# Hand off to the shared launcher. FITCACHE_CLIENT_LAUNCHER selects the
+# Megatron-specific torchrun wrapper instead of CosmoFlow's.
+export FITCACHE_CLIENT_LAUNCHER="$FITPP_REPO/benchmarks/megatron/command_megatron_FITPP.sh"
+exec "$FITPP_REPO/benchmarks/cosmoflow/PDSW_FITPP_inner.sh"
