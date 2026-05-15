@@ -13,9 +13,9 @@ Date: 2026-05-12 (full single-job FitCachePP-vs-Pure_CF baseline runs +
 two-job sequential sidecar-restore complete; the two-job concurrent
 cross-job-sharing run exposed a real mechanism gap; the real-PMem
 hardware evaluation on c35 was unblocked late in the day after
-/mnt/fsdax write access was restored). Source data: `benchmarks/results/`
+/mnt/fsdax write access was restored). Source data: `benchmarks/results/arc/`
 subtrees referenced inline. **Headline summary:**
-[benchmarks/results/single_job_baseline_and_sidecar_restore_summary.md](benchmarks/results/single_job_baseline_and_sidecar_restore_summary.md).
+[benchmarks/results/arc/single_job_baseline_and_sidecar_restore_summary.md](benchmarks/results/arc/single_job_baseline_and_sidecar_restore_summary.md).
 
 ---
 
@@ -42,7 +42,7 @@ single-job comparison block.
 - ✅ **Data-mover signal-loss fix delivered a 45% cold-epoch reduction** on the same workload (385s → 216s), attributable purely to commit `c6c25ee`.
 - ⚠️ **Cold-vs-warm gap small** (216 → 200 = 8%): `n_train=1024` is too small to stress I/O — the dataset fits in c66 free RAM so even "warm" reads are kernel-page-cached. The fix is scaling up to a larger n_train (8192 baseline below; 61440 would be ideal but is too long for repeat runs).
 - ❌ **Prior baselines (221607, ...615, ...617, ...619) all show 0 Open RPCs** — see `summary_221618_221619.md`. The ~200s cold / ~188s warm pattern they reported is kernel page cache + GPU/TF warmup, not FitCache. **Do not quote those numbers.**
-- Source: `benchmarks/results/single_job_baseline/summary_221634_engaged.md`. Memory `project_fitcachepp_tpds.md`.
+- Source: `benchmarks/results/arc/single_job_baseline/summary_221634_engaged.md`. Memory `project_fitcachepp_tpds.md`.
 
 ### 1b. Single-node baseline (c66 GPU+storage co-located, n_train=8192)
 
@@ -59,7 +59,7 @@ Comparison column is RELATIVE ratio (Pure_CF vs FitCachePP). Pure_CF ×2 reps wi
 | FitCachePP OS-cold | 899s | 935s | 891s | 1.5 reps | ✅ same as OS-warm |
 | IPDPS FitCache 1 GPU n_train=61440 (ref from logs/pdsw/) | 6968s | 7552s | 6573s | published | ref |
 
-**Finding:** At n_train=8192 on 1 GPU, **FitCachePP adds 58s = ~7% overhead** (Mercury RPC per file open). Pure_CF dataset (167 GB) fits in c66's 188 GB RAM → page cache absorbs working set → FitCachePP's "local cache" pathway has nothing structural to win. **The overhead is the cost of FitCachePP's scaling infrastructure;** the benefit emerges at multi-GPU multi-node large-working-set regime (the IPDPS-extrapolation case) and in cross-job mode (the two-job sequential sidecar-restore experiment below). Detailed analysis in [single_job_baseline_and_sidecar_restore_summary.md](benchmarks/results/single_job_baseline_and_sidecar_restore_summary.md).
+**Finding:** At n_train=8192 on 1 GPU, **FitCachePP adds 58s = ~7% overhead** (Mercury RPC per file open). Pure_CF dataset (167 GB) fits in c66's 188 GB RAM → page cache absorbs working set → FitCachePP's "local cache" pathway has nothing structural to win. **The overhead is the cost of FitCachePP's scaling infrastructure;** the benefit emerges at multi-GPU multi-node large-working-set regime (the IPDPS-extrapolation case) and in cross-job mode (the two-job sequential sidecar-restore experiment below). Detailed analysis in [single_job_baseline_and_sidecar_restore_summary.md](benchmarks/results/arc/single_job_baseline_and_sidecar_restore_summary.md).
 
 ### 1c. Multi-node single-job (c35 storage + c66 GPU client, SLURM 221645)
 
@@ -93,7 +93,7 @@ Setup: 221684 (c66) + 221685 (c67), both `CROSS_JOB=1`, shared `FitCache_CLUSTER
 | peer_lookup has_yes | **0** ❌ |
 | peer_lookup has_no | 12,196 |
 
-**Cross-job infrastructure fires (peer_lookup RPCs flow) but responders ALWAYS say "no".** Hypothesis (deferred for debug): HRW with 8 cluster servers picks different servers across jobs for the same path; the responder server's local path_cache_map doesn't have what the requester is looking for. Or path_cache_map is partitioned across the 4 server processes per node and peer_lookup arrives at the wrong process. Detailed in [single_job_baseline_and_sidecar_restore_summary.md](benchmarks/results/single_job_baseline_and_sidecar_restore_summary.md) and [mmap_and_cross_job_imbalance_analysis.md](benchmarks/results/mmap_and_cross_job_imbalance_analysis.md).
+**Cross-job infrastructure fires (peer_lookup RPCs flow) but responders ALWAYS say "no".** Hypothesis (deferred for debug): HRW with 8 cluster servers picks different servers across jobs for the same path; the responder server's local path_cache_map doesn't have what the requester is looking for. Or path_cache_map is partitioned across the 4 server processes per node and peer_lookup arrives at the wrong process. Detailed in [single_job_baseline_and_sidecar_restore_summary.md](benchmarks/results/arc/single_job_baseline_and_sidecar_restore_summary.md) and [mmap_and_cross_job_imbalance_analysis.md](benchmarks/results/arc/mmap_and_cross_job_imbalance_analysis.md).
 
 ### 2b. Two-job sequential (sidecar restore) — VALIDATED ✅
 
@@ -128,10 +128,10 @@ follow-up claim from the three-tier hardware evaluation section of
 
 | Test | Files | Tier split | Restoration | Status |
 |---|---:|---|---:|:---:|
-| **`scripts/run_three_tier_smoke.sh`** (12 files × 1 MiB, 4/4/4 MiB capacities) | 12 | DRAM 4 / PMem 4 / NVMe 4 | 12/12 from sidecars per-tier | ✅ |
+| **`scripts/smoke/run_three_tier_smoke.sh`** (12 files × 1 MiB, 4/4/4 MiB capacities) | 12 | DRAM 4 / PMem 4 / NVMe 4 | 12/12 from sidecars per-tier | ✅ |
 
 - ✅ Local smoke proves the placement-priority logic (DRAM → PMem → NVMe) and the per-tier sidecar-restore loop are workload-correct. Re-run after every code change as a regression gate.
-- Source: `benchmarks/results/three_tier/local_smoke_summary.md`.
+- Source: `benchmarks/results/arc/three_tier/local_smoke_summary.md`.
 
 ### 3b. Real PMem characterization on c35 (`/mnt/fsdax`) — code path validated, quantitative speedup blocked by cluster topology ⚠️
 
@@ -140,7 +140,7 @@ c35's `/mnt/fsdax` is `/dev/pmem0` mounted ext4 with `dax=always` — confirmed 
 - Source on local /tmp: cold pass 34.3s, warm-pass mean per round 258s (warm is 7.5x slower than cold).
 - Source on BeeGFS with OS page cache evicted between passes: cold pass 53.9s, warm-pass mean per round 261s (warm is 4.8x slower than cold).
 
-Tier placement fires end-to-end on real PMem (`DRAM`, `/mnt/fsdax`, NVMe directories all populate). The warm-vs-cold inversion is due to the cache-hit RPC path paying a ~250 ms per-open tax that the cache-miss path doesn't. The natural follow-up (multi-node CosmoFlow with `FitCache_PMEM_PATH=/mnt/fsdax`) is **infeasible on this cluster** because c35 has DAX PMem but no GPU; the GPU nodes (rtx4060ti16g partition) have no DAX PMem. GPU + PMem are on disjoint node classes. Full write-up: [real_pmem_evaluation_on_c35.md](benchmarks/results/three_tier/real_pmem_evaluation_on_c35.md).
+Tier placement fires end-to-end on real PMem (`DRAM`, `/mnt/fsdax`, NVMe directories all populate). The warm-vs-cold inversion is due to the cache-hit RPC path paying a ~250 ms per-open tax that the cache-miss path doesn't. The natural follow-up (multi-node CosmoFlow with `FitCache_PMEM_PATH=/mnt/fsdax`) is **infeasible on this cluster** because c35 has DAX PMem but no GPU; the GPU nodes (rtx4060ti16g partition) have no DAX PMem. GPU + PMem are on disjoint node classes. Full write-up: [real_pmem_evaluation_on_c35.md](benchmarks/results/arc/three_tier/real_pmem_evaluation_on_c35.md).
 
 **To unblock the quantitative GPU+PMem speedup claim:** either (i) run on a cluster with GPU + DAX-mode PMem co-located, or (ii) profile and reduce the cache-hit-path per-open RPC cost so the cache wins at smaller per-open work granularity.
 
@@ -157,18 +157,18 @@ I/O shapes.
 
 | Smoke | Workload shape | Files cached | Sidecars | sha256 match | Status |
 |---|---|---:|---:|---|:---:|
-| **`scripts/run_megatron_access_pattern_smoke.sh`** | 8 MiB `.bin` + 64 KiB `.idx` (Megatron indexed-binary) | 2/2 | 2/2 | both | ✅ |
-| **`scripts/run_dinov2_access_pattern_smoke.sh`** | 4 classes × 10 imgs + 2 metadata = 42 files (ImageNet-style nested tree) | 42/42 | 42/42 | spot-check ok | ✅ |
+| **`scripts/smoke/run_megatron_access_pattern_smoke.sh`** | 8 MiB `.bin` + 64 KiB `.idx` (Megatron indexed-binary) | 2/2 | 2/2 | both | ✅ |
+| **`scripts/smoke/run_dinov2_access_pattern_smoke.sh`** | 4 classes × 10 imgs + 2 metadata = 42 files (ImageNet-style nested tree) | 42/42 | 42/42 | spot-check ok | ✅ |
 
 - ✅ Both workload I/O shapes (large-streaming `.bin` and small-files-deep-tree) are workload-correct: opens caught by the path-filter, files promoted via the data mover, sidecars written, payloads byte-equivalent. The same FitCache code paths handle both shapes.
 - ✅ Megatron smoke surfaced the **data-mover signal-loss bug** (the second file `.idx` was being dropped from the cache because pthread_cond signals fired while the mover was busy were getting lost). Fixed in commit `c6c25ee`.
-- Source: smoke scripts under `scripts/`, summary in `benchmarks/results/workload_generalization/setup_and_run.md`.
+- Source: smoke scripts under `scripts/`, summary in `benchmarks/results/arc/workload_generalization/setup_and_run.md`.
 
 ### 4b. Real cluster runs
 
 | Run | Status | Blocking on |
 |---|:---:|---|
-| Megatron-LM (12-layer GPT, 1000 iters) | ❌ architectural limit | `numpy.memmap` for the .bin/.idx → page faults, not `read()` syscalls. LD_PRELOAD client doesn't intercept `mmap`. Workload bypasses FitCachePP entirely. See [mmap_and_cross_job_imbalance_analysis.md](benchmarks/results/mmap_and_cross_job_imbalance_analysis.md). |
+| Megatron-LM (12-layer GPT, 1000 iters) | ❌ architectural limit | `numpy.memmap` for the .bin/.idx → page faults, not `read()` syscalls. LD_PRELOAD client doesn't intercept `mmap`. Workload bypasses FitCachePP entirely. See [mmap_and_cross_job_imbalance_analysis.md](benchmarks/results/arc/mmap_and_cross_job_imbalance_analysis.md). |
 | DINOv2 SSL (1 epoch, ImageNet-22k subset) | ❌ architectural limit | `mmap(fileno=f.fileno(), …)` for each per-class .tar bundle. Same architectural pattern as Megatron — page-fault reads bypass LD_PRELOAD. |
 
 - 🚧 Megatron-LM source cloned at `/home/ghu4/hvac/benchmark/Megatron-LM` (shallow, 64 MB source-only).
@@ -176,7 +176,7 @@ I/O shapes.
 - 🚧 Cluster sbatch scripts ready to submit once datasets exist:
   - [benchmarks/megatron/PDSW_FITPP_megatron.sh](benchmarks/megatron/PDSW_FITPP_megatron.sh) + [command_megatron_FITPP.sh](benchmarks/megatron/command_megatron_FITPP.sh)
   - [benchmarks/dinov2/PDSW_FITPP_dinov2.sh](benchmarks/dinov2/PDSW_FITPP_dinov2.sh) + [command_dinov2_FITPP.sh](benchmarks/dinov2/command_dinov2_FITPP.sh)
-- Source: `benchmarks/results/workload_generalization/setup_and_run.md`.
+- Source: `benchmarks/results/arc/workload_generalization/setup_and_run.md`.
 
 ---
 
@@ -189,12 +189,12 @@ safety claim in that doc's cluster-scoped coordination protocol section.
 
 | Test | Workload | `CROSS_JOB=0` cache | `CROSS_JOB=1` cache | sha256 match | Status |
 |---|---|---|---|---|:---:|
-| **`scripts/run_bit_equivalence_smoke.sh`** | 8 files × 256 KiB synthetic | 8 files cached | 8 files cached + 8 sidecars | all 8 byte-identical to source AND between modes | ✅ |
+| **`scripts/smoke/run_bit_equivalence_smoke.sh`** | 8 files × 256 KiB synthetic | 8 files cached | 8 files cached + 8 sidecars | all 8 byte-identical to source AND between modes | ✅ |
 
 - ✅ The `CROSS_JOB={0,1}` byte-equivalence is the strongest single-process check that the cross-job code path preserves data correctness when run in single-job degenerate mode.
 - ✅ Re-run after every code change in this session (path-filter fix, lookup_addr fix, registry rmw fix, data-mover fix, dataset_id manifest plumb, lease renewal, log4c flush, PMem tier add). Still passes.
 - ✅ Verified in the cross-job=on pass: cross_job_stats counters show `opens_total=8 ... pfs_fallback=8 ... peer_lookup forwarded=0 handled=0` — single-server topology with no peers, no peer-lookup ever fires, zero Mercury overhead beyond the basic open RPC. Matches design.
-- Source: `benchmarks/results/bit_equivalence/summary.md`.
+- Source: `benchmarks/results/arc/bit_equivalence/summary.md`.
 
 ---
 
@@ -218,11 +218,11 @@ workload-generalization experiments produce their primary numbers.
 | Suite | Coverage | Status |
 |---|---|:---:|
 | `tests/test_cross_job_smoke` | FNV-1a vectors / HRW balance + churn / dataset_id stability / cluster registry roundtrip + heartbeat staleness + deregister / client-side routing + slot stability / sidecar persistent metadata + refcount + scan / eviction victim selection (refcount-protected never picked) / subscriber-lease subscribe + release idempotency | ✅ 8/8 |
-| `scripts/run_bit_equivalence_smoke.sh` | CROSS_JOB={0,1} byte-equivalence | ✅ |
-| `scripts/run_three_tier_smoke.sh` | DRAM + PMem + NVMe placement + restoration | ✅ |
-| `scripts/run_two_server_smoke.sh` | Multi-server peer-lookup + redirect + cross-job-sharing on localhost | ✅ |
-| `scripts/run_megatron_access_pattern_smoke.sh` | Megatron `.bin`/`.idx` access-pattern | ✅ |
-| `scripts/run_dinov2_access_pattern_smoke.sh` | DINOv2 nested-image-tree access-pattern | ✅ |
+| `scripts/smoke/run_bit_equivalence_smoke.sh` | CROSS_JOB={0,1} byte-equivalence | ✅ |
+| `scripts/smoke/run_three_tier_smoke.sh` | DRAM + PMem + NVMe placement + restoration | ✅ |
+| `scripts/smoke/run_two_server_smoke.sh` | Multi-server peer-lookup + redirect + cross-job-sharing on localhost | ✅ |
+| `scripts/smoke/run_megatron_access_pattern_smoke.sh` | Megatron `.bin`/`.idx` access-pattern | ✅ |
+| `scripts/smoke/run_dinov2_access_pattern_smoke.sh` | DINOv2 nested-image-tree access-pattern | ✅ |
 
 ---
 
@@ -267,10 +267,10 @@ The execution order from earlier in the campaign — single-job baseline →
 cross-job sharing → three-tier hardware → workload-generalization →
 sensitivity — has been worked through. End-of-day state:
 
-1. **Single-job FitCachePP-vs-Pure_CF baseline runs (c66, n_train=8192).** Complete. Headline: +7% overhead. Detailed in [single_job_baseline_and_sidecar_restore_summary.md](benchmarks/results/single_job_baseline_and_sidecar_restore_summary.md).
+1. **Single-job FitCachePP-vs-Pure_CF baseline runs (c66, n_train=8192).** Complete. Headline: +7% overhead. Detailed in [single_job_baseline_and_sidecar_restore_summary.md](benchmarks/results/arc/single_job_baseline_and_sidecar_restore_summary.md).
 2. **Multi-node single-job CosmoFlow with FitCachePP verifiably engaged (SLURM 221645, c35 storage + c66 GPU client).** Complete. 46,088 Open RPCs, 9,216 cached files. Seeded the headline cluster-engaged number.
-3. **Two-job concurrent cross-job-sharing run.** Mechanism gap found (HRW imbalance + per-server-process path_cache_map partitioning); `has_yes=0` across 12k peer_lookups. Detailed in [mmap_and_cross_job_imbalance_analysis.md](benchmarks/results/mmap_and_cross_job_imbalance_analysis.md). Open follow-up: peer_lookup sibling-fanout in `fitcache_peer_lookup_rpc_handler`.
+3. **Two-job concurrent cross-job-sharing run.** Mechanism gap found (HRW imbalance + per-server-process path_cache_map partitioning); `has_yes=0` across 12k peer_lookups. Detailed in [mmap_and_cross_job_imbalance_analysis.md](benchmarks/results/arc/mmap_and_cross_job_imbalance_analysis.md). Open follow-up: peer_lookup sibling-fanout in `fitcache_peer_lookup_rpc_handler`.
 4. **Two-job sequential sidecar-restore run.** Validated: Job B saved 44s vs Job A cold via 9,216-file sidecar restore.
-5. **Real DAX-mode PMem hardware evaluation on c35 (`/mnt/fsdax`).** Code paths fire on real PMem; quantitative speedup blocked by cluster topology (GPU and DAX-PMem on disjoint node classes). Detailed in [real_pmem_evaluation_on_c35.md](benchmarks/results/three_tier/real_pmem_evaluation_on_c35.md).
-6. **Workload-generalization run (Megatron-LM + DINOv2).** Architectural limit: both workloads use `mmap`, bypassing LD_PRELOAD. Detailed in [mmap_and_cross_job_imbalance_analysis.md](benchmarks/results/mmap_and_cross_job_imbalance_analysis.md). Open follow-up: pick syscall-based replacement workloads or add an `mmap` interceptor.
+5. **Real DAX-mode PMem hardware evaluation on c35 (`/mnt/fsdax`).** Code paths fire on real PMem; quantitative speedup blocked by cluster topology (GPU and DAX-PMem on disjoint node classes). Detailed in [real_pmem_evaluation_on_c35.md](benchmarks/results/arc/three_tier/real_pmem_evaluation_on_c35.md).
+6. **Workload-generalization run (Megatron-LM + DINOv2).** Architectural limit: both workloads use `mmap`, bypassing LD_PRELOAD. Detailed in [mmap_and_cross_job_imbalance_analysis.md](benchmarks/results/arc/mmap_and_cross_job_imbalance_analysis.md). Open follow-up: pick syscall-based replacement workloads or add an `mmap` interceptor.
 7. **Sensitivity / ablation / failure-injection block.** Deferred.

@@ -25,8 +25,8 @@ export FITPP_N_TRAIN=1024
 export FITPP_N_EPOCHS=3
 
 RUN_TAG=$(date +'%Y%m%d_%H%M%S')_sanity
-FCP_DIR=benchmarks/results/frontier_sanity/FitCachePP_${RUN_TAG}
-PCF_DIR=benchmarks/results/frontier_sanity/Pure_CF_${RUN_TAG}
+FCP_DIR=benchmarks/results/frontier/sanity/FitCachePP_${RUN_TAG}
+PCF_DIR=benchmarks/results/frontier/sanity/Pure_CF_${RUN_TAG}
 mkdir -p "$FCP_DIR" "$PCF_DIR"
 
 # Frontier batch partition needs -C nvme to mount the per-node burst buffer

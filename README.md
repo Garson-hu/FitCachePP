@@ -126,7 +126,7 @@ export FitCache_DATA_DIR=/YOUR_TRAINING_SET_PATH/
 3. Launch the server and client (For simple test)
 ```
 mpirun -N 1 ./fitcache_server $FitCache_SERVER_COUNT &
-mpirun -N 1 ./scripts/command_FitCache.sh
+mpirun -N 1 ./scripts/legacy/command_FitCache.sh
 ```
 
 ### Running on Cluster (Slurm Example)
