@@ -95,6 +95,30 @@ bool cross_job_enabled() {
     return cached != 0;
 }
 
+// Default peer-RPC deadline for the open-time peer_lookup fanout. Picked at
+// the upper end of expected steady-state RPC latency (single-digit ms on
+// Frontier Slingshot) so legitimate slow responses don't hit the watchdog,
+// but well below a SLURM job's wall-clock so a single dead peer can't
+// indefinitely block another job's training run.
+static constexpr int kDefaultPeerRpcTimeoutSec = 30;
+
+int peer_rpc_timeout_sec() {
+    static int cached = -2;  // sentinel: -2 = not read; -1 = disabled; >=0 = value
+    if (cached == -2) {
+        const char *v = std::getenv("FitCache_PEER_RPC_TIMEOUT_SEC");
+        if (!v) {
+            cached = kDefaultPeerRpcTimeoutSec;
+        } else {
+            int n = std::atoi(v);
+            cached = (n >= 0) ? n : kDefaultPeerRpcTimeoutSec;
+        }
+        L4C_INFO("peer_rpc_timeout_sec: FitCache_PEER_RPC_TIMEOUT_SEC=%s -> %d sec %s",
+                 v ? v : "(unset)", cached,
+                 cached == 0 ? "(watchdog DISABLED)" : "");
+    }
+    return cached;
+}
+
 // ----------------------------------------------------------------------------
 // Cluster endpoint table for cross-job routing.
 //
@@ -325,6 +349,7 @@ std::atomic<uint64_t> g_peer_lookup_forwarded{0};
 std::atomic<uint64_t> g_peer_lookup_handled{0};
 std::atomic<uint64_t> g_peer_lookup_has_yes{0};
 std::atomic<uint64_t> g_peer_lookup_has_no{0};
+std::atomic<uint64_t> g_peer_lookup_timeout{0};
 
 std::mutex            g_stats_log_mtx;
 CrossJobCounters      g_stats_last_logged = {};
@@ -342,6 +367,7 @@ CrossJobCounters cross_job_counters_snapshot() {
     c.peer_lookup_handled    = g_peer_lookup_handled.load();
     c.peer_lookup_has_yes    = g_peer_lookup_has_yes.load();
     c.peer_lookup_has_no     = g_peer_lookup_has_no.load();
+    c.peer_lookup_timeout    = g_peer_lookup_timeout.load();
     return c;
 }
 
@@ -353,6 +379,7 @@ void cross_job_counter_bump_peer_lookup_forwarded()  { g_peer_lookup_forwarded.f
 void cross_job_counter_bump_peer_lookup_handled()    { g_peer_lookup_handled.fetch_add(1, std::memory_order_relaxed); }
 void cross_job_counter_bump_peer_lookup_has_yes()    { g_peer_lookup_has_yes.fetch_add(1, std::memory_order_relaxed); }
 void cross_job_counter_bump_peer_lookup_has_no()     { g_peer_lookup_has_no.fetch_add(1, std::memory_order_relaxed); }
+void cross_job_counter_bump_peer_lookup_timeout()    { g_peer_lookup_timeout.fetch_add(1, std::memory_order_relaxed); }
 
 void log_cross_job_stats(int server_rank) {
     CrossJobCounters cur = cross_job_counters_snapshot();
@@ -362,7 +389,7 @@ void log_cross_job_stats(int server_rank) {
         L4C_INFO("cross_job_stats[rank=%d]: opens_total=%lu local_hit=%lu "
                  "redirect_to_peer=%lu pfs_fallback=%lu | "
                  "peer_lookup forwarded=%lu handled=%lu has_yes=%lu has_no=%lu "
-                 "(first sample; no delta)",
+                 "timeout=%lu (first sample; no delta)",
                  server_rank,
                  (unsigned long)cur.opens_total,
                  (unsigned long)cur.opens_local_hit,
@@ -371,7 +398,8 @@ void log_cross_job_stats(int server_rank) {
                  (unsigned long)cur.peer_lookup_forwarded,
                  (unsigned long)cur.peer_lookup_handled,
                  (unsigned long)cur.peer_lookup_has_yes,
-                 (unsigned long)cur.peer_lookup_has_no);
+                 (unsigned long)cur.peer_lookup_has_no,
+                 (unsigned long)cur.peer_lookup_timeout);
         g_stats_last_logged = cur;
         g_stats_have_baseline = true;
         return;
@@ -381,7 +409,7 @@ void log_cross_job_stats(int server_rank) {
     L4C_INFO("cross_job_stats[rank=%d]: opens_total=%lu(+%lu) local_hit=%lu(+%lu) "
              "redirect_to_peer=%lu(+%lu) pfs_fallback=%lu(+%lu) | "
              "peer_lookup forwarded=%lu(+%lu) handled=%lu(+%lu) "
-             "has_yes=%lu(+%lu) has_no=%lu(+%lu)",
+             "has_yes=%lu(+%lu) has_no=%lu(+%lu) timeout=%lu(+%lu)",
              server_rank,
              (unsigned long)cur.opens_total,            (unsigned long)(cur.opens_total            - p.opens_total),
              (unsigned long)cur.opens_local_hit,        (unsigned long)(cur.opens_local_hit        - p.opens_local_hit),
@@ -390,7 +418,8 @@ void log_cross_job_stats(int server_rank) {
              (unsigned long)cur.peer_lookup_forwarded,  (unsigned long)(cur.peer_lookup_forwarded  - p.peer_lookup_forwarded),
              (unsigned long)cur.peer_lookup_handled,    (unsigned long)(cur.peer_lookup_handled    - p.peer_lookup_handled),
              (unsigned long)cur.peer_lookup_has_yes,    (unsigned long)(cur.peer_lookup_has_yes    - p.peer_lookup_has_yes),
-             (unsigned long)cur.peer_lookup_has_no,     (unsigned long)(cur.peer_lookup_has_no     - p.peer_lookup_has_no));
+             (unsigned long)cur.peer_lookup_has_no,     (unsigned long)(cur.peer_lookup_has_no     - p.peer_lookup_has_no),
+             (unsigned long)cur.peer_lookup_timeout,    (unsigned long)(cur.peer_lookup_timeout    - p.peer_lookup_timeout));
     g_stats_last_logged = cur;
 }
 

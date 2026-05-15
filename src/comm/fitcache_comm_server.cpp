@@ -12,11 +12,13 @@
 #include <fcntl.h>
 #include <cassert>
 #include <cerrno>
+#include <chrono>
 #include <map>
 #include <string>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <thread>
 #include <vector>
 
 // External server ID variable declared in fitcache_server.cpp
@@ -54,17 +56,24 @@ hg_id_t fitcache_peer_lookup_get_id(void) {
 // State carried across all peer_lookup callbacks for one in-flight open.
 // refcount cleanup model:
 //   start at 1 (issuer holds a ref)
-//   bump by 1 per successful HG_Forward
+//   bump by 1 per successful HG_Forward (callback drops it)
+//   bump by 1 for the watchdog thread (watchdog drops it on exit)
 //   release once on issuer's exit
-//   release once per callback
 struct OpenPeerLookupState {
-    hg_handle_t       open_handle;
-    std::string       original_path;
-    std::atomic<int>  refcount;
-    std::atomic<int>  responses_remaining;
-    std::atomic<bool> responded;
-    pthread_mutex_t   respond_mtx;
-    std::string       peer_addr_winner;   // protected by respond_mtx
+    hg_handle_t                 open_handle;
+    std::string                 original_path;
+    std::atomic<int>            refcount;
+    std::atomic<int>            responses_remaining;
+    std::atomic<bool>           responded;
+    pthread_mutex_t             respond_mtx;
+    std::string                 peer_addr_winner;   // protected by respond_mtx
+    // Watchdog support — see peer_lookup_watchdog_fn below.
+    // pending_handles holds the hg_handle_t for each in-flight peer_lookup
+    // forward. The callback removes its own entry under respond_mtx before
+    // HG_Destroy; the watchdog iterates whatever's still in it after the
+    // deadline elapses and HG_Cancel's them (forcing the callback to fire
+    // with HG_CANCELED so our normal cleanup runs).
+    std::vector<hg_handle_t>    pending_handles;
 };
 
 static void state_release(OpenPeerLookupState *st) {
@@ -105,27 +114,39 @@ static void respond_open_redirect(OpenPeerLookupState *st) {
     HG_Respond(st->open_handle, NULL, NULL, &out);
 }
 
-// Mercury callback fired when one peer's peer_lookup_rpc response arrives.
+// Mercury callback fired when one peer's peer_lookup_rpc response arrives
+// (or when the watchdog cancels the request).
 static hg_return_t peer_lookup_response_cb(const struct hg_cb_info *info) {
     OpenPeerLookupState *st = (OpenPeerLookupState *)info->arg;
+    hg_handle_t this_handle = info->info.forward.handle;
     fitcache_peer_lookup_out_t out;
     bool got_yes = false;
     std::string winner_addr;
 
     if (info->ret == HG_SUCCESS &&
-        HG_Get_output(info->info.forward.handle, &out) == HG_SUCCESS) {
+        HG_Get_output(this_handle, &out) == HG_SUCCESS) {
         if (out.has == 1 && out.serve_addr != NULL && out.serve_addr[0] != '\0') {
             got_yes     = true;
             winner_addr = out.serve_addr;
         }
-        HG_Free_output(info->info.forward.handle, &out);
+        HG_Free_output(this_handle, &out);
     }
-    HG_Destroy(info->info.forward.handle);
+    // info->ret == HG_CANCELED here means the watchdog gave up on this peer;
+    // fall through to the not-yet-responded counters so the next branch
+    // either picks another peer's yes or triggers PFS fallback.
 
     bool should_redirect = false;
     bool should_fallback = false;
 
     pthread_mutex_lock(&st->respond_mtx);
+    // Remove our handle from pending_handles so the watchdog can no longer
+    // touch it. Do this BEFORE HG_Destroy.
+    for (auto it = st->pending_handles.begin(); it != st->pending_handles.end(); ++it) {
+        if (*it == this_handle) {
+            st->pending_handles.erase(it);
+            break;
+        }
+    }
     int remaining = --st->responses_remaining;
     if (!st->responded.load() && got_yes) {
         st->peer_addr_winner = winner_addr;
@@ -137,11 +158,61 @@ static hg_return_t peer_lookup_response_cb(const struct hg_cb_info *info) {
     }
     pthread_mutex_unlock(&st->respond_mtx);
 
+    HG_Destroy(this_handle);
+
     if (should_redirect) respond_open_redirect(st);
     if (should_fallback) respond_open_pfs(st);
 
     state_release(st);
     return HG_SUCCESS;
+}
+
+// Watchdog thread for one in-flight peer-lookup fanout.
+//
+// Sleeps until the deadline (peer_rpc_timeout_sec after fanout). If the
+// state has already responded by then (normal path), exits quietly. Otherwise,
+// HG_Cancels every still-pending lookup_handle (forcing each callback to
+// fire with HG_CANCELED, which drives our normal has_no path), and respond
+// to the client with PFS-fallback right now so the client isn't blocked
+// waiting for the cancellations to propagate.
+//
+// Holds one refcount on the state so the state survives until this thread
+// exits, even if every callback fires + drops its ref first.
+static void peer_lookup_watchdog_fn(OpenPeerLookupState *st, int timeout_sec) {
+    std::this_thread::sleep_for(std::chrono::seconds(timeout_sec));
+
+    bool we_responded = false;
+    std::vector<hg_handle_t> to_cancel;
+
+    pthread_mutex_lock(&st->respond_mtx);
+    if (!st->responded.load() && !st->pending_handles.empty()) {
+        st->responded.store(true);
+        we_responded = true;
+        // Snapshot pending handles to cancel; clear so the callbacks (which
+        // will fire as HG_CANCELED) skip the cancellation step on their side.
+        // The callbacks will still erase from pending_handles defensively;
+        // we leave the vector populated so they find their entries and
+        // HG_Destroy correctly. Don't clear here.
+        to_cancel = st->pending_handles;
+    }
+    pthread_mutex_unlock(&st->respond_mtx);
+
+    if (we_responded) {
+        L4C_WARN("peer_lookup watchdog fired after %d sec on %s "
+                 "(canceling %zu in-flight forwards, falling back to PFS)",
+                 timeout_sec, st->original_path.c_str(), to_cancel.size());
+        fitcache::cross_job_counter_bump_peer_lookup_timeout();
+        // PFS open + HG_Respond to the client first — don't make the client
+        // wait for Mercury to deliver the cancellation events.
+        respond_open_pfs(st);
+        // Cancel outstanding forwards. HG_Cancel is async; the callbacks
+        // will fire with HG_CANCELED and clean up their own handles.
+        for (hg_handle_t h : to_cancel) {
+            (void)HG_Cancel(h);
+        }
+    }
+
+    state_release(st);
 }
 
 hg_return_t
@@ -230,9 +301,20 @@ fitcache_open_rpc_handler(hg_handle_t handle)
                 lookup_in.dataset_manifest_hash = 0;
 
                 st->refcount.fetch_add(1);  // hold a ref for the in-flight callback
+                // Add to pending_handles BEFORE HG_Forward so the watchdog
+                // can never see a forwarded-but-untracked handle.
+                pthread_mutex_lock(&st->respond_mtx);
+                st->pending_handles.push_back(lookup_handle);
+                pthread_mutex_unlock(&st->respond_mtx);
                 hg_return_t hr = HG_Forward(lookup_handle, peer_lookup_response_cb, st, &lookup_in);
                 HG_Addr_free(hg_class, peer_hg_addr);
                 if (hr != HG_SUCCESS) {
+                    // Pull the handle back out — it never went out.
+                    pthread_mutex_lock(&st->respond_mtx);
+                    for (auto it = st->pending_handles.begin(); it != st->pending_handles.end(); ++it) {
+                        if (*it == lookup_handle) { st->pending_handles.erase(it); break; }
+                    }
+                    pthread_mutex_unlock(&st->respond_mtx);
                     HG_Destroy(lookup_handle);
                     state_release(st);          // give back the ref we just bumped
                     --st->responses_remaining;
@@ -254,6 +336,14 @@ fitcache_open_rpc_handler(hg_handle_t handle)
 
             if (should_fallback_now) {
                 respond_open_pfs(st);
+            }
+
+            // Arm the per-fanout watchdog, but only if at least one forward
+            // actually flew and the deadline is positive (timeout=0 disables).
+            int timeout_sec = fitcache::peer_rpc_timeout_sec();
+            if (forwards_issued > 0 && timeout_sec > 0 && !should_fallback_now) {
+                st->refcount.fetch_add(1);  // hold a ref for the watchdog
+                std::thread(peer_lookup_watchdog_fn, st, timeout_sec).detach();
             }
 
             state_release(st);  // drop the issuer ref; callbacks (if any) keep their own

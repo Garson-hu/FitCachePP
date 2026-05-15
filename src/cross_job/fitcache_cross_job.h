@@ -51,6 +51,19 @@ int modulo_select(const std::string &path, int server_count);
 // Cached on first call.
 bool cross_job_enabled();
 
+// Read the per-RPC deadline (seconds) the server waits before giving up on a
+// peer's peer_lookup response and falling through to PFS. Default 30.
+// 0 disables the watchdog (legacy "wait forever" behaviour). Negative values
+// fall back to the default. Read from env var FitCache_PEER_RPC_TIMEOUT_SEC
+// on first call and cached.
+//
+// Motivation: prior to this knob, a single peer that exited / hung mid-run
+// would block every cross-job open RPC on every other server indefinitely
+// (the 2026-05-14 two_job_concurrent_v2 run hit this — run 2 froze with
+// Job A waiting forever on a peer_lookup to a Job B server that had already
+// deregistered, requiring a full 24h SLURM timeout to clear).
+int peer_rpc_timeout_sec();
+
 // Pick a server for `path`. Returns a routing slot consumable by
 // fitcache_client_comm_lookup_addr.
 //
@@ -136,6 +149,7 @@ struct CrossJobCounters {
     uint64_t peer_lookup_handled;     // incoming peer_lookup_rpc handler entry
     uint64_t peer_lookup_has_yes;     // peer handler returned has=1
     uint64_t peer_lookup_has_no;      // peer handler returned has=0
+    uint64_t peer_lookup_timeout;     // watchdog fired on stalled peer fanout
 };
 
 // Read a snapshot of the counters (no internal locking — values are atomic
@@ -153,6 +167,7 @@ void cross_job_counter_bump_peer_lookup_forwarded();
 void cross_job_counter_bump_peer_lookup_handled();
 void cross_job_counter_bump_peer_lookup_has_yes();
 void cross_job_counter_bump_peer_lookup_has_no();
+void cross_job_counter_bump_peer_lookup_timeout();
 
 // Emit one L4C_INFO line summarising the counters. Includes a delta vs. the
 // previous call so periodic logging shows recent activity, not just the

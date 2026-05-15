@@ -758,31 +758,69 @@ static int test_registry_heartbeat_self_heal_and_gc_scope() {
     return 0;
 }
 
+// Regression for the 2026-05-14 deferred peer-RPC timeout fix.
+// Exercises the env-var parsing + counter wiring for FitCache_PEER_RPC_TIMEOUT_SEC.
+// The actual cancellation behaviour (HG_Cancel on stalled peer handles) needs
+// a live Mercury cluster and is exercised in the two_job_concurrent_v2 runs
+// after this fix landed; this smoke just locks in the configuration contract.
+static int test_peer_rpc_timeout_config() {
+    using fitcache::peer_rpc_timeout_sec;
+    // peer_rpc_timeout_sec caches on first call. Use a child process via fork
+    // is overkill for a smoke; just verify the default-path behaviour given
+    // we don't set the env var in this test process.
+    int t = peer_rpc_timeout_sec();
+    CHECK(t == 30, "default peer_rpc_timeout_sec should be 30");
+    std::printf("  ok: peer_rpc_timeout_sec default = %d\n", t);
+
+    // Cached call returns the same.
+    int t2 = peer_rpc_timeout_sec();
+    CHECK(t == t2, "peer_rpc_timeout_sec must be cached");
+    std::printf("  ok: peer_rpc_timeout_sec cached across calls\n");
+
+    // peer_lookup_timeout counter should exist and start at 0.
+    auto cnt = fitcache::cross_job_counters_snapshot();
+    CHECK(cnt.peer_lookup_timeout == 0,
+          "peer_lookup_timeout counter should start at 0");
+    std::printf("  ok: peer_lookup_timeout counter exposed (initial=%lu)\n",
+                (unsigned long)cnt.peer_lookup_timeout);
+
+    // Bump it once and verify the snapshot reflects it.
+    fitcache::cross_job_counter_bump_peer_lookup_timeout();
+    auto cnt2 = fitcache::cross_job_counters_snapshot();
+    CHECK(cnt2.peer_lookup_timeout == cnt.peer_lookup_timeout + 1,
+          "peer_lookup_timeout bump did not increment");
+    std::printf("  ok: peer_lookup_timeout counter bumps (now=%lu)\n",
+                (unsigned long)cnt2.peer_lookup_timeout);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
     std::printf("FitCache++ cross-job smoke test\n");
-    std::printf("[1/10] FNV-1a vectors...\n");
+    std::printf("[1/11] FNV-1a vectors...\n");
     test_fnv1a_stable();
-    std::printf("[2/10] HRW routing...\n");
+    std::printf("[2/11] HRW routing...\n");
     test_hrw_basic();
-    std::printf("[3/10] dataset_id...\n");
+    std::printf("[3/11] dataset_id...\n");
     test_dataset_id();
-    std::printf("[4/10] cluster registry roundtrip (will sleep ~4s for stale "
+    std::printf("[4/11] cluster registry roundtrip (will sleep ~4s for stale "
                 "heartbeat check)...\n");
     test_registry_roundtrip();
-    std::printf("[5/10] client-side routing (select_server_for_path + slot_to_addr)...\n");
+    std::printf("[5/11] client-side routing (select_server_for_path + slot_to_addr)...\n");
     test_routing_select_and_slot_addr();
-    std::printf("[6/10] sidecar persistent metadata...\n");
+    std::printf("[6/11] sidecar persistent metadata...\n");
     test_sidecar_persistent_meta();
-    std::printf("[7/10] eviction victim selection (refcount-protected, lowest-access)...\n");
+    std::printf("[7/11] eviction victim selection (refcount-protected, lowest-access)...\n");
     test_eviction_victim_selection();
-    std::printf("[8/10] subscriber-lease roundtrip (subscribe/release)...\n");
+    std::printf("[8/11] subscriber-lease roundtrip (subscribe/release)...\n");
     test_subscriber_lease_roundtrip();
-    std::printf("[9/10] sibling-cache refresh de-dup contract...\n");
+    std::printf("[9/11] sibling-cache refresh de-dup contract...\n");
     test_sibling_cache_refresh_dedup();
-    std::printf("[10/10] heartbeat self-heal + gc hostname scope (regression for "
+    std::printf("[10/11] heartbeat self-heal + gc hostname scope (regression for "
                 "the 2026-05-13 cross-node addr-wipe race)...\n");
     test_registry_heartbeat_self_heal_and_gc_scope();
+    std::printf("[11/11] peer-RPC timeout config (env var + counter) ...\n");
+    test_peer_rpc_timeout_config();
     std::printf("\nALL SMOKE TESTS PASSED\n");
     return 0;
 }
