@@ -18,3 +18,7 @@ fitcache_server_log.*
 /benchmarks/results/**/*.log
 /benchmarks/results/**/*.out
 /benchmarks/results/**/2026*.sh
+
+# FitCache LD_PRELOAD / server runtime logs — emitted in CWD; don't commit
+fitcache_intercept_log.*
+fitcache_server_log.*

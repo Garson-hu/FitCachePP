@@ -29,8 +29,11 @@ export FITPP_RESULTS_ROOT="${FITPP_REPO}/benchmarks/results"
 export FITPP_COSMOFLOW_DIR=/lustre/orion/gen008/proj-shared/ghu4/benchmark/cosmoflow-benchmark
 # Megatron / DINOv2 left blocked-by-mmap (per repo-level notes); point at the
 # in-tree clones for completeness, but don't expect them to fire.
-export FITPP_MEGATRON_DIR=/lustre/orion/gen008/proj-shared/ghu4/benchmark/Megatron-DeepSpeed-ORNL
-export FITPP_DINOV2_DIR=""   # not cloned on Frontier yet
+# Upstream NVIDIA Megatron-LM, cloned 2026-05-15 (the Megatron-DeepSpeed-ORNL
+# clone alongside it has its megatron/data/ source files stripped, so the
+# IndexedDataset path doesn't load).
+export FITPP_MEGATRON_DIR=/lustre/orion/gen008/proj-shared/ghu4/benchmark/Megatron-LM
+export FITPP_DINOV2_DIR=/lustre/orion/gen008/proj-shared/ghu4/benchmark/dinov2
 
 # ---- Python environments ----
 # TF + Horovod for ROCm 6.2, created at env-bootstrap time. Will not exist
