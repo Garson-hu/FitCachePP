@@ -21,7 +21,18 @@ set -u
 
 # Resolve site (sets FITPP_REPO / FITPP_SERVER_BIN / FITPP_RESULTS_ROOT /
 # FITPP_COSMOFLOW_DIR / FITPP_SERVERS_PER_NODE_DEFAULT / etc.).
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Same sbatch-script-copy fallback as PDSW_FITPP.sh.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+if [ -z "$SCRIPT_DIR" ] || [ ! -d "$SCRIPT_DIR/../sites" ]; then
+    if [ -n "${FITPP_REPO:-}" ] && [ -d "$FITPP_REPO/benchmarks/sites" ]; then
+        SCRIPT_DIR="$FITPP_REPO/benchmarks/cosmoflow"
+    elif [ -n "${SLURM_SUBMIT_DIR:-}" ] && [ -d "$SLURM_SUBMIT_DIR/benchmarks/sites" ]; then
+        SCRIPT_DIR="$SLURM_SUBMIT_DIR/benchmarks/cosmoflow"
+    else
+        echo "ERROR: cannot locate benchmarks/sites — set FITPP_REPO" >&2
+        exit 1
+    fi
+fi
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/../sites/_resolve.sh"
 
@@ -123,9 +134,24 @@ if [[ "$CLIENT_LAUNCHER" == *megatron* ]] || [[ "$CLIENT_LAUNCHER" == *dinov2* ]
     echo "[$(date '+%H:%M:%S')] launching directly (non-Horovod client)"
     "$CLIENT_LAUNCHER" 2>&1 | tee "$RESULTS_DIR/client_${SLURM_JOB_ID}.log"
     HOROVOD_RC=${PIPESTATUS[0]}
+elif [ "$TOTAL_GPUS" -eq 1 ]; then
+    # Single-GPU runs don't need horovodrun's process-launching layer — hvd.init()
+    # inside the python process is enough. Bypass the launcher entirely so we
+    # don't depend on horovodrun's mpirun/gloo backend (this env was built
+    # without gloo and Frontier has no mpirun, so horovodrun crashes either way).
+    echo "[$(date '+%H:%M:%S')] launching directly (single-GPU, no horovodrun)"
+    "$CLIENT_LAUNCHER" 2>&1 | tee "$RESULTS_DIR/client_${SLURM_JOB_ID}.log"
+    HOROVOD_RC=${PIPESTATUS[0]}
 else
-    echo "[$(date '+%H:%M:%S')] horovodrun -np $TOTAL_GPUS -H $HOROVOD_HOSTLIST"
-    horovodrun -np "$TOTAL_GPUS" -H "$HOROVOD_HOSTLIST" \
+    # Multi-GPU / multi-node: needs a real launcher. On Frontier, prefer srun
+    # over horovodrun since cray-mpich has no mpirun. --gloo bypasses mpirun
+    # but requires horovod to have been built with HOROVOD_WITH_GLOO=1.
+    HVDRUN_BACKEND="${FITPP_HVDRUN_BACKEND:-}"
+    if [ -z "$HVDRUN_BACKEND" ] && [ "${FITPP_SITE:-}" = "frontier" ]; then
+        HVDRUN_BACKEND="--gloo"
+    fi
+    echo "[$(date '+%H:%M:%S')] horovodrun $HVDRUN_BACKEND -np $TOTAL_GPUS -H $HOROVOD_HOSTLIST"
+    horovodrun $HVDRUN_BACKEND -np "$TOTAL_GPUS" -H "$HOROVOD_HOSTLIST" \
         "$CLIENT_LAUNCHER" \
         2>&1 | tee "$RESULTS_DIR/horovodrun_${SLURM_JOB_ID}.log"
     HOROVOD_RC=${PIPESTATUS[0]}

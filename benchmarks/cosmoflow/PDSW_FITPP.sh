@@ -24,7 +24,20 @@
 # 4-servers-per-node default for non-trivial datasets.
 
 # Resolve site config first — sets $FITPP_REPO and friends.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Under sbatch, SLURM copies the script to /var/spool/slurmd/.../slurm_script,
+# so BASH_SOURCE-relative paths to sites/_resolve.sh don't resolve. Fall back
+# to $FITPP_REPO (set by the caller / site config) when that happens.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+if [ -z "$SCRIPT_DIR" ] || [ ! -d "$SCRIPT_DIR/../sites" ]; then
+    if [ -n "${FITPP_REPO:-}" ] && [ -d "$FITPP_REPO/benchmarks/sites" ]; then
+        SCRIPT_DIR="$FITPP_REPO/benchmarks/cosmoflow"
+    elif [ -n "${SLURM_SUBMIT_DIR:-}" ] && [ -d "$SLURM_SUBMIT_DIR/benchmarks/sites" ]; then
+        SCRIPT_DIR="$SLURM_SUBMIT_DIR/benchmarks/cosmoflow"
+    else
+        echo "ERROR: cannot locate benchmarks/sites — set FITPP_REPO or run from repo root" >&2
+        exit 1
+    fi
+fi
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/../sites/_resolve.sh"
 
@@ -66,6 +79,13 @@ HOROVOD_HOSTLIST=${HOROVOD_HOSTLIST%,}
 export FitCache_LOG_LEVEL=600
 export RDMAV_FORK_SAFE=1
 export VERBS_LOG_LEVEL=4
+# Disable TF/XLA's LLVM bitcode load — TF-ROCm 2.14's bundled LLVM 18 reader
+# rejects "Unknown attribute kind (91)" emitted by Frontier's ROCm 6.2.4
+# /opt/rocm-6.2.4/amdgcn/bitcode/opencl.bc (newer LLVM than TF expects).
+# Without these the very first conv layer crashes. ROCm-Fusion is a TF-side
+# optimization pass; turning it off costs some perf but lets the model run.
+export TF_ROCM_FUSION_DISABLE=1
+export TF_XLA_FLAGS="${TF_XLA_FLAGS:-} --tf_xla_auto_jit=0 --tf_xla_cpu_global_jit=false"
 # Mercury / log4c / Python paths already prepended to PATH / LD_LIBRARY_PATH /
 # PKG_CONFIG_PATH by sites/_resolve.sh based on the active site config.
 

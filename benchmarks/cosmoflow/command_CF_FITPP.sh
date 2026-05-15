@@ -11,7 +11,14 @@
 
 set -x
 # Resolve site (FITPP_COSMOFLOW_DIR / FITPP_PYTHON_TF / FITPP_CLIENT_LIB).
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# horovodrun copies us to a temp dir under sbatch, so apply the same fallback
+# as PDSW_FITPP.sh.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+if [ -z "$SCRIPT_DIR" ] || [ ! -d "$SCRIPT_DIR/../sites" ]; then
+    if [ -n "${FITPP_REPO:-}" ] && [ -d "$FITPP_REPO/benchmarks/sites" ]; then
+        SCRIPT_DIR="$FITPP_REPO/benchmarks/cosmoflow"
+    fi
+fi
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/../sites/_resolve.sh"
 
