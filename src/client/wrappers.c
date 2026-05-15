@@ -374,14 +374,30 @@ ssize_t WRAP_DECL(write)(int fd, const void *buf, size_t count)
 	return __real_write(fd, buf, count);
 }
 
+/*
+ * lseek wrapper.
+ *
+ * The fd we get back from the FitCache-wrapped open() IS a real PFS fd
+ * (the client wrapper does __real_open before issuing the open RPC) — so
+ * __real_lseek on it works directly and returns the correct file size /
+ * offset. Routing the lseek through the server via fitcache_remote_lseek
+ * was added for symmetry with the read path, but it has plumbing issues
+ * (numpy.memmap saw SEEK_END come back as -1 → io.UnsupportedOperation)
+ * and isn't actually needed: subsequent reads on tracked fds go through
+ * ms_read which uses an EXPLICIT offset (pread-style), so we never depend
+ * on the kernel-tracked offset of the cached-file fd on the server side.
+ *
+ * Keeping the wrapper around (rather than dropping it) so we can still
+ * log the lseek call for traceability and so future logic that needs to
+ * intercept lseek (e.g., bounded by cache-tier size) has an obvious home.
+ */
 off_t WRAP_DECL(lseek)(int fd, off_t offset, int whence)
 {
 	MAP_OR_FAIL(lseek);
 	if (g_disable_redirect || tl_disable_redirect) return __real_lseek(fd,offset,whence);
 
-	if (fitcache_file_tracked(fd)){
-		L4C_INFO("Got an LSEEK on a tracked file %d %ld\n", fd, offset);	
-		return fitcache_remote_lseek(fd,offset,whence);
+	if (fitcache_file_tracked(fd) && DEBUG_HU) {
+		L4C_INFO("lseek on tracked fd %d offset %ld whence %d", fd, offset, whence);
 	}
 	return __real_lseek(fd, offset, whence);
 }
@@ -390,9 +406,8 @@ off64_t WRAP_DECL(lseek64)(int fd, off64_t offset, int whence)
 {
 	MAP_OR_FAIL(lseek64);
 	if (g_disable_redirect || tl_disable_redirect) return __real_lseek64(fd,offset,whence);
-	if (fitcache_file_tracked(fd)){
-		L4C_INFO("Got an LSEEK64 on a tracked file %d %ld\n", fd, offset);	
-		return fitcache_remote_lseek(fd,offset,whence);
+	if (fitcache_file_tracked(fd) && DEBUG_HU) {
+		L4C_INFO("lseek64 on tracked fd %d offset %ld whence %d", fd, (long)offset, whence);
 	}
 	return __real_lseek64(fd, offset, whence);
 }
@@ -436,9 +451,17 @@ ssize_t WRAP_DECL(readv)(int fd, const struct iovec *iov, int iovcnt)
  * mmap users it's an overcharge. A lazier variant (mmap the cached file
  * directly via a get_cached_path RPC) is the natural follow-up.
  *
- * EXCLUSIONS: MAP_ANONYMOUS / fd<0 (no file), MAP_SHARED (write-back is
- * out of scope), MAP_FIXED (must honor user addr; would defeat the
- * anonymous redirect), or any untracked fd → passthrough to real mmap.
+ * EXCLUSIONS: MAP_ANONYMOUS / fd<0 (no file), writable MAP_SHARED (the
+ * application expects writes to flush to the backing file — our anon
+ * redirect would break that contract), MAP_FIXED (must honor user addr;
+ * would defeat the anonymous redirect), or any untracked fd → passthrough
+ * to real mmap.
+ *
+ * Note on read-only MAP_SHARED: this is the path numpy.memmap mode='r'
+ * actually takes (CPython mmapmodule.c maps ACCESS_READ → MAP_SHARED |
+ * PROT_READ). We INTERCEPT this case — there's no write-back to honor
+ * since the prot has no PROT_WRITE bit, so the anon-backing redirect is
+ * semantically equivalent to a file-backed read-only shared mapping.
  */
 void* WRAP_DECL(mmap)(void *addr, size_t length, int prot, int flags,
                       int fd, off_t offset)
@@ -449,10 +472,13 @@ void* WRAP_DECL(mmap)(void *addr, size_t length, int prot, int flags,
     if (g_disable_redirect || tl_disable_redirect)
         return __real_mmap(addr, length, prot, flags, fd, offset);
 
-    /* Bypass the redirect for any case we can't safely intercept. */
+    /* Bypass the redirect for any case we can't safely intercept.
+     * MAP_SHARED is only bypassed when the mapping is WRITABLE — read-only
+     * MAP_SHARED (numpy.memmap mode='r' default) is fine to redirect because
+     * there's no write-back contract to honor. */
     if (fd < 0 || length == 0 ||
-        (flags & MAP_ANONYMOUS) || (flags & MAP_SHARED) ||
-        (flags & MAP_FIXED))
+        (flags & MAP_ANONYMOUS) || (flags & MAP_FIXED) ||
+        ((flags & MAP_SHARED) && (prot & PROT_WRITE)))
         return __real_mmap(addr, length, prot, flags, fd, offset);
 
     const char *path = fitcache_get_path(fd);
@@ -509,6 +535,20 @@ void* WRAP_DECL(mmap)(void *addr, size_t length, int prot, int flags,
         L4C_INFO("mmap: redirected to anon %p (populated %ld of %zu requested bytes)",
                  buf, (long)got, length);
     return buf;
+}
+
+/*
+ * mmap64 wrapper. CPython's _mmap.so calls mmap64 (the explicit 64-bit
+ * variant) via glibc, NOT plain mmap — so without this wrapper the
+ * numpy.memmap path skips our redirect entirely. On 64-bit Linux the
+ * implementation is identical to mmap; the symbol name is what differs
+ * for LD_PRELOAD interposition. Delegate to mmap so the logic lives in
+ * one place.
+ */
+void* WRAP_DECL(mmap64)(void *addr, size_t length, int prot, int flags,
+                        int fd, off64_t offset)
+{
+    return WRAP_DECL(mmap)(addr, length, prot, flags, fd, (off_t)offset);
 }
 
 int WRAP_DECL(munmap)(void *addr, size_t length)

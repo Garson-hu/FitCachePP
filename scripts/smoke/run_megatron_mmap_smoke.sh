@@ -65,10 +65,12 @@ export FitCache_SERVER_COUNT=1
 export FitCache_CROSS_JOB=0
 mkdir -p "$FitCache_DRAM_PATH" "$FitCache_NVME_PATH"
 
-# Start ONE fitcache_server. SLURM_PROCID + FitCache_SERVER_PORT keep it
-# happy without a real Slurm allocation.
+# Start ONE fitcache_server. SLURM_PROCID + SLURM_JOBID + FitCache_SERVER_PORT
+# keep it happy without a real Slurm allocation; the JOBID must match what
+# the client passes below so the .ports.cfg lookup resolves.
 echo "[smoke] starting fitcache_server"
-SLURM_PROCID=0 FitCache_SERVER_PORT=5555 \
+SMOKE_FAKE_JOBID="${SMOKE_FAKE_JOBID:-99999}"
+SLURM_PROCID=0 SLURM_JOBID="$SMOKE_FAKE_JOBID" FitCache_SERVER_PORT=5555 \
     "$FITPP_SERVER_BIN" 1 \
     > "$SMOKE_ROOT/server.log" 2>&1 &
 SERVER_PID=$!
@@ -81,18 +83,28 @@ if ! kill -0 "$SERVER_PID" 2>/dev/null; then
 fi
 echo "[smoke] server alive (pid=$SERVER_PID)"
 
-# Run the I/O-only iterator with LD_PRELOAD'd libfitcache_client.so.
-# The mmap wrapper should fire when IndexedDataset.__init__ calls
-# numpy.memmap on the .bin/.idx pair.
-echo "[smoke] launching megatron_io_only_iter.py under LD_PRELOAD"
+# Run a minimal numpy.memmap-only iterator with LD_PRELOAD'd
+# libfitcache_client.so. memmap-only (as opposed to Megatron's
+# IndexedDataset) sidesteps the Megatron-LM .idx-format compatibility
+# issue and gets us straight to the mmap call — which is what the
+# interceptor actually targets.
+#
+# SLURM_PROCID + SLURM_JOBID are required by the client's comm init —
+# they key the .ports.cfg.<JOBID> file the client reads to find its
+# server. On a login-node smoke (no SLURM context) we set them
+# explicitly to match what the server we spawned above wrote.
+echo "[smoke] launching memmap_only_iter.py under LD_PRELOAD"
 SMOKE_NUM_ITERS="${SMOKE_NUM_ITERS:-200}"
+SMOKE_FAKE_JOBID="${SMOKE_FAKE_JOBID:-99999}"
 LD_PRELOAD="$FITPP_CLIENT_LIB" \
-FITPP_MEGATRON_DIR="$FITPP_MEGATRON_DIR" \
+SLURM_PROCID=0 \
+SLURM_JOBID="$SMOKE_FAKE_JOBID" \
     "$FITPP_PYTHON_TORCH" \
-    "$FITPP_REPO/benchmarks/megatron/megatron_io_only_iter.py" \
-    --data-prefix "$DATA_PREFIX" \
+    "$FITPP_REPO/benchmarks/megatron/memmap_only_iter.py" \
+    --bin "${DATA_PREFIX}.bin" \
+    --dtype uint16 \
     --num-iters "$SMOKE_NUM_ITERS" \
-    --seq-length 1024 \
+    --slice-len 1024 \
     --batch-size 4 \
     2>&1 | tee "$SMOKE_ROOT/client.log"
 CLIENT_RC=${PIPESTATUS[0]}
@@ -104,8 +116,18 @@ sleep 1
 
 # Engagement check — what does the server log say?
 echo "[smoke] ----- engagement signals -----"
-OPEN_RPC_LINES=$(grep -c "Open RPC: requested path" "$SMOKE_ROOT/server.log" 2>/dev/null || echo 0)
-MMAP_REDIRECT_LINES=$(grep -cE "mmap on tracked fd|mmap: redirected to anon" "$SMOKE_ROOT/client.log" 2>/dev/null || echo 0)
+# The fitcache_server's log4c output (fitcache_server_log.<pid>.0) lands in
+# CWD because the server doesn't cd into RESULTS_DIR on its own (inner.sh
+# does that for SLURM jobs but we're a standalone smoke). Look for both
+# the SLURM-style server.log AND the most recent fitcache_server_log.* in
+# CWD that belongs to OUR server pid. The client's log4c file
+# (fitcache_intercept_log.<pid>.0) likewise lands in CWD; the mmap log
+# lines from the wrapper go there, NOT into the client.log captured by tee.
+OPEN_RPC_LINES=$(grep -cE "Open RPC: requested path" \
+    "$SMOKE_ROOT/server.log" \
+    fitcache_server_log.${SERVER_PID}.* 2>/dev/null | awk -F: '{s+=$NF} END {print s+0}')
+MMAP_REDIRECT_LINES=$(grep -cE "mmap on tracked fd|mmap: redirected to anon" \
+    fitcache_intercept_log.*.0 2>/dev/null | awk -F: '{s+=$NF} END {print s+0}')
 echo "    Open RPCs in server log:        $OPEN_RPC_LINES"
 echo "    mmap-redirect lines (client):   $MMAP_REDIRECT_LINES"
 echo "    Client exit code:               $CLIENT_RC"

@@ -120,6 +120,9 @@ extern off64_t WRAP_DECL(lseek64)(int fd, off64_t offset, int whence);
 REAL_DECL(mmap, void*, (void *addr, size_t length, int prot, int flags, int fd, off_t offset))
 extern void* WRAP_DECL(mmap)(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
 
+REAL_DECL(mmap64, void*, (void *addr, size_t length, int prot, int flags, int fd, off64_t offset))
+extern void* WRAP_DECL(mmap64)(void *addr, size_t length, int prot, int flags, int fd, off64_t offset);
+
 REAL_DECL(munmap, int, (void *addr, size_t length))
 extern int WRAP_DECL(munmap)(void *addr, size_t length);
 
