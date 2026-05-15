@@ -106,7 +106,7 @@ export FITPP_MAIL_USER=""
 export FITPP_MODULE_LOADS='
 module reset
 module swap PrgEnv-cray PrgEnv-gnu
-module load rocm/6.2.4
+module load rocm/6.0.0
 module load miniforge3
 module unload darshan-runtime
 '

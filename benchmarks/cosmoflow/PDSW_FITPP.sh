@@ -86,6 +86,19 @@ export VERBS_LOG_LEVEL=4
 # optimization pass; turning it off costs some perf but lets the model run.
 export TF_ROCM_FUSION_DISABLE=1
 export TF_XLA_FLAGS="${TF_XLA_FLAGS:-} --tf_xla_auto_jit=0 --tf_xla_cpu_global_jit=false"
+# MIOpen kernel-cache lives in SQLite under $HOME/.cache/miopen/ by default.
+# Frontier $HOME is NFS and SQLite's flock usage fails on it with "disk I/O
+# error" → "No suitable algorithm was found to execute the required
+# convolution". Three knobs match the user's known-working HVAC pattern:
+#   - MIOPEN_DISABLE_CACHE=1 — don't load/store kernel-search results
+#   - MIOPEN_FIND_MODE=3      — fast-find mode (skip exhaustive search)
+#   - MIOPEN_USER_DB_PATH on local /tmp — even with DISABLE_CACHE, some MIOpen
+#     paths still open the SQLite db; point it somewhere writeable.
+export MIOPEN_DISABLE_CACHE=1
+export MIOPEN_FIND_MODE=3
+export MIOPEN_USER_DB_PATH="/tmp/${USER}/miopen-cache-${SLURM_JOB_ID:-0}"
+export MIOPEN_CUSTOM_CACHE_DIR="$MIOPEN_USER_DB_PATH"
+mkdir -p "$MIOPEN_USER_DB_PATH"
 # Mercury / log4c / Python paths already prepended to PATH / LD_LIBRARY_PATH /
 # PKG_CONFIG_PATH by sites/_resolve.sh based on the active site config.
 
