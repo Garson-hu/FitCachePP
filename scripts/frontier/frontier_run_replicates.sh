@@ -44,30 +44,30 @@ SBATCH_BASE=(
 
 JOBIDS=()
 for i in $(seq 1 "$N_RUNS"); do
-    FCP_DIR="$ROOT_DIR/FitCachePP_run${i}"
-    PCF_DIR="$ROOT_DIR/Pure_CF_run${i}"
-    mkdir -p "$FCP_DIR" "$PCF_DIR"
+    FITCACHEPP_DIR="$ROOT_DIR/FitCachePP_run${i}"
+    PURE_CF_DIR="$ROOT_DIR/Pure_CF_run${i}"
+    mkdir -p "$FITCACHEPP_DIR" "$PURE_CF_DIR"
 
     # FitCachePP replicate
-    JOB_FCP=$(FITPP_N_TRAIN="$N_TRAIN" FITPP_N_EPOCHS="$N_EPOCHS" \
-              RESULTS_DIR="$PWD/$FCP_DIR" \
+    JOB_FITCACHEPP=$(FITPP_N_TRAIN="$N_TRAIN" FITPP_N_EPOCHS="$N_EPOCHS" \
+              RESULTS_DIR="$PWD/$FITCACHEPP_DIR" \
         sbatch --parsable "${SBATCH_BASE[@]}" \
-            -J "FCP_rep${i}" \
-            -o "$FCP_DIR/FitCachePP-%j.out" \
+            -J "FitCachePP_rep${i}" \
+            -o "$FITCACHEPP_DIR/FitCachePP-%j.out" \
             benchmarks/cosmoflow/TPDS_FITPP.sh)
-    JOBIDS+=("$JOB_FCP")
+    JOBIDS+=("$JOB_FITCACHEPP")
 
     # Pure_CF replicate
-    JOB_PCF=$(FITPP_N_TRAIN="$N_TRAIN" FITPP_N_EPOCHS="$N_EPOCHS" \
+    JOB_PURE_CF=$(FITPP_N_TRAIN="$N_TRAIN" FITPP_N_EPOCHS="$N_EPOCHS" \
               FITPP_PURE_CF=1 \
-              RESULTS_DIR="$PWD/$PCF_DIR" \
+              RESULTS_DIR="$PWD/$PURE_CF_DIR" \
         sbatch --parsable "${SBATCH_BASE[@]}" \
-            -J "PCF_rep${i}" \
-            -o "$PCF_DIR/Pure_CF-%j.out" \
+            -J "Pure_CF_rep${i}" \
+            -o "$PURE_CF_DIR/Pure_CF-%j.out" \
             benchmarks/cosmoflow/TPDS_FITPP.sh)
-    JOBIDS+=("$JOB_PCF")
+    JOBIDS+=("$JOB_PURE_CF")
 
-    echo "replicate $i submitted: FCP=$JOB_FCP  PCF=$JOB_PCF"
+    echo "replicate $i submitted: FCP=$JOB_FITCACHEPP  PCF=$JOB_PURE_CF"
 done
 
 # Persist the job-id list + run config alongside the outputs so the parser

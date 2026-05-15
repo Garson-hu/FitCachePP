@@ -25,9 +25,9 @@ export FITPP_N_TRAIN=1024
 export FITPP_N_EPOCHS=3
 
 RUN_TAG=$(date +'%Y%m%d_%H%M%S')_sanity
-FCP_DIR=benchmarks/results/frontier/sanity/FitCachePP_${RUN_TAG}
-PCF_DIR=benchmarks/results/frontier/sanity/Pure_CF_${RUN_TAG}
-mkdir -p "$FCP_DIR" "$PCF_DIR"
+FITCACHEPP_DIR=benchmarks/results/frontier/sanity/FitCachePP_${RUN_TAG}
+PURE_CF_DIR=benchmarks/results/frontier/sanity/Pure_CF_${RUN_TAG}
+mkdir -p "$FITCACHEPP_DIR" "$PURE_CF_DIR"
 
 # Frontier batch partition needs -C nvme to mount the per-node burst buffer
 # (/mnt/bb/$USER); without it $FITPP_LOCAL_CACHE_ROOT doesn't exist.
@@ -41,22 +41,22 @@ SBATCH_BASE=(
 )
 
 echo "--- submitting FitCachePP sanity ---"
-RESULTS_DIR="$PWD/$FCP_DIR" \
+RESULTS_DIR="$PWD/$FITCACHEPP_DIR" \
 sbatch "${SBATCH_BASE[@]}" \
     -J FitCachePP_sanity \
-    -o "$FCP_DIR/FitCachePP-%j.out" \
+    -o "$FITCACHEPP_DIR/FitCachePP-%j.out" \
     benchmarks/cosmoflow/TPDS_FITPP.sh
 
 echo "--- submitting Pure_CF sanity ---"
-RESULTS_DIR="$PWD/$PCF_DIR" \
+RESULTS_DIR="$PWD/$PURE_CF_DIR" \
 FITPP_PURE_CF=1 \
 sbatch "${SBATCH_BASE[@]}" \
     -J Pure_CF_sanity \
-    -o "$PCF_DIR/Pure_CF-%j.out" \
+    -o "$PURE_CF_DIR/Pure_CF-%j.out" \
     benchmarks/cosmoflow/TPDS_FITPP.sh
 
 echo "--- queued ---"
 squeue -u "$USER" 2>&1 | tail -5
 echo "Run-tag: $RUN_TAG"
-echo "FitCachePP results: $FCP_DIR"
-echo "Pure_CF results:    $PCF_DIR"
+echo "FitCachePP results: $FITCACHEPP_DIR"
+echo "Pure_CF results:    $PURE_CF_DIR"

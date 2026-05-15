@@ -64,7 +64,7 @@ submit_job() {
     FitCache_CROSS_JOB=1 \
     FitCache_CLUSTER_REGISTRY_DIR="$REGISTRY_DIR" \
         sbatch --parsable "${SBATCH_BASE[@]}" \
-            -J "FCP_${TAG}" \
+            -J "FitCachePP_${TAG}" \
             -o "$JOB_DIR/FitCachePP-%j.out" \
             benchmarks/cosmoflow/TPDS_FITPP.sh
 }
