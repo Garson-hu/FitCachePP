@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-12
 **SLURM job:** 221792 on c35 (cascade partition), COMPLETED in 18:01
-**Script:** `scripts/run_three_tier_sustained_read.sh`
+**Script:** `scripts/smoke/run_three_tier_sustained_read.sh`
 **Output:** `benchmarks/results/three_tier/sustained_read_smoke_c35_local_source-221792.out`
 **KEEP=1 artifacts:** `/tmp/fitcachepp_sustained_read_2822789/` on c35
 

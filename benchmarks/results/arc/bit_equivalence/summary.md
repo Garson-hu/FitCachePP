@@ -1,7 +1,7 @@
 # Bit-equivalence smoke result
 
 **Date:** 2026-05-11
-**Script:** `scripts/run_bit_equivalence_smoke.sh`
+**Script:** `scripts/smoke/run_bit_equivalence_smoke.sh`
 **Result:** PASS
 
 ## What this defends
@@ -58,7 +58,7 @@ All 24 hashes (8 source + 8 off-pass cache + 8 on-pass cache) match:
 - Single-host, single-process smoke. Defends correctness of the cache
   payload contents under both `CROSS_JOB` settings, not the full cluster
   cross-job protocol. The full protocol is exercised separately by
-  `scripts/run_two_server_smoke.sh` (peer-lookup + redirect) and the
+  `scripts/smoke/run_two_server_smoke.sh` (peer-lookup + redirect) and the
   cluster experiments under `benchmarks/cosmoflow/PDSW_FITPP_two_job_*.sh`.
 - NVMe tier is empty in this run because the 2 MiB dataset fits entirely
   in the 100 MiB DRAM budget; no eviction is triggered. A larger smoke

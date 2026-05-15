@@ -1,7 +1,7 @@
 # Three-tier placement + restoration smoke (local, no PMem hardware)
 
 **Date:** 2026-05-11
-**Script:** `scripts/run_three_tier_smoke.sh`
+**Script:** `scripts/smoke/run_three_tier_smoke.sh`
 **Result:** PASS
 
 ## What this defends
@@ -56,7 +56,7 @@ end-to-end.
 ## Backward-compatibility check
 
 The bit-equivalence smoke
-(`scripts/run_bit_equivalence_smoke.sh`) was re-run after the PMem changes
+(`scripts/smoke/run_bit_equivalence_smoke.sh`) was re-run after the PMem changes
 landed. It still passes with `FitCache_CROSS_JOB={0,1}` producing
 byte-identical cache content — i.e. the PMem code path is dormant when
 `FitCache_PMEM_PATH` is unset, and the zero-regression-vs-IPDPS claim is

@@ -15,8 +15,8 @@ accelerates non-CosmoFlow workloads with different I/O shapes:
 - **Megatron-LM source** at [/home/ghu4/hvac/benchmark/Megatron-LM/](/home/ghu4/hvac/benchmark/Megatron-LM/) (shallow clone, ~64 MB, source code only).
 - **DINOv2 source** at [/home/ghu4/hvac/benchmark/dinov2/](/home/ghu4/hvac/benchmark/dinov2/) (shallow clone, ~6.9 MB, source code only).
 - **Access-pattern smokes** that prove FitCache catches each workload's I/O shape on synthetic data, without needing the real models or datasets:
-  - [scripts/run_megatron_access_pattern_smoke.sh](../../scripts/run_megatron_access_pattern_smoke.sh) — `.bin` + `.idx` pair. PASS as of commit `c6c25ee` (the data-mover signal-loss fix made the 2-file case work).
-  - [scripts/run_dinov2_access_pattern_smoke.sh](../../scripts/run_dinov2_access_pattern_smoke.sh) — 4 classes × 10 images + 2 metadata files. PASS — 42/42 cached + 42/42 sidecars + sha256 match.
+  - [scripts/smoke/run_megatron_access_pattern_smoke.sh](../../scripts/smoke/run_megatron_access_pattern_smoke.sh) — `.bin` + `.idx` pair. PASS as of commit `c6c25ee` (the data-mover signal-loss fix made the 2-file case work).
+  - [scripts/smoke/run_dinov2_access_pattern_smoke.sh](../../scripts/smoke/run_dinov2_access_pattern_smoke.sh) — 4 classes × 10 images + 2 metadata files. PASS — 42/42 cached + 42/42 sidecars + sha256 match.
 - **Cluster sbatch templates** that wire each model's training command through `LD_PRELOAD=libfitcache_client.so`:
   - [benchmarks/megatron/PDSW_FITPP_megatron.sh](../../benchmarks/megatron/PDSW_FITPP_megatron.sh) + [command_megatron_FITPP.sh](../../benchmarks/megatron/command_megatron_FITPP.sh)
   - [benchmarks/dinov2/PDSW_FITPP_dinov2.sh](../../benchmarks/dinov2/PDSW_FITPP_dinov2.sh) + [command_dinov2_FITPP.sh](../../benchmarks/dinov2/command_dinov2_FITPP.sh)

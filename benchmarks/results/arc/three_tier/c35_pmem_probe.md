@@ -35,7 +35,7 @@ currently mounted as a filesystem**. From `srun -p cascade -w c35 -- ndctl list`
 **P1-8 (run sustained-read on c35 with real PMem) is blocked on a sysadmin
 action:** someone with root needs to `mount -o dax /dev/pmem0 /mnt/pmem`
 (or wherever — adjust `FitCache_PMEM_PATH` to match). Once mounted, the
-sustained-read smoke at `scripts/run_three_tier_sustained_read.sh` can be
+sustained-read smoke at `scripts/smoke/run_three_tier_sustained_read.sh` can be
 run via `srun -p cascade -w c35` with
 `PMEM_PATH=/mnt/pmem/ghu4/fitcachepp_three_tier_pmem` to characterise
 real DAX-PMem performance vs NVMe.
