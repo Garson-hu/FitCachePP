@@ -256,25 +256,37 @@ int WRAP_DECL(close)(int fd)
 // & timer here
 ssize_t WRAP_DECL(read)(int fd, void *buf, size_t count)
 {
+    MAP_OR_FAIL(read);
 
-	int ret = -1;
-	
-    MAP_OR_FAIL(read);	
-	
+    /*
+     * Sequential read() on a tracked fd: passthrough to __real_read.
+     *
+     * Why: ms_read (FitCache's read RPC path) doesn't maintain a per-fd
+     * offset on the server, and the client's local PFS fd never advances
+     * because ms_read populates the user buffer directly without touching
+     * the kernel's file-position state. That breaks Python's BufferedReader
+     * semantics — `stream.tell()` returns garbage (file_size - bytes_read
+     * with a wrong sign) and downstream numpy.frombuffer raises
+     * "offset must be non-negative and no greater than buffer length"
+     * (observed 2026-05-15 on Megatron IndexedDataset's .idx parse).
+     *
+     * The cache benefit for tracked files still flows through:
+     *   - mmap on tracked fd  → mmap interceptor anon-fills via ms_read
+     *     once at mmap time (commit 85c9527).
+     *   - pread on tracked fd → wrapper routes through ms_read with the
+     *     explicit offset, which is well-defined on the server.
+     *
+     * What we GIVE UP: per-byte cache routing on plain read() calls. The
+     * read still hits PFS via __real_read, not the local NVMe cache copy.
+     * That's fine for small metadata reads (Megatron's .idx header is
+     * 34 bytes) and not load-bearing for the workloads we care about.
+     */
     const char *path = fitcache_get_path(fd);
-	// ret = fitcache_remote_read(fd,buf,count); 
-
-	ret = ms_read(fd, buf, count, (int64_t) -1);
-
-	if (path)
-    {
-        L4C_INFO("Read to file %s of size %ld returning %ld bytes",path,count,ret);
+    ssize_t ret = __real_read(fd, buf, count);
+    if (path && DEBUG_HU) {
+        L4C_INFO("read on tracked fd %d path %s count=%zu got=%ld (passthrough)",
+                 fd, path, count, (long)ret);
     }
-	
-	if (ret == -1)
-	{
-		ret = __real_read(fd,buf,count);	
-	}
     return ret;
 }
 
