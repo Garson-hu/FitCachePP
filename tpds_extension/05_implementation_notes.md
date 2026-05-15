@@ -1083,3 +1083,238 @@ Compute-node smoke matrix (in flight or done):
 Note: ImageNet-22k itself is 1.4 TB and requires LSVRC/Kaggle registration.
 The synthetic stand-in is enough to validate the mmap-interceptor path; a
 real-data follow-up campaign would stage the real dataset.
+
+## 2026-05-15 — Megatron pretrain_gpt.py compare landed (workload-generalization)
+
+After five Megatron blockers (resolved one-at-a-time in
+`scripts/frontier/frontier_megatron_compare.sh`), the FitCachePP-vs-Pure_CF
+comparison on Megatron-LM v0.11.0 pretrain_gpt.py + enwik8 finally ran clean
+end-to-end (jobs 4586991/4586992, 200 iters, micro-batch=global=4, single
+MI250X GCD on Frontier).
+
+**Blockers resolved (in order)**:
+1. `pybind11/pybind11.h: No such file` in `megatron/core/datasets/Makefile`
+   → pre-built `helpers_cpp*.so` on login node with `python setup.py build_ext`.
+2. `address family not supported by protocol` from torch.distributed bootstrap
+   → set `MASTER_ADDR=127.0.0.1` (Frontier disables IPv6 sockets on compute).
+3. `subprocess.run(['nvcc', '-V'])` from `legacy/fused_kernels/__init__.py`
+   → patched `load(args)` to early-return when `cpp_extension.CUDA_HOME is None`.
+4. `persist_layer_norm not supported by torch LayerNorm` from
+   `core/transformer/torch_norm.py` (WrappedTorchNorm assertion)
+   → added `--no-persist-layer-norm`.
+5. `gradient_accumulation_fusion=True but fused_weight_gradient_mlp_cuda
+   missing` (requires APEX)
+   → added `--no-gradient-accumulation-fusion`.
+6. `ProcessGroupGloo::allreduce_coalesced: unsupported device type cuda`
+   → switched `--distributed-backend gloo` → `nccl` (PyTorch+rocm6.0 maps
+   nccl→rccl).
+
+**Result (200 iter, 4 samples/iter, micro-batch=4)**:
+
+| Side       | Wall-clock | Per-iter (ms) | Final loss | Open RPCs | mmap-redir |
+|------------|-----------:|--------------:|-----------:|----------:|-----------:|
+| FitCachePP |        68s |         128.6 |   6.115665 |        29 |         22 |
+| Pure_CF    |        75s |         128.9 |   6.115665 |         0 |          0 |
+
+Per-iter delta = 0.3 ms (well inside run-to-run noise on a 128 ms compute-bound
+inner loop). Final loss is **bit-identical**, which is the correctness check.
+The 7-second wall-clock gap is dominated by warm-up overhead, not steady-state
+training — at this dataset size (58 MB tokenized enwik8) the OS page cache
+holds the entire .bin after the first read, so neither side sees real I/O during
+the inner loop.
+
+**What this defends**: the workload-generalization claim. The mmap interceptor
+fires correctly inside a real Megatron pretrain (22 redirects), the LD_PRELOAD
+client registers files with the server (29 Open RPCs), training reaches the same
+final loss as the non-intercepted baseline, and per-iter latency is unchanged.
+This is the missing piece for the paper to say "the cache architecture
+generalizes beyond CosmoFlow-style sample iteration into LM-style memmap'd
+corpora" — previously (ARC) Megatron ran 0 Open RPCs because numpy.memmap
+bypassed the file-open hook entirely. The interceptor + the read/lseek
+`__real_*` pass-through fix close that gap.
+
+**What this does NOT defend**: the per-job speedup claim. With enwik8 fitting
+trivially in page cache, FitCachePP can't differentiate from Pure_CF on
+steady-state per-iter latency. The CosmoFlow headline at n_train=524288 (full
+1.8 TB v2 set, well beyond per-node DRAM) is the load-bearing measurement for
+per-job speedup; Megatron is the workload-generalization story only.
+
+## 2026-05-15 — Multi-GPU CosmoFlow Horovod hang (open issue)
+
+Once `data/cosmoflow/cosmoUniverse_2019_05_4parE_tf_v2/` was fully extracted
+(524288 train + 65536 validation tfrecords) we tried to run the full-scale
+n_train=524288 headline via the user-supplied multi-GPU srun pattern:
+
+```
+srun -N $N -n $N_TOTAL_SERVERS --ntasks-per-node=$SERVERS_PER_NODE fitcache_server &
+sleep 15
+srun -N $N -c4 --gpus-per-node=8 --ntasks-per-gpu=1 wrapper.sh   # LD_PRELOAD + train.py
+```
+
+(stored as `scripts/frontier/frontier_cosmoflow_headline.sh`).
+
+**Smoke at N_NODES=1, n_train=8192, 8 GPUs, SERVERS_PER_NODE=2**:
+- **Pure_CF** ran clean: 2 epochs × 104.5 s/epoch, "All done!", training wall=259 s.
+  → confirms the multi-GPU srun + Horovod + cosmoflow path works on Frontier.
+- **FitCachePP** hung in the first Horovod gradient allreduce:
+  ```
+  W stall_inspector.cc:138 One or more tensors were submitted to be reduced...
+  waiting for remainder of ranks for more than 60 seconds.
+  Missing ranks:
+    0: [DistributedSGD_Allreduce/.../HorovodAllreduce_grads_0, ...]
+  ```
+  Stuck for 21+ minutes until scancel.
+
+Retry at **SERVERS_PER_NODE=1** (rule out CPU contention from 2 server processes
+per node): same hang, but the missing rank shifted from 0 → 1. Variable rank,
+deterministic hang. → not specific to one rank; it's a race condition.
+
+**What the diagnostics say**:
+- The FitCache server log is healthy: thousands of `Open RPC: requested path`
+  entries with `Successful Redirection` and `Closing File` follow-ups. RPCs flow
+  through and complete.
+- The cosmoflow train.py log shows all 8 ranks reach `Initialized rank N size 8
+  local_rank N` (so horovod.init() completes for all of them) before the stall
+  fires.
+- The benchmark directory contains 700+ `fitcache_intercept_log.<pid>.0` files
+  for a single 8-rank smoke. TensorFlow's data pipeline forks many subprocesses
+  (interleave/parallel_map workers); each one inherits LD_PRELOAD and creates
+  its own FitCachePP client, each of which opens its own RPC channel to the
+  server.
+
+**Hypothesis**: the FitCachePP client's per-process init (Mercury HG_Init
++ first lookup of server addresses + first registration with the cluster
+registry) is non-trivial in wall-clock — fine in 1-process single-GPU mode,
+but when one rank's TF data pipeline forks ~30 subprocesses and each does the
+same init, the rank's first training step is delayed *significantly* past the
+others'. With 60 s stall threshold and ~10-100 ms per fork init, a rank with
+poor fork-init scheduling (or one that hits a slow server response) can fall
+behind enough to trigger the stall and never recover, because gloo/MPI's
+collective ordering serializes everyone behind that rank.
+
+**This is NOT new code that broke**:
+- The mmap interceptor (2026-05-15) only intercepts mmap/mmap64/munmap and
+  was disabled-by-default behavior for the cosmoflow path (cosmoflow's
+  tfrecord reader uses plain read(), not numpy.memmap).
+- The read()-pass-through fix (2026-05-15) only changes the `__real_read`
+  call path for *tracked* fds; untracked fds (everything outside
+  FitCache_DATA_DIR) are unaffected.
+- The HRW routing slice (2026-05-11) is gated by `FitCache_CROSS_JOB`, which
+  is `0` in this smoke.
+
+What changed on Frontier vs ARC IPDPS multi-GPU runs:
+- The TF version (2.14 vs whatever was on ARC).
+- The PyTorch/Horovod build (we built from source with HOROVOD_WITH_GLOO=1
+  + HOROVOD_WITH_MPI=1 but without HOROVOD_GPU_OPERATIONS=NCCL, after the
+  bfd_close mismatch in ROCm 5.7.1 — so collectives go via host-side gloo,
+  which is generally slower than the GPU-direct path).
+- The number of TF data pipeline workers is auto-tuned and may differ.
+
+**Forward path candidates** (deferred to a future debug session):
+1. Set `FitCache_DATA_DIR` to a path that excludes the tfrecords so the
+   client doesn't intercept them; use FitCachePP only for a different
+   benchmark. (Defeats the per-job speedup story for CosmoFlow.)
+2. Rebuild Horovod with `HOROVOD_GPU_OPERATIONS=NCCL` + `HOROVOD_GPU=ROCM`
+   so the first collective doesn't go through gloo and the stall_inspector
+   timeout window shifts (this was tried earlier and hit a ROCm 5.7.1
+   bfd_close mismatch — needs a re-attempt against ROCm 6.0).
+3. Add per-rank cache pre-warm step before `model.fit()` so the cold-read
+   latency is paid before any collective is issued.
+4. Make the FitCachePP client's Mercury init re-use a process-shared address
+   pool so forked subprocesses don't redo the lookup (server-side change).
+5. Run with TF data pipeline parallelism = 1 (single-threaded prefetch).
+   Likely tanks I/O throughput but isolates whether the fork is the cause.
+
+**Pragmatic decision tonight**: pivoted to **single-GPU** FitCachePP-vs-Pure_CF
+on the now-extracted full v2 set (1 rank → no Horovod → no stall), at
+n_train=32768. Single-GPU is enough to characterise per-job speedup
+*qualitatively* (FitCachePP server engaged, DRAM cache populated) even if it
+can't match the wall-clock numbers of the user's HVAC sbatch which runs 16
+nodes × 8 GPUs. The headline-scale multi-GPU run is left as an explicit
+follow-up; see candidates above.
+
+## 2026-05-15 — Cross-job has_yes=0 mechanism (open issue)
+
+The cross-job concurrent smoke (jobs 4585804 + 4585805, 1 node each, 4
+ranks/job, shared `FitCache_CLUSTER_REGISTRY_DIR`, different `FITPP_SEED`)
+showed:
+
+- `peer_lookup forwarded=1148/1183, handled=1117/1112` — RPC fanout works.
+- `has_yes=0, has_no=1117/1112` — every peer answers "no I don't have it",
+  including for files known to be in *some* job's local cache.
+- `redirect_to_peer=0` — therefore no cross-job hits ever surfaced.
+- `timeout=0` — the 2026-05-14 peer-RPC watchdog held; no hang on this front.
+
+**Captured state** of `$FITPP_PFS_REGISTRY_ROOT/cross_job_concurrent/<TAG>/registry.v1/`:
+- `nodes/frontier{02941,03063}_rank{0..3}.txt` — Mercury OFI addresses + node
+  UUIDs + jobids. So both jobs *did* find each other's Mercury endpoints.
+- `datasets/<hash>.txt` — `dataset.manifest_hash=14081395369131431799`,
+  `dataset.name=fitcache-default`, plus two subscriber entries (one per job
+  ID). So both jobs joined the same "dataset" namespace.
+- **No per-file presence entries.** The cluster registry is currently a node
+  + dataset discovery layer, not a path→owner inventory.
+
+**Probable mechanism** (needs source-walk to confirm): peer_lookup uses HRW
+to pick the *single* owner rank for path X, then asks that rank "do you have
+X?" If X was locally cached by a *different* rank (e.g., file was opened
+inside jobA's rank 2, but HRW hashes path X to jobB's rank 0), the HRW
+owner correctly says "no" — it never saw X. The cluster registry's
+`nodes/<host>_rank<r>.txt` files don't record which paths each rank has
+served, so there's no fallback "ask everyone" path.
+
+**Forward path candidates**:
+1. Augment the cluster registry with per-rank presence (each rank writes a
+   tiny `presence/<rank>.idx` mapping paths→last-touch-time; lookups
+   consult presence before falling back to PFS).
+2. Or: have the rank that locally caches X tell the HRW-owner via a
+   one-way `register_file(X)` RPC, so the HRW owner becomes the authoritative
+   "who has X" pointer.
+3. Or: drop HRW for peer_lookup and broadcast the lookup to all peers
+   (scales poorly; only OK for small cluster).
+
+Option 2 is the minimum-disruption fix and matches the IPDPS architectural
+intent. Confirm in source: `src/cross_job/fitcache_cross_job.{h,cpp}` and the
+`peer_lookup` handler in `src/comm/fitcache_comm_server.cpp` are the places to
+audit. Defer to a focused debug session — the watchdog/hang fix (timeout=0
+confirmed) was the prerequisite, and that part holds.
+
+## 2026-05-15 — Single-GPU full-dataset CosmoFlow result (and why it doesn't show speedup)
+
+After the multi-GPU hang forced a pivot, the single-GPU comparison ran clean on the
+now-extracted full v2 set (jobs 4587411 + 4587412):
+
+| Side       | Mean epoch (s) | Total 3-epoch (s) | Open RPCs | Files cached |
+|------------|---------------:|------------------:|----------:|-------------:|
+| FitCachePP |          88.26 |             264.8 |      3839 |         1280 |
+| Pure_CF    |          86.37 |             259.1 |         0 |            0 |
+
+Δ = +1.89 s/ep (FitCachePP **slower** by ~2.2 %). FitCache engagement is real
+(3839 Open RPCs, 1280 files cached in DRAM tier), but page cache absorbs the
+working set so the cache adds RPC latency without I/O savings.
+
+**Why no speedup at this scale (structural, not a bug)**:
+- cosmoflow's MLPerf config runs 256 steps × batch_size=4 = 1024 samples per
+  epoch on 1 rank. Each sample is one ~2.9 MB tfrecord, so per-epoch I/O is
+  about 3 GB.
+- Frontier compute nodes have 512 GB DRAM. A 3 GB working set fits trivially in
+  the OS page cache, so the cold epoch is the only chance to see I/O cost, and
+  even there 3 GB at PFS read bandwidth is sub-second.
+- The IPDPS-era per-job speedup story comes from multi-GPU / multi-node runs
+  where the *aggregate* working set across all ranks exceeds any single node's
+  page cache (16 nodes × 8 GPUs × 1024 samples = 128K files = ~370 GB,
+  comfortably past any single-node cache). FitCachePP wins because its
+  per-node NVMe + cross-node sharing avoids the PFS bottleneck.
+- Multi-GPU is blocked by the Horovod-fork hang documented above.
+
+**Honest status for the journal extension as of 2026-05-15 EOD**:
+- ✅ **Workload generalization** (Megatron + DINOv2): mmap interceptor proven,
+  Megatron compare clean (28 OpenRPCs, 22 mmap-redirects, bit-identical loss),
+  DINOv2 compare clean.
+- ✅ **Cross-job hang fix** (peer-RPC timeout watchdog): timeout=0 across two
+  concurrent jobs confirms no hang. has_yes=0 mechanism issue (separate from
+  the hang fix) documented with three forward-path candidates.
+- ⚠ **Per-job speedup on CosmoFlow**: deferred. Single-GPU configuration on
+  Frontier cannot exceed page cache; multi-GPU configuration hangs in Horovod
+  fork-init. Both paths documented with concrete next-step candidates.
+
+

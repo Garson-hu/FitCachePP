@@ -121,8 +121,10 @@ MEGATRON_ARGS=(
     --no-masked-softmax-fusion
     --no-bias-gelu-fusion
     --no-async-tensor-model-parallel-allreduce
+    --no-persist-layer-norm
+    --no-gradient-accumulation-fusion
     --transformer-impl local
-    --distributed-backend gloo
+    --distributed-backend nccl
 )
 
 echo "=== side=$SIDE start \$(date) ==="

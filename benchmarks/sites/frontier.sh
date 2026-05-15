@@ -69,7 +69,9 @@ export FITPP_LOG4C_PKGCONFIG_DIR=/ccs/home/ghu4/log4c-1.2.4/install/lib/pkgconfi
 export FITPP_PFS_DATA_ROOT=/lustre/orion/gen008/proj-shared/ghu4/data
 # cosmo.py auto-appends /train and /validation to data_dir, so point at the
 # parent dataset dir, not the train/ subdir.
-export FITPP_COSMOFLOW_DATA_DEFAULT="${FITPP_PFS_DATA_ROOT}/cosmoUniverse_2019_05_4parE_tf_v2_mini"
+# Full v2 set: 524288 train + 65536 validation tfrecords (~1.74 TB on disk).
+# Mini variant kept available as a smoke target.
+export FITPP_COSMOFLOW_DATA_DEFAULT="${FITPP_PFS_DATA_ROOT}/cosmoflow/cosmoUniverse_2019_05_4parE_tf_v2"
 export FITPP_COSMOFLOW_DATA_SMOKE="${FITPP_PFS_DATA_ROOT}/cosmoUniverse_2019_05_4parE_tf_v2_mini"
 # Megatron prep is mmap-limited; leave unset until that gap is closed.
 # Megatron GPT-2 tokenizer + tokenized corpus (enwik8 ~58 MB tokenized).

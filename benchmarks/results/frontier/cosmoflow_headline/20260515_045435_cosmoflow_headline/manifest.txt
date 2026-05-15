@@ -1,0 +1,11 @@
+run_tag=20260515_045435_cosmoflow_headline
+job_fitcachepp=4587196
+job_pure_cf=4587197
+n_nodes=1
+gpus_per_node=8
+servers_per_node=2
+total_servers=2
+n_train=8192
+n_epochs=2
+data_dir=/lustre/orion/gen008/proj-shared/ghu4/data/cosmoflow/cosmoUniverse_2019_05_4parE_tf_v2
+walltime=00:30:00

@@ -15,7 +15,7 @@
 # the Lustre dataset.
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 export FITPP_SITE=frontier
 # Mini dataset has 1024 train files. n_train=1024 matches the file count

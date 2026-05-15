@@ -1,0 +1,6 @@
+run_tag=20260515_005514_crossjob
+job_a=4585804
+job_b=4585805
+n_train=1024
+n_epochs=3
+registry=/lustre/orion/gen008/proj-shared/ghu4/fitcachepp_registry/cross_job_concurrent/20260515_005514_crossjob

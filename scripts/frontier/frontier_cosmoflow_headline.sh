@@ -129,11 +129,11 @@ export TF_CPP_MIN_LOG_LEVEL=3
 
 mkdir -p "\$FitCache_DRAM_PATH" "\$FitCache_NVME_PATH"
 
-echo "[\$SIDE] nodes=\$SLURM_NNODES  total_servers=\$FitCache_SERVER_COUNT  gpus_per_node=$GPUS_PER_NODE"
-echo "[\$SIDE] data=\$FitCache_DATA_DIR"
+echo "[$SIDE] nodes=\$SLURM_NNODES  total_servers=\$FitCache_SERVER_COUNT  gpus_per_node=$GPUS_PER_NODE"
+echo "[$SIDE] data=\$FitCache_DATA_DIR"
 
 # ---- spawn FitCachePP servers (always, even on Pure_CF; Pure_CF just doesn't LD_PRELOAD)
-echo "[\$SIDE] launching $TOTAL_SERVERS servers via srun"
+echo "[$SIDE] launching $TOTAL_SERVERS servers via srun"
 srun -N $N_NODES -n $TOTAL_SERVERS --ntasks-per-node=$SERVERS_PER_NODE \\
      --cpus-per-task=1 --cpu-bind=cores \\
      "\$FITPP_SERVER_BIN" $TOTAL_SERVERS \\
@@ -157,23 +157,23 @@ ${USE_LD_PRELOAD} \$FITPP_PYTHON_TF \\
 WEOF
 chmod +x "\$WRAPPER"
 
-echo "[\$SIDE] launching training: \$((N_NODES * $GPUS_PER_NODE)) GPUs total"
+echo "[$SIDE] launching training: \$((N_NODES * $GPUS_PER_NODE)) GPUs total"
 START=\$SECONDS
 srun -N $N_NODES -c4 --gpus-per-node=$GPUS_PER_NODE --ntasks-per-gpu=1 \\
      --cpu-bind=cores "\$WRAPPER" 2>&1 | tee "\$RESULTS_DIR/train_\${SLURM_JOB_ID}.log"
 TRAIN_RC=\${PIPESTATUS[0]}
 END=\$SECONDS
-echo "[\$SIDE] training wall=\$((END - START))s rc=\$TRAIN_RC"
+echo "[$SIDE] training wall=\$((END - START))s rc=\$TRAIN_RC"
 
 # ---- teardown
-echo "[\$SIDE] tearing down servers"
+echo "[$SIDE] tearing down servers"
 kill -TERM \$SERVER_SRUN_PID 2>/dev/null || true
 sleep 5
 
 OPEN_RPC=\$(grep -cE "Open RPC: requested path" \$RESULTS_DIR/fitcache_server_log.*.* 2>/dev/null | awk -F: '{s+=\$NF} END {print s+0}')
 MMAP=\$(grep -cE "mmap on tracked fd|mmap: redirected to anon" \$RESULTS_DIR/fitcache_intercept_log.*.0 2>/dev/null | awk -F: '{s+=\$NF} END {print s+0}')
 EPOCH_LINES=\$(grep -cE "time:.*[0-9]+s/epoch" \$RESULTS_DIR/train_\${SLURM_JOB_ID}.log 2>/dev/null || echo 0)
-echo "----- \$SIDE summary -----"
+echo "----- $SIDE summary -----"
 echo "  Training wall:    \$((END - START))s"
 echo "  Open RPCs:        \$OPEN_RPC"
 echo "  mmap-redirects:   \$MMAP"
