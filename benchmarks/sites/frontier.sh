@@ -37,9 +37,10 @@ export FITPP_DINOV2_DIR=""   # not cloned on Frontier yet
 # until /ccs/home/ghu4/envs/build_cosmoflow_env.sh finishes.
 export FITPP_PYTHON_TF=/ccs/home/ghu4/envs/cosmoflow_rocm/bin/python3
 export FITPP_PYTHON_TF_BIN_DIR=/ccs/home/ghu4/envs/cosmoflow_rocm/bin
-# PyTorch ROCm env (csc791 happens to already have torch + rocm 6.3.1 tooling
-# in user's .conda envs; use as-is unless we explicitly switch).
-export FITPP_PYTHON_TORCH=/ccs/home/ghu4/.conda/envs/csc791/bin/python3
+# PyTorch + ROCm 6.0 env for Megatron-LM + DINOv2 (both PyTorch-based,
+# both mmap-using → exercise the libfitcache_client.so mmap interceptor).
+# Created by scripts/env/build_torch_rocm_env.sh.
+export FITPP_PYTHON_TORCH=/ccs/home/ghu4/envs/torch_rocm/bin/python3
 export FITPP_PYTHON_DINOV2="$FITPP_PYTHON_TORCH"
 
 # ---- Mercury + log4c ----

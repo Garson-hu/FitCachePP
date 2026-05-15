@@ -28,8 +28,11 @@ import os
 import sys
 import time
 
-# Megatron is on PYTHONPATH via direct import path.
-sys.path.insert(0, '/home/ghu4/hvac/benchmark/Megatron-LM')
+# Megatron source dir — use FITPP_MEGATRON_DIR from the site config, falling
+# back to the ARC-era hardcoded location for backward compatibility.
+_megatron_dir = os.environ.get(
+    'FITPP_MEGATRON_DIR', '/home/ghu4/hvac/benchmark/Megatron-LM')
+sys.path.insert(0, _megatron_dir)
 
 from megatron.core.datasets import indexed_dataset
 
