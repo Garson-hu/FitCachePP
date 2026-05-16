@@ -134,6 +134,20 @@ export MIOPEN_FIND_MODE=3
 export MIOPEN_USER_DB_PATH=/tmp/miopen_cache_\$SLURM_PROCID
 mkdir -p \$MIOPEN_USER_DB_PATH
 
+# Horovod stall-check tolerance: the FitCachePP LD_PRELOAD client serialises
+# open RPCs through 2 fitcache_servers per node, so the slowest rank's
+# data-pipeline prefetch can lag the fastest rank's by tens of seconds —
+# Horovod's default 60s stall_check fires before slow ranks catch up. Raise
+# to 600s so training proceeds (with the expected per-iter slowdown) rather
+# than aborting. Set HOROVOD_STALL_CHECK_DISABLE=1 to suppress the warning
+# spew entirely; we keep it on so a TRUE deadlock (no progress at all) is
+# still visible.
+export HOROVOD_STALL_CHECK_TIME_SECONDS=600
+export HOROVOD_STALL_SHUTDOWN_TIME_SECONDS=0  # 0 = warn only, never abort
+# Cycle time controls how often Horovod polls the request queue. Default 5ms
+# is fine; explicit so future debug knows where the knob is.
+export HOROVOD_CYCLE_TIME=5
+
 # TF / XLA / ROCm bitcode mismatch workarounds (see commit history)
 export TF_ROCM_FUSION_DISABLE=1
 export TF_XLA_FLAGS="--tf_xla_auto_jit=0 --tf_xla_cpu_global_jit=false"
