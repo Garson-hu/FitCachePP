@@ -1317,4 +1317,174 @@ working set so the cache adds RPC latency without I/O savings.
   Frontier cannot exceed page cache; multi-GPU configuration hangs in Horovod
   fork-init. Both paths documented with concrete next-step candidates.
 
+## 2026-05-17 — Multi-GPU root cause + fix (per-job-speedup unblocked)
+
+The "Horovod fork-init hang" diagnosis was wrong. What actually happens at
+8 GPUs / 1 node under LD_PRELOAD on Frontier:
+
+1. All 8 ranks reach `model.fit()` and print "Epoch 1/2".
+2. Each rank's TF data pipeline calls `open()` on the first tfrecord. Our
+   wrapper does `__real_open` → returns local fd, then calls
+   `fitcache_track_file` which fires `fitcache_client_comm_gen_open_rpc` to
+   the server and blocks via `fitcache_client_block_for_file` waiting for
+   the open RPC's callback to populate `fd_redir_map[fd]`.
+3. With 8 ranks × ~4 TF parallel-call workers each = ~32 concurrent opens
+   serialised through 2 fitcache_server processes' single Mercury progress
+   thread, throughput collapsed to ~7 opens/sec. Cold-epoch wall went from
+   Pure_CF's 105s → FitCachePP's 571s (a 5.4× slowdown).
+4. Some runs hung outright at "Beginning training" with AveCPU=00:00:00.
+
+Three combined patches close this. All match the behaviour of the reference
+HVAC implementation at `/lustre/orion/gen008/proj-shared/ghu4/FitCache_Frontier/`:
+
+**Patch 1 — fire-and-forget open RPC** (`src/client/fitcache_client.cpp`).
+The reference's `hvac_client_block()` is a deprecated no-op (see
+`FitCache_Frontier/src/hvac_comm_client.cpp:361` — just logs a warning and
+returns). The open RPC is fired but the client does not block on it. The
+first reads then fall back to `__real_pread` on the LOCAL fd (still fast
+PFS reads) until the open RPC's callback asynchronously populates
+`fd_redir_map`, after which subsequent reads can use the server-cached
+path. We removed the `fitcache_client_block_for_file(fd_map[fd])` call
+that was forcing every open through a synchronous round-trip.
+
+**Patch 2 — thread-safe Mercury init** (`src/client/fitcache_client.cpp`).
+TF's `tf.data` AUTOTUNE pipeline spawns parallel I/O worker threads. With
+`g_mercury_init` checked without a lock, multiple threads in the same rank
+could both see `g_mercury_init=false`, both call `fitcache_init_comm()`,
+HG_Init Mercury twice, pthread_create two progress threads against the
+same hg_context. Symptom: ranks lock at first data-pipeline iteration with
+AveCPU=00:00:00. The reference has the same race but TF's older
+single-threaded data pipeline didn't trigger it. We added a static
+`pthread_mutex_t` around the `!g_mercury_init` check + init.
+
+**Patch 3 — ms_read race-safe early bypass** (`src/client/fitcache_multi_source_read.cpp`).
+After patch 1 makes the open RPC fire-and-forget, the first `ms_read` on
+the local fd can race ahead of the open callback. `fd_redir_map[fd]` is
+still 0 at that point, so the server-side handler does `pread(0, ...)` —
+which reads STDIN and fails. Intercept log showed:
+
+```
+[multi_source_read:69] Remote fd: 0
+[multi_source_read:86] Generated read rpc with ms
+[comm_client:370] Open RPC Returned FD: 33, Local FD 25   ← arrives AFTER
+[multi_source_read:133] RPC failed
+```
+
+The reference guards this at the `hvac_remote_pread` level
+(`if (hvac_file_tracked(fd) && fd_redir_map[fd] != 0)`). We added the same
+guard at the top of `ms_read`: if `fd_redir_map[fd] == 0` (or absent),
+fall back to `__real_read` / `__real_pread` on the local fd. This is the
+"fire-and-forget open + read-from-local-until-cache-ready" protocol
+referenced in patch 1.
+
+### Validation at n=8192 / 1 node × 8 GPUs (4598562)
+
+| Side          | Cold (ep 1) | Warm (ep 2) | Mean   | Total wall | Open RPCs |
+|---------------|------------:|------------:|-------:|-----------:|----------:|
+| Pure_CF       |        105s |        104s |  105s  |       256s |         0 |
+| **FitCachePP**|     **135s** |     **73s** |**103.8s** |    258s |     8345+ |
+| FitCachePP (pre-patch) | — | — | 539s | 1149s | 28K |
+
+**Warm-epoch is 30% faster than Pure_CF** (73s vs 104s) — the FitCachePP
+advantage paying off once the cache is populated. Cold epoch carries the
+30s one-time cost of server-side PFS-to-DRAM cache copies; mean is tied
+with Pure_CF, total wall +1%. Pre-patch numbers were 5× slower across the
+board.
+
+### Long-term north-star (agreed 2026-05-17)
+
+FitCachePP = reusable cache layer for AI training data:
+- (1) improves warm-epoch perf within one job,
+- (2) generalizes beyond one file-access pattern (numpy.memmap, gzip-tfrecord, JPEG),
+- (3) enables cache reuse across jobs.
+
+Headline result for the paper is always reported as a **triple**: cold
+epoch wall, warm epoch wall, and multi-epoch amortized wall. The cold cost
+is real and the paper must show when it's amortized. Cross-job sharing is
+the most important new contribution for the extension and is verified
+EARLY (before scaling to multi-node) so the headline claim has the right
+mechanism behind it.
+
+## 2026-05-15 EOD addendum — Horovod GPU-collectives gap diagnosed; cross-job has_yes=0 fix shipped
+
+After the user pushed back on the single-GPU pivot ("each experiment should
+use all GPUs on the node") and the deferred Horovod debug, I confirmed the
+multi-GPU hang and shipped the cross-job changes.
+
+### Multi-GPU hang root cause
+
+`python -c "import horovod.tensorflow as hvd; print(hvd.nccl_built(),
+hvd.rocm_built())"` against the env at `/ccs/home/ghu4/envs/cosmoflow_rocm`
+reports:
+
+```
+mpi_built   True
+gloo_built  True
+nccl_built  0       <-- CPU-side collectives only
+cuda_built  False
+rocm_built  False   <-- not built against RCCL
+```
+
+That's the hang's root cause, not the launch pattern. With gloo+MPI only,
+every `hvd.allreduce` on a GPU tensor goes GPU→host-copy→CPU-allreduce→host-broadcast→GPU.
+Combined with the FitCachePP LD_PRELOAD adding any data-pipeline latency, one
+rank falls behind the others' staging buffers and the 60s Horovod
+stall_inspector fires. The IPDPS-era ARC build had RCCL+ROCm baked in, so
+collectives were GPU-direct and the LD_PRELOAD didn't trip the timeout.
+
+Launch command is correct per `feedback-frontier-multi-gpu-pattern`:
+```
+srun -N $N -c4 --gpus-per-node=8 --ntasks-per-gpu=1 --cpu-bind=cores wrapper.sh
+# wrapper.sh:
+LD_PRELOAD=libfitcache_client.so $FITPP_PYTHON_TF train.py -d \
+    --data-dir "$FitCache_DATA_DIR" --n-train ... --n-epochs ...
+# env: MIOPEN_DISABLE_CACHE=1, MIOPEN_FIND_MODE=3, MIOPEN_USER_DB_PATH=/tmp/...,
+#      TF_ROCM_FUSION_DISABLE=1, TF_XLA_FLAGS="--tf_xla_auto_jit=0 ...",
+#      BBPATH=/tmp, FitCache_DRAM_PATH=/tmp/..._dram, etc
+```
+
+Rebuild kicked off (`scripts/env/build_cosmoflow_env.sh` already had the
+correct env flags; first attempt fell through to a stale Python 3.6, second
+attempt uses explicit `/ccs/home/ghu4/envs/cosmoflow_rocm/bin/python` and
+`HOROVOD_RCCL_HOME=/opt/rocm-6.0.0/rccl + HOROVOD_RCCL_INCLUDE/LIB` set
+explicitly). Build time ~30-60min; verifies post-build that `nccl_built=True`
+and `rocm_built=True`. Once landed, `cosmoflow_headline.sh` at
+N_NODES=1..16 should run without the rank-skew hang.
+
+### Cross-job has_yes=0 — shipped all three fixes
+
+User requested all three forward-path candidates be implemented and tested.
+
+**Implementation map**:
+
+| Option | What it adds | Files touched | Test |
+|--------|--------------|---------------|------|
+| 1: PFS-backed per-file presence index | `registry_record_file_presence(path, addr, dataset_hash)` and `registry_lookup_file_presence(path)` in cluster_registry; `${registry.v1}/presence/aa/bb/<sha1>.txt` append-only files | `src/cross_job/fitcache_cluster_registry.{h,cpp}` (+~260 lines) | test 13, 14 |
+| 2: register-file-on-cache RPC | New `fitcache_register_file_rpc` (path + serve_addr + dataset_hash) + handler that updates an in-memory `remote_presence_map`; broadcast from data-mover at cache populate | `src/comm/fitcache_comm.h`, `src/comm/fitcache_comm_server.cpp`, `src/cross_job/fitcache_cross_job.{h,cpp}`, `src/server/fitcache_server.cpp` | test 15 |
+| 3: broadcast lookup | Already in place: `fitcache_open_rpc_handler` fans peer_lookup out to every live peer. Verified resolution priority (local → in-memory → PFS) | `src/comm/fitcache_comm_server.cpp` (peer_lookup_rpc_handler now does 3-tier lookup) | test 16 |
+
+The data mover hook (`src/server/fitcache_data_mover.cpp` line ~509) now does
+both Option 1 (PFS write) AND Option 2 (RPC broadcast) at cache-populate
+time. The `peer_lookup_rpc_handler` consultation order:
+1. **local path_cache_map** — fastest, my own cache.
+2. **remote_presence_map** — in-memory peer-RPC index (Option 2).
+3. **PFS presence index** — durable, cluster-wide (Option 1).
+
+If a path is in any of the three, the handler returns has=1 with serve_addr
+pointing at whichever holder we know about; the client gets redirected
+there and retrieves the file. Closing the prior gap where each peer only
+checked its own path_cache_map and answered NO if a different peer held it.
+
+**Tests**: `test_cross_job_smoke` now runs **16/16** (was 12/12):
+- 13: PFS presence roundtrip + dedupe + multi-holder.
+- 14: stale-entry filter at lookup time + gc rewrite.
+- 15: in-memory remote_presence_map insert/lookup/overwrite/empty-input.
+- 16: 3-tier resolution priority + multiple PFS holders co-exist.
+
+**End-to-end validation**: deferred to the next two-job concurrent run on
+Frontier after Horovod rebuild lands. The smoke tests verify the structural
+contract; the run will verify the integration produces `has_yes > 0` and
+`redirect_to_peer > 0` (with overlapping files between the two jobs, not
+the disjoint-seed pattern the previous smoke used).
+
 

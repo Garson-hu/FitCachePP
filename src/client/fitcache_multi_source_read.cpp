@@ -41,6 +41,25 @@ ssize_t ms_read(int fd, void* buf, size_t count, int64_t offset)
         }
     }
 
+    // Race-safe early bypass: if the open RPC's callback hasn't populated
+    // fd_redir_map[fd] yet (== 0), the server doesn't know about our local fd
+    // and would try pread(0, ...) which reads STDIN and fails. The reference
+    // HVAC code guards this at hvac_remote_pread() level with
+    //   if (hvac_file_tracked(fd) && fd_redir_map[fd] != 0)
+    // We do the same here so the wrapper falls back to __real_read /
+    // __real_pread on the LOCAL fd that the application got from __real_open.
+    // This is the "fire-and-forget open + read-from-local-until-cache-ready"
+    // protocol that gives cold-epoch wall ≈ Pure_CF.
+    if (fd_redir_map.find(fd) == fd_redir_map.end() || fd_redir_map[fd] == 0) {
+        MAP_OR_FAIL(read);
+        if (offset == -1) {
+            return __real_read(fd, buf, count);
+        } else {
+            MAP_OR_FAIL(pread);
+            return __real_pread(fd, buf, count, offset);
+        }
+    }
+
     L4C_INFO("File tracked, using multi-source read, the file descriptor is %d", fd);
 
     // Create ms_read_state to store asynchronous results

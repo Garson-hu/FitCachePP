@@ -136,13 +136,26 @@ bool fitcache_track_file(const char *path, int flags, int fd)
 		//Need to do something here
 	}
 
-	// Send RPC to tell server to open file 
+	// Send RPC to tell server to open file
 	if (tracked){
-		if (!g_mercury_init){
-			fitcache_init_comm(false);	
-			/* I think I only need to do this once */
-			fitcache_client_comm_register_rpc();
-			g_mercury_init = true;
+		// Thread-safe one-shot Mercury init. Without the mutex, TF data-pipeline
+		// parallel workers in the same python rank can both see g_mercury_init
+		// as false on their first open(), each call fitcache_init_comm() which
+		// HG_Init's Mercury twice and pthread_create's two progress threads
+		// against the same hg_context. Symptoms: ranks lock up at the first
+		// data-pipeline iteration (08-rank n=8192 hangs we saw 2026-05-17 with
+		// tasks at AveCPU=00:00:00). The reference HVAC code has the same race
+		// but TF didn't trigger it under its older single-threaded data pipeline.
+		// Our env (TF 2.14.0.600 + horovod 0.28.1 with tf.data.AUTOTUNE) does.
+		{
+			static pthread_mutex_t mercury_init_mutex = PTHREAD_MUTEX_INITIALIZER;
+			pthread_mutex_lock(&mercury_init_mutex);
+			if (!g_mercury_init){
+				fitcache_init_comm(false);
+				fitcache_client_comm_register_rpc();
+				g_mercury_init = true;
+			}
+			pthread_mutex_unlock(&mercury_init_mutex);
 		}
 		// Decide which server should we sent data. In single-job mode this is
 		// modulo over the local rank set; in cross-job mode (FitCache_CROSS_JOB=1)
@@ -151,10 +164,33 @@ bool fitcache_track_file(const char *path, int flags, int fd)
 			fitcache::select_server_for_path(fd_map[fd],
 				static_cast<int>(g_fitcache_server_count)));
 		L4C_INFO("Remote open - Host %d", host);
+		// Fire-and-forget open RPC: don't block waiting for the server's response.
+		//
+		// Why: blocking serialises every open through a single RPC round-trip,
+		// which on cold-epoch reads (cosmoflow's first 1024 opens × 8 ranks
+		// × 2 fitcache_servers) collapsed throughput to ~7 opens/sec and made
+		// cold-epoch wall 5.4x slower than Pure_CF Lustre direct
+		// (FitCachePP 571s vs Pure_CF 105s at n_train=8192).
+		//
+		// The reference HVAC implementation that achieves cold ≈ Pure_CF
+		// uses a `hvac_client_block()` that is a deprecated no-op (see
+		// FitCache_Frontier/src/hvac_comm_client.cpp:361). The open RPC is
+		// fired, the open_cb populates fd_redir_map asynchronously, and the
+		// client returns to the application immediately. The application's
+		// first read() on the local fd then falls through to __real_read /
+		// __real_pread on the PFS-opened local fd (still fast) until
+		// fd_redir_map[fd] is populated and subsequent reads can use
+		// the server's cached fd path.
+		//
+		// Correctness is preserved because:
+		//   - The local fd from __real_open is valid and points at the
+		//     real PFS file; reads on it always work.
+		//   - ms_read / fitcache_remote_read tolerate fd_redir_map[fd]==0
+		//     by falling back to __real_read on the same local fd.
+		//   - Once the open RPC's callback completes, fd_redir_map[fd] is
+		//     set and subsequent reads can use the server's cached path
+		//     for warm-cache speedup.
 		fitcache_client_comm_gen_open_rpc(host, fd_map[fd], fd);
-
-		// * Wait for file-specific operation to complete
-		fitcache_client_block_for_file(fd_map[fd]);
 	}
 
 	return tracked;
