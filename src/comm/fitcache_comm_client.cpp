@@ -2,6 +2,8 @@
 #include <string>
 #include <iostream>
 #include <map>
+#include <set>
+#include <atomic>
 #include <unordered_map>
 #include <mutex>
 
@@ -54,6 +56,18 @@ struct fitcache_open_state {
     // to take. Starts at 1; decremented when fitcache_open_cb sees
     // FITCACHE_OPEN_REDIRECT and re-issues the open against the peer.
     int redirect_hops_remaining;
+    // fd-reuse race guard. Sampled from fd_open_epoch[local_fd] at the time
+    // fitcache_track_file fires the open RPC. open_cb only writes
+    // fd_redir_map / peer_slot_override if this epoch is still current
+    // (i.e. the local_fd hasn't been close()'d + reused for a different file
+    // since this RPC was issued). Without this guard a late open_cb for a
+    // closed fd would resurrect a stale server-fd into fd_redir_map, and
+    // subsequent reads on the reused-fd-for-a-different-file would pread
+    // the OLD file on the server. We saw this manifest as
+    // tensorflow.framework.errors_impl.DataLossError ("inflate() failed
+    // with error -3: invalid block type") in cosmoflow GZIP-TFRecord at
+    // n=8192 / 8GPU / 2 cross-job-sharing nodes (2026-05-17, JobB 4601942).
+    uint64_t fd_epoch_at_fire;
 };
 
 struct fitcache_seek_state {
@@ -235,6 +249,24 @@ extern std::map<int, std::string > fd_map;
 static std::mutex                 fd_peer_slot_mutex;
 static std::map<int, int>         fd_peer_slot_override;
 
+// Per-fd epoch counter. fitcache_track_file bumps this when it fires an open
+// RPC for a new file at this fd; open_cb compares against the snapshot it
+// took at fire time and bails out if a newer epoch has been started.
+// See fitcache_open_state::fd_epoch_at_fire for the rationale.
+static std::mutex                 fd_open_epoch_mutex;
+static std::map<int, uint64_t>    fd_open_epoch;
+
+extern "C" uint64_t fitcache_client_bump_fd_open_epoch(int local_fd) {
+    std::lock_guard<std::mutex> lock(fd_open_epoch_mutex);
+    return ++fd_open_epoch[local_fd];
+}
+
+extern "C" uint64_t fitcache_client_current_fd_open_epoch(int local_fd) {
+    std::lock_guard<std::mutex> lock(fd_open_epoch_mutex);
+    auto it = fd_open_epoch.find(local_fd);
+    return (it == fd_open_epoch.end()) ? 0 : it->second;
+}
+
 // Public helpers used by the routing layer in fitcache_client.cpp.
 extern "C" int fitcache_client_get_peer_slot_override(int local_fd) {
     std::lock_guard<std::mutex> lock(fd_peer_slot_mutex);
@@ -300,6 +332,28 @@ fitcache_open_cb(const struct hg_cb_info *info)
     assert(info->ret == HG_SUCCESS);
 
     HG_Get_output(info->info.forward.handle, &out);
+
+    // fd-reuse race guard. If a newer open RPC has been fired for the same
+    // local_fd since this RPC was issued, this callback's response is stale
+    // and must not write to fd_redir_map / peer_slot_override (doing so
+    // would direct reads-for-the-new-file at the OLD file's server fd).
+    {
+        uint64_t now_epoch = fitcache_client_current_fd_open_epoch(open_state->local_fd);
+        if (now_epoch != open_state->fd_epoch_at_fire) {
+            L4C_INFO("open_cb: dropping stale response for local_fd=%u "
+                     "(fired at epoch=%lu, current=%lu, path=%s)",
+                     open_state->local_fd,
+                     (unsigned long)open_state->fd_epoch_at_fire,
+                     (unsigned long)now_epoch,
+                     open_state->filename.c_str());
+            HG_Free_output(info->info.forward.handle, &out);
+            HG_Destroy(info->info.forward.handle);
+            fitcache_signal_file_operation_done(open_state->sync_ctx, -1);
+            fitcache_release_file_sync_context(open_state->filename);
+            delete open_state;
+            return HG_SUCCESS;
+        }
+    }
 
     // Cross-job peer redirect: the server we asked told us to retry against
     // a peer that has the file cached. Re-issue the open RPC against that
@@ -472,25 +526,43 @@ ssize_t fitcache_seek_block() {
 
 
 void fitcache_client_comm_gen_close_rpc(uint32_t svr_hash, int fd)
-{   
+{
     FitCache_TIMING("HvacCommClient_gen_close_rpc_Total");
-    
-    hg_addr_t svr_addr; 
+
+    // Race-safe close: if fd_redir_map[fd] is unset or 0, the open RPC for
+    // this fd has not completed yet (fire-and-forget pattern). Sending the
+    // close RPC with in.fd=0 makes the server close(0) — closes stdin and
+    // returns EBADF — and the server's close handler then pushes
+    // fd_to_path[0] = "" into the data_queue, which the data_mover then
+    // tries to fs::file_size("") on and logs a noisy error. Skip the RPC
+    // entirely; the server has no per-fd state for us and the open RPC's
+    // late open_cb will be discarded by the epoch guard.
+    auto it = fd_redir_map.find(fd);
+    if (it == fd_redir_map.end() || it->second == 0) {
+        // Still bump the epoch so any in-flight open_cb gets dropped.
+        (void)fitcache_client_bump_fd_open_epoch(fd);
+        return;
+    }
+
+    hg_addr_t svr_addr;
     fitcache_close_in_t in;
-    hg_handle_t handle; 
+    hg_handle_t handle;
     int ret;
     /* Get address */
-    svr_addr = fitcache_client_comm_lookup_addr(svr_hash);        
+    svr_addr = fitcache_client_comm_lookup_addr(svr_hash);
 
     /* create create handle to represent this rpc operation */
     fitcache_comm_create_handle(svr_addr, fitcache_client_close_id, &handle);
 
-    in.fd = fd_redir_map[fd];
+    in.fd = it->second;
 
     ret = HG_Forward(handle, NULL, NULL, &in);
     assert(ret == 0);
 
     fd_redir_map.erase(fd);
+    // Bump epoch so any late open_cb that hasn't run yet sees a stale tag
+    // and drops its response instead of resurrecting the entry we just erased.
+    (void)fitcache_client_bump_fd_open_epoch(fd);
 
     HG_Destroy(handle);
     fitcache_comm_free_addr(svr_addr);
@@ -544,6 +616,17 @@ void fitcache_client_comm_gen_open_rpc(uint32_t svr_hash, string path, int fd)
     // Allow at most one cross-job peer redirect on this open. If the peer also
     // says "go elsewhere" the second open is treated as a hard failure.
     fitcache_open_state_p->redirect_hops_remaining = 1;
+
+    // Bump the per-fd epoch and snapshot it so the open_cb can detect whether
+    // this fd has been close()'d + reused by the application by the time the
+    // RPC response comes back. See struct fitcache_open_state for rationale.
+    // Also reset fd_redir_map[fd] to 0 so any read that races between this
+    // bump and the open_cb response triggers the ms_read race-safe bypass
+    // (falling back to __real_read on the local PFS fd) rather than reading
+    // the previous file's server fd.
+    fitcache_open_state_p->fd_epoch_at_fire =
+        fitcache_client_bump_fd_open_epoch(fd);
+    fd_redir_map[fd] = 0;
     
     // Set FD state to opening
     fitcache_set_fd_state(fd, FitCache_FD_OPENING, path);
@@ -721,6 +804,7 @@ void fitcache_client_comm_gen_read_rpc_with_ms(uint32_t svr_hash, int localfd, v
     in.offset = offset;
     // Pseudo tier hint: follow rpc_state->requested_tier (DRAM or NVME)
     in.requested_tier = (int32_t)rpc_state->requested_tier;
+
     ret = HG_Forward(rpc_state->handle, callback, rpc_state, &in);
     assert(ret == 0);
 

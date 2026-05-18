@@ -35,7 +35,10 @@
 #                                     8192 for a quick smoke)
 #   FITPP_N_EPOCHS  default 3        (cold + 2 warm)
 #   N_NODES         default 1        (16 in the user's example)
-#   SERVERS_PER_NODE default 2
+#   SERVERS_PER_NODE default 4  (raised from 2 — single-server progress thread
+#                                serializes RPC handlers on slow Lustre opens
+#                                under MDS contention; observed n=32768 stall
+#                                after ~280 opens with 2 servers/node)
 #   GPUS_PER_NODE   default 8
 #   COSMOFLOW_DATA  default $FITPP_PFS_DATA_ROOT/cosmoflow/cosmoUniverse_2019_05_4parE_tf_v2
 #                   (parent dir containing train/ and validation/)
@@ -48,10 +51,15 @@ export FITPP_SITE=frontier
 source benchmarks/sites/_resolve.sh
 
 N_NODES="${N_NODES:-1}"
-SERVERS_PER_NODE="${SERVERS_PER_NODE:-2}"
+SERVERS_PER_NODE="${SERVERS_PER_NODE:-4}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 TOTAL_SERVERS=$((N_NODES * SERVERS_PER_NODE))
 N_TRAIN="${FITPP_N_TRAIN:-524288}"
+N_VALID="${FITPP_N_VALID:-1024}"   # 1024 / (16 nodes * 8 GPU * batch 4) = 2 valid steps,
+                                     # the smallest power of 2 that divides evenly at 16N
+                                     # AND 1N. Avoids the "n_valid not divisible by
+                                     # samples_per_file * n_shards * batch_size" failure
+                                     # that took down 4604189 at 16 nodes.
 N_EPOCHS="${FITPP_N_EPOCHS:-3}"
 WALLTIME="${WALLTIME:-12:00:00}"
 # When set (e.g. QOS=debug), inserted as `#SBATCH --qos=$QOS`. The Frontier
@@ -127,6 +135,10 @@ export FitCache_LOG_LEVEL=${FitCache_LOG_LEVEL_OVERRIDE:-600}
 export FitCache_PORTS_CFG_DIR="\$RESULTS_DIR"
 export FitCache_SERVER_COUNT=$TOTAL_SERVERS
 export FitCache_CROSS_JOB=0
+# Profiling: emit FitCache_TIMING per-tag histogram on client exit. Lets us
+# compare single-job ms_read.hrw_normal_total latency against cross-job
+# peer_redirect_total to quantify Mercury overhead.
+export FITPP_TIMING_DUMP_ON_EXIT=1
 
 # MIOpen knobs (mandatory on Frontier — SQLite kernel cache breaks on NFS \$HOME)
 export MIOPEN_DISABLE_CACHE=1
@@ -179,11 +191,12 @@ ${USE_LD_PRELOAD} \$FITPP_PYTHON_TF \\
     \$FITPP_COSMOFLOW_DIR/train.py -d \\
     --data-dir "\$FitCache_DATA_DIR" \\
     --n-train $N_TRAIN \\
+    --n-valid $N_VALID \\
     --n-epochs $N_EPOCHS
 WEOF
 chmod +x "\$WRAPPER"
 
-echo "[$SIDE] launching training: \$((N_NODES * $GPUS_PER_NODE)) GPUs total"
+echo "[$SIDE] launching training: $((N_NODES * GPUS_PER_NODE)) GPUs total"
 START=\$SECONDS
 srun -N $N_NODES -c4 --gpus-per-node=$GPUS_PER_NODE --ntasks-per-gpu=1 \\
      --cpu-bind=cores "\$WRAPPER" 2>&1 | tee "\$RESULTS_DIR/train_\${SLURM_JOB_ID}.log"

@@ -12,6 +12,7 @@
 #include "fitcache_cross_job.h"
 #include "fitcache_multi_source_read.h"
 #include "fitcache_logging.h"         // For L4C_INFO, L4C_ERR
+#include "fitcache_timer.h"           // FitCache_TIMING per-path tags
 
 extern std::map<int, int > fd_redir_map;
 // extern map<int,string> fd_to_path;             // & Server File Descriptor -> Original path
@@ -24,17 +25,18 @@ extern uint32_t g_fitcache_server_count;
 
 ssize_t ms_read(int fd, void* buf, size_t count, int64_t offset)
 {
-    
+
     // Check if file is tracked, otherwise fallback to normal read
-    if (!fitcache_file_tracked(fd)) 
+    if (!fitcache_file_tracked(fd))
     {
+        FitCache_TIMING("ms_read.untracked");
         MAP_OR_FAIL(read);
         // L4C_INFO("File not tracked, falling back to normal read");
-        if(offset == -1) 
+        if(offset == -1)
         {
             return __real_read(fd, buf, count);
         }
-        else 
+        else
         {
             MAP_OR_FAIL(pread);
             return __real_pread(fd, buf, count, offset);
@@ -51,6 +53,7 @@ ssize_t ms_read(int fd, void* buf, size_t count, int64_t offset)
     // This is the "fire-and-forget open + read-from-local-until-cache-ready"
     // protocol that gives cold-epoch wall ≈ Pure_CF.
     if (fd_redir_map.find(fd) == fd_redir_map.end() || fd_redir_map[fd] == 0) {
+        FitCache_TIMING("ms_read.bypass_pfs");
         MAP_OR_FAIL(read);
         if (offset == -1) {
             return __real_read(fd, buf, count);
@@ -59,6 +62,13 @@ ssize_t ms_read(int fd, void* buf, size_t count, int64_t offset)
             return __real_pread(fd, buf, count, offset);
         }
     }
+
+    // Path-specific timing: distinguishes peer-redirect from HRW-normal so the
+    // shutdown summary can quantify Mercury bulk + redirect/retry overhead.
+    int override_slot_probe = fitcache_client_get_peer_slot_override(fd);
+    fitcache::TimerGuard __ms_read_total_tg__(
+        override_slot_probe >= 0 ? "ms_read.peer_redirect_total"
+                                 : "ms_read.hrw_normal_total");
 
     L4C_INFO("File tracked, using multi-source read, the file descriptor is %d", fd);
 

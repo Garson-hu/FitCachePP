@@ -1,0 +1,13 @@
+run_tag=20260516_122745_hvac_baseline
+job_hvac=4595516
+qos=hackathon
+n_nodes=1
+gpus_per_node=8
+servers_per_node=2
+total_servers=2
+n_train=32768
+n_epochs=2
+data_dir=/lustre/orion/gen008/proj-shared/ghu4/data/cosmoflow/cosmoUniverse_2019_05_4parE_tf_v2
+walltime=00:30:00
+hvac_client_lib=/ccs/home/ghu4/new_hvac_copy/build_frontier/src/libhvac_client.so
+hvac_server_bin=/ccs/home/ghu4/new_hvac_copy/build_frontier/src/hvac_server

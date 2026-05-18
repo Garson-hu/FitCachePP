@@ -1,0 +1,10 @@
+run_tag=20260517_164725_xjob_sharing
+job_a=4601941
+job_b=4601942
+n_train=8192
+n_epochs=2
+seed=0
+jobB_delay_sec=30
+registry=/lustre/orion/gen008/proj-shared/ghu4/fitcachepp_registry/crossjob_sharing/20260517_164725_xjob_sharing
+qos=hackathon
+walltime=00:30:00

@@ -1,0 +1,6 @@
+run_tag=20260517_231535_dinov2_compare
+job_fitcachepp=4604032
+job_pure_cf=4604033
+num_iters=2000
+batch_size=4
+data_root=/lustre/orion/gen008/proj-shared/ghu4/data/dinov2/imagenet_synth

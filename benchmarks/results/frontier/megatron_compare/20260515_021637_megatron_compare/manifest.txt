@@ -1,0 +1,5 @@
+run_tag=20260515_021637_megatron_compare
+job_fitcachepp=4586745
+job_pure_cf=4586746
+train_iters=200
+data_prefix=/lustre/orion/gen008/proj-shared/ghu4/data/megatron/enwik8/enwik8_text_document

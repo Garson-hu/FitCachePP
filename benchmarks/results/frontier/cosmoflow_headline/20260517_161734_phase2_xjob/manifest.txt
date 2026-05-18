@@ -1,0 +1,9 @@
+run_tag=20260517_161734_phase2_xjob
+job_a=4601861
+job_b=4601862
+n_train=8192
+n_epochs=2
+walltime=00:30:00
+qos=hackathon
+cluster_registry_dir=/lustre/orion/gen008/proj-shared/ghu4/fitcachepp_registry/phase2_xjob/20260517_161734_phase2_xjob
+hypothesis=JobB.cold_epoch_wall close to phase1.warm_epoch_wall (~73s) via peer_lookup

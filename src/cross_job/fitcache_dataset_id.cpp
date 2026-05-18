@@ -151,6 +151,22 @@ fitcache_dataset_id_t build_dataset_id(const std::string &root_path,
     std::string canonical_str = ec ? root_path : canonical.string();
     id.root_path_hash = fitcache_dataset_root_path_hash(canonical_str.c_str());
 
+    // Opt-out for large datasets where the recursive scan dominates startup.
+    // When FITPP_SKIP_MANIFEST_SCAN=1, derive manifest_hash from root_path_hash
+    // only. Sharing then only requires the two jobs name the *same* root path
+    // — the divergence-detection refinement is sacrificed for startup speed.
+    // Cosmoflow's 524288-file train/ dir takes ~37s single-threaded on Lustre;
+    // with 8 ranks × parallel scans the contention cost can exceed 9 minutes.
+    if (const char *skip = std::getenv("FITPP_SKIP_MANIFEST_SCAN")) {
+        if (skip[0] == '1') {
+            id.manifest_hash = id.root_path_hash;
+            L4C_INFO("dataset_id: FITPP_SKIP_MANIFEST_SCAN=1; "
+                     "manifest_hash := root_path_hash=0x%lx (no scan)",
+                     (unsigned long)id.root_path_hash);
+            return id;
+        }
+    }
+
     std::vector<ManifestEntry> entries;
     if (!collect_manifest(canonical_str, entries)) {
         L4C_WARN("dataset_id: manifest scan failed; manifest_hash=0");

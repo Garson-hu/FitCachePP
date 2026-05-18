@@ -3,6 +3,7 @@
 /.claude/*
 .clangd
 /logs/*
+*log*
 
 # but keep this script
 !/build/clear_cmake.sh

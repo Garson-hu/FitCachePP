@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include <vector>
 #include <cstdio>
+#include <cstring>
 
 #include "fitcache_timer.h"
 #include "fitcache_internal.h"
@@ -84,6 +85,16 @@ static void __attribute((destructor)) fitcache_client_shutdown()
     // evict files we cached if pressure forces it. No-op when not subscribed.
     fitcache::release_self_from_local_dataset();
     fitcache_shutdown_comm();
+
+    // Profiling: dump per-tag latency table so post-run analysis can identify
+    // dominant overhead (peer-redirect vs HRW-normal, ms_read.bypass_pfs vs
+    // the RPC paths). Emitted per-rank-process to its srun stdout; the
+    // benchmark scripts capture all 8 ranks via tee into train_<jobid>.log.
+    // No-op for stats==0 paths.
+    if (getenv("FITPP_TIMING_DUMP_ON_EXIT")
+        && std::strcmp(getenv("FITPP_TIMING_DUMP_ON_EXIT"), "0") != 0) {
+        fitcache::print_all_stats();
+    }
 }
 
 bool fitcache_track_file(const char *path, int flags, int fd)

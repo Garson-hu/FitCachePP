@@ -1,0 +1,6 @@
+run_tag=20260515_011226_dinov2_compare
+job_fcp=4585968
+job_pcf=4585969
+num_iters=2000
+batch_size=4
+data_root=/lustre/orion/gen008/proj-shared/ghu4/data/dinov2/imagenet_synth
