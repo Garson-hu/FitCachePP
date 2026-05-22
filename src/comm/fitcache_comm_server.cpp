@@ -397,8 +397,27 @@ fitcache_open_rpc_handler(hg_handle_t handle)
         L4C_ERR("Failed to open file: %s", path_str.c_str());
         out.ret_status = -errno;
     } else {
-        std::unique_lock<std::shared_mutex> wlock(cache_mtx);
-        fd_to_path[out.ret_status] = path_str;
+        bool need_promote = false;
+        {
+            std::unique_lock<std::shared_mutex> wlock(cache_mtx);
+            fd_to_path[out.ret_status] = path_str;
+            need_promote = (path_cache_map.find(path_str) == path_cache_map.end());
+        }
+        // Promote at OPEN time (not only at close). Under the mmap/fd-reuse
+        // access pattern (numpy.memmap reuses the same fd per shard), the
+        // client's open_cb response is dropped as stale by the epoch guard,
+        // leaving fd_redir_map[fd]==0, which makes the client skip the close
+        // RPC — so close-time promotion never fires and the cache stays empty
+        // (the cache that the warm-hit direct-mmap path needs). Enqueueing at
+        // open time guarantees promotion regardless of the close RPC. The data
+        // mover dedups against path_cache_map, so a double enqueue is harmless.
+        if (need_promote) {
+            L4C_INFO("Open-time promote enqueue: %s", path_str.c_str());
+            pthread_mutex_lock(&data_mutex);
+            data_queue.push(path_str);
+            pthread_cond_signal(&data_cond);
+            pthread_mutex_unlock(&data_mutex);
+        }
     }
     HG_Respond(handle, NULL, NULL, &out);
     return (hg_return_t)ret;
@@ -433,30 +452,47 @@ fitcache_rpc_handler(hg_handle_t handle)
         &fitcache_rpc_state_p->bulk_handle);
     assert(ret == 0);
 
-    if (fitcache_rpc_state_p->in.offset == -1){
-        // NOTE: requested_tier is a hint for future per-tier file selection.
-        // Current prototype uses the already-opened fd mapping; tier selection
-        // is performed by path redirection at open/close time.
-        readbytes = read(fitcache_rpc_state_p->in.accessfd, fitcache_rpc_state_p->buffer, fitcache_rpc_state_p->size);
+    // Loop the read/pread until the full requested size is satisfied. A single
+    // Linux read()/pread() is silently capped by the kernel at 0x7ffff000
+    // (2,147,479,552 bytes ~= 2 GiB), returning a short count. The previous
+    // single-call code left the tail of any request > ~2 GiB zero-filled,
+    // which silently truncated large mmap eager-populates (Megatron 16 GiB
+    // shards, IGB-large 9.8 GiB CSR). Loop on the short count to read the rest.
+    {
+        char *buf = (char *) fitcache_rpc_state_p->buffer;
+        size_t want = (size_t) fitcache_rpc_state_p->size;
+        size_t got = 0;
+        bool use_pread = (fitcache_rpc_state_p->in.offset != -1);
+        int rfd = fitcache_rpc_state_p->in.accessfd;
+        int64_t base_off = fitcache_rpc_state_p->in.offset;
+        readbytes = 0;
+        while (got < want) {
+            ssize_t n;
+            if (use_pread) {
+                n = pread(rfd, buf + got, want - got, base_off + (int64_t) got);
+            } else {
+                n = read(rfd, buf + got, want - got);
+            }
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                if (got == 0) { readbytes = -1; }
+                break;          // hard error; return what we have
+            }
+            if (n == 0) break;  // EOF (request extended past end of file)
+            got += (size_t) n;
+        }
+        if (readbytes != -1) readbytes = (ssize_t) got;
         if(DEBUG_HU)
         {
             std::string path_copy;
             {
                 std::shared_lock<std::shared_mutex> rlock(cache_mtx);
-                auto it = fd_to_path.find(fitcache_rpc_state_p->in.accessfd);
-                if (it != fd_to_path.end())
-                    path_copy = it->second;    
+                auto it = fd_to_path.find(rfd);
+                if (it != fd_to_path.end()) path_copy = it->second;
             }
-            L4C_DEBUG("Server Rank %d : Read %ld bytes from file %s", server_rank,readbytes, path_copy.c_str());
-        }
-        
-    }else
-    {
-        // See note above regarding requested_tier pseudo logic.
-        readbytes = pread(fitcache_rpc_state_p->in.accessfd, fitcache_rpc_state_p->buffer, fitcache_rpc_state_p->size, fitcache_rpc_state_p->in.offset);
-        if(DEBUG_HU)
-        {
-            L4C_DEBUG("Server Rank %d : PRead %ld bytes from file %s at offset %lld", server_rank, readbytes, fd_to_path[fitcache_rpc_state_p->in.accessfd].c_str(),(long long) fitcache_rpc_state_p->in.offset );
+            L4C_DEBUG("Server Rank %d : %s %ld bytes from file %s (offset %lld)",
+                      server_rank, use_pread ? "PRead" : "Read", (long) readbytes,
+                      path_copy.c_str(), (long long) base_off);
         }
     }
 

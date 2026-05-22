@@ -1,15 +1,47 @@
 # FitCache++ Worklog
 
-### 2026-05-18 — 16-node cosmoflow n=131072 strong-scaling completes; averaging runs in flight
+### 2026-05-19 — TPDS contribution pivot: mmap interceptor + sidecar warm-restart land as the two new mechanisms; cross-job becomes future work
 
-- **16-node n=131072 single-job FitCachePP completed cleanly** (job 4604373, retry of 4604189 after the `n_valid` fix). Cold-epoch wall **140s**, warm-epoch wall **73s**, mean-epoch wall **106s**, total training wall 979s. With 128 ranks each holding 1024 files, this is a strong-scaling counterpart to the 1-node n=32768 single-job baseline (which sees 366s cold for the same per-rank work as 1-node n=8192). 16-node strong scaling delivers **2.6×** per-epoch speedup over 1-node n=32768.
-- **Second averaging runs in flight**: 1-node n=32768 single-job (4604375), 1-node n=32768 cross-job pair (4604376 + 4604377), 4-node n=131072 single-job (4604378 pending). Will collect once all three complete.
-- 20-minute heartbeat monitor set via `CronCreate` (job id `bbb2cfb1`, session-only, recurring).
+After the cross-job campaign concluded with weak wall-time savings + recurring `DataLossError` flakiness (see 2026-05-17 / 2026-05-18 entries below), the TPDS contribution shape was revised. **Two new mechanisms now anchor the paper, with cross-job sharing demoted to secondary / future work:**
+
+1. **Primary new contribution — mmap interceptor + LLM workload generalization.** The IPDPS-paper FitCache intercepted only `{open, read, pread, close}`; page-fault reads from `mmap`-based loaders (numpy.memmap, Megatron `IndexedDataset`, DINOv2 ImageNet tarballs) silently bypassed the cache. The `src/client/wrappers.c::mmap` intercept allocates an anonymous region and eager-populates it via `ms_read` at `mmap()` time. Validation: bit-identical Megatron `lm_loss=6.1157` between FitCachePP and Pure_CF; **11.5× cold-state throughput** (894 MB/s vs 78 MB/s) on a 10 GB synthetic Megatron `IndexedDataset`; 1.93× amortized over 20 K iterations × batch 16 × seq 1024. Auto-memory: [[project-mmap-interceptor-contribution]], [[project-llm-dataloader-headline]].
+2. **Second technical contribution — persistent sidecar metadata + warm-restart recovery.** Each cached file gets a `.meta` sidecar (magic + version + `original_path` + `original_size` + `cached_at_unix` + `access_count`) written atomically alongside the data file. On server startup, `restore_from_sidecars()` scans the tier directories and rebuilds `path_cache_map` so the next training process hits the cache without refetching from PFS. **Validation experiment 4614896 (2026-05-19 00:01):** Phase 1 cold (server srun #1, empty cache) Epoch wall 340 s → kill server → Phase 3 warm-after-restart (server srun #2, scanned 33,789 sidecars from disk) Epoch wall **260 s** (= warm-baseline 285 s within run-to-run noise, 80 s faster than the cold-from-empty 340 s). Mechanism rebuilt `path_cache_map` with **33,789** entries on every one of the 4 server ranks. Auto-memory: [[project-sidecar-warmrestart]].
+3. **Future / secondary — cross-job sharing.** Mechanism is functional and validated end-to-end (peer_lookup, redirect_to_peer, has_yes counters work as designed). Wall-time benefit is structurally bounded (I/O fraction of cold epoch + consumer local-cache absorption). Concurrent mode has a recurring `DataLossError: inflate() failed` that is un-root-caused. Kept in the paper as secondary prototype evidence / future work. Auto-memory: [[project-cross-job-limits]].
+
+**Engineering change that enabled the sidecar validation:** decoupled sidecar write + restore from `FitCache_CROSS_JOB`. The original gate ran the cross-job machinery (registry init + heartbeat + sibling-refresh threads) for any test that wanted sidecar persistence; those threads skewed Horovod ranks 2 + 7 at n=32768/1N (job 4614727 hung 28 min in `HorovodAllreduce` before walltime kill). New flag `FitCache_PERSIST_META=1` (auto-on under cross-job; opt-in otherwise) gates just the sidecar write + restore. Code: `bool persist_meta_enabled()` in `src/cross_job/fitcache_cross_job.{h,cpp}`; gate replaced at `src/server/fitcache_data_mover.cpp:512` and `src/server/fitcache_server.cpp:179`. 16/16 cross-job smoke tests pass.
+
+**Operational note (saved to durable memory):** the hackathon Frontier queue parked the original sidecar validation 19 hours behind other jobs for a ~13-minute experiment. Rule encoded in [[feedback-slurm-proactive-resubmit]]: a SLURM heartbeat must auto-cancel + resubmit under `QOS=debug` whenever a pending job's `StartTime` is many hours away while its `TimeLimit` is short. A 20-minute cron heartbeat (id `f1e73f8f`) was armed for this session that applies that rule + tails completed-job stdouts.
 
 **Next steps**
-- Collect second averaging runs for all three headline configurations; if cluster time allows, submit third runs.
-- Compute mean and standard deviation across runs; record in `tpds_extension/05_implementation_notes.md`.
-- Decide whether the cross-job sharing paper claim needs robustness against producer-job death; if yes, root-cause the `ms_read` modification corruption that blocked the prior two attempts before retrying. Otherwise frame producer-death as a known limitation.
+- Restructure `tpds_extension/05_implementation_notes.md` around the three-contribution shape (done in this session).
+- Optional: re-run the warm-restart experiment at full IPDPS n=524288 to characterise the sidecar-scan walk time at 524K `.meta` files (currently estimated 10-15 s on Lustre `/tmp`).
+- Optional: rerun the LLM dataloader at a corpus large enough that the warm-state Pure_CF advantage disappears (the current 10 GB corpus fits in 188 GB-RAM node page cache after Epoch 1, so Pure_CF eventually catches up). 50-100 GB corpus would isolate the cold-state advantage from page-cache amortization.
+
+### 2026-05-18 — 16-node strong-scaling + 3-run averaging; full IPDPS training set; LLM dataloader 11.5× cold; cross-job sharing limits identified
+
+- **16-node n=131072 single-job (job 4604373):** cold **140 s**, warm **73 s**, mean **106 s**, wall 979 s. 2.6× strong-scaling speedup over 1-node n=32768.
+- **Three-run averaging** for headline single-job configurations:
+
+  | Configuration | Cold mean ± std | Warm mean ± std | n |
+  |---|---|---|---|
+  | 1-node n=32768 | 352 ± 10 s | 289 ± 3 s | 3 |
+  | 4-node n=131072 | 369 ± 7 s | 290 ± 3 s | 3 |
+  | 16-node n=131072 | 140 s | 73 s | 1 |
+
+- **Full IPDPS training set at 16 nodes (job 4606441):** first clean run that exercises all 524288 training tfrecords. Cold **365 s**, warm **302 s**, mean 333 s, wall 917 s. Per-rank load matches 1-node n=32768 (4096 files/rank); cold-epoch wall is within 1 s of the 1-node baseline — weak-scaling overhead is essentially zero at full-IPDPS scale.
+- **LLM dataloader benchmark (10 GB synthetic Megatron IndexedDataset, 327 M tokens read):**
+  - FitCachePP cold sample: 894 MB/s, 28.6 K iters/s, 0.03 ms/step
+  - Pure_CF cold sample: 78 MB/s, 2.5 K iters/s, 0.40 ms/step
+  - **Cold-state speedup: 11.5×**; amortized over 20 K iters: **1.93×** (855 MB/s vs 443 MB/s)
+  - Built `benchmarks/megatron/generate_synth_corpus.py` + `llm_dataloader_bench.py` for this. Pure_CF eventually catches up after kernel page cache warms, but the amortized advantage holds because a real LLM pretraining loop doesn't re-read the same files many times.
+- **Cross-job sharing — warm-provider controlled experiment (null result).** New `frontier_cosmoflow_xjob_warmprovider.sh`: producer trains to completion then sleeps to keep its cache+servers alive; consumer pre-sleeps so producer Epoch 1 finishes before consumer reads start. Consumer cold = **354 s** (matches single-job 352 s baseline) with `has_yes` ≤ 27. Sharing did not engage at meaningful rate. Structural cause: consumer's local NVMe cache absorbs the per-rank working set (~20 GB) within Epoch 1, so the peer cache becomes unused after the first epoch.
+- **Cross-job sharing — multi-node concurrent escalation (recurring flakiness).** Per the user's escalation rule, ran concurrent cross-job at n=131072 / 4 nodes per side (jobs 4607367 + 4607369). Parameterized `frontier_cosmoflow_crossjob_sharing.sh` to take `N_NODES_PER_JOB`. Consumer crashed with `DataLossError: inflate() failed with error -3: invalid code lengths set` in Epoch 1 — same recurring corruption pattern seen at every previous concurrent-cross-job attempt at scale. Producer hung after consumer death (in-flight RPCs to dead peers block).
+- **Cross-job summary:** mechanism validated end-to-end (peer_lookup, redirect_to_peer, has_yes all work as designed); per-call profiling confirms peer reads are 10% faster than local-HRW reads. Wall-time benefit is structurally bounded by (a) I/O fraction of cold-epoch wall and (b) consumer's local cache absorbing the working set within Epoch 1. One clean wall-time data point stands (1-node n=32768 concurrent best run: consumer cold 338 s vs single-job mean 352 s, **−14 s**). The recurring concurrent-mode `DataLossError` is a real defect, not benchmarking variance, and remains un-root-caused.
+
+**Next steps**
+- Frame cross-job sharing claim honestly in the paper: mechanism validated, per-call optimal, wall-time benefit bounded by I/O fraction + local-cache absorption; recurring concurrent-mode data-corruption is future work.
+- The strong empirical results for the journal extension are: 16-node full IPDPS training set weak-scaling, 16-node n=131072 strong-scaling 2.6×, and the **LLM dataloader 11.5× cold-state throughput speedup** (the headline LLM evidence the previous Megatron correctness check lacked).
+- Optional: root-cause the concurrent-cross-job `inflate()` corruption with instrumented reproduction (capture the bytes the consumer's `__real_pread` fallback writes vs the bytes Mercury delivered). Defer unless the paper claim needs it.
 
 ### 2026-05-17 — 4-servers-per-node fix unblocks n=32768; cross-job sharing speedup scales 9× at larger dataset; multi-node weak-scaling clean; Megatron + DINOv2 re-verified
 

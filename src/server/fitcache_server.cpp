@@ -172,16 +172,6 @@ int fitcache_start_comm_server(void)
                 L4C_WARN("Failed to start cluster-registry heartbeat thread");
             }
 
-            // Cross-job durability: scan tier directories for sidecars left
-            // behind by a previous server lifetime and rebuild path_cache_map
-            // so peer-job lookups against this server return has=1 instead
-            // of has=0. No-op on first-ever start.
-            int restored = fitcache_data_mover_restore_from_sidecars();
-            if (restored > 0) {
-                L4C_INFO("Cross-job startup: restored %d cached files from "
-                         "sidecar metadata", restored);
-            }
-
             // Cross-job eviction: start the background reaper that enforces
             // FitCache_EVICT_HIGH_WM / FitCache_EVICT_LOW_WM watermarks.
             static pthread_t reaper_tid;
@@ -208,6 +198,20 @@ int fitcache_start_comm_server(void)
         } else {
             L4C_WARN("FitCache_CROSS_JOB=1 but registry_init failed; "
                      "running in single-job mode");
+        }
+    }
+
+    // Sidecar durability: scan tier directories for .meta files left behind
+    // by a previous server lifetime and rebuild path_cache_map so opens for
+    // restored files hit cache instead of falling through to PFS. Gated on
+    // persist_meta_enabled() so this runs in both cross-job mode (auto-on)
+    // and single-job-persist-meta mode (FitCache_PERSIST_META=1). No-op on
+    // first-ever start (no sidecars yet).
+    if (fitcache::persist_meta_enabled()) {
+        int restored = fitcache_data_mover_restore_from_sidecars();
+        if (restored > 0) {
+            L4C_INFO("Sidecar warm-restart: restored %d cached files from "
+                     "sidecar metadata", restored);
         }
     }
 

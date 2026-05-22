@@ -56,6 +56,9 @@ SEED="${FITPP_SEED:-0}"
 # after ~280 opens. Four servers spread the Mercury queue across four
 # progress threads, with each owning a 1/4 slice of the path hashring.
 SERVERS_PER_NODE="${SERVERS_PER_NODE:-4}"
+# Nodes per side. Each side (JobA, JobB) runs on this many nodes.
+# Total nodes consumed = 2 * N_NODES_PER_JOB.
+N_NODES_PER_JOB="${N_NODES_PER_JOB:-1}"
 
 # Stagger Job B's start so A has time to FULLY WARM its cache before B
 # starts issuing peer_lookups. 30s wasn't long enough on the prior run
@@ -63,6 +66,7 @@ SERVERS_PER_NODE="${SERVERS_PER_NODE:-4}"
 # >135s + a bit more before its cache is fully populated. Default 180s
 # = enough time for JobA to finish Epoch 1 cold + start serving warm.
 JOBB_DELAY_SEC="${JOBB_DELAY_SEC:-180}"
+TOTAL_SERVERS_PER_JOB=$((N_NODES_PER_JOB * SERVERS_PER_NODE))
 
 COSMOFLOW_DATA="${COSMOFLOW_DATA:-${FITPP_PFS_DATA_ROOT}/cosmoflow/cosmoUniverse_2019_05_4parE_tf_v2}"
 RUN_TAG=$(date +'%Y%m%d_%H%M%S')_xjob_sharing
@@ -89,7 +93,7 @@ submit_job() {
 #!/bin/bash
 #SBATCH -J xjob_${TAG}
 #SBATCH -t $WALLTIME
-#SBATCH -N 1
+#SBATCH -N $N_NODES_PER_JOB
 #SBATCH -C nvme
 #SBATCH -p $FITPP_SLURM_PARTITION
 #SBATCH --account=$FITPP_SLURM_ACCOUNT
@@ -125,7 +129,7 @@ export FitCache_DRAM_CAPACITY=\$((100 * 1024 * 1024 * 1024))
 export FitCache_NVME_CAPACITY=\$((1500 * 1024 * 1024 * 1024))
 export FitCache_LOG_LEVEL=600
 export FitCache_PORTS_CFG_DIR="\$RESULTS_DIR"
-export FitCache_SERVER_COUNT=$SERVERS_PER_NODE
+export FitCache_SERVER_COUNT=$TOTAL_SERVERS_PER_JOB
 # Enable cross-job sharing
 export FitCache_CROSS_JOB=1
 export FitCache_CLUSTER_REGISTRY_DIR="$REGISTRY_DIR"
@@ -159,13 +163,13 @@ export HOROVOD_CYCLE_TIME=5
 # Use the same seed for both jobs so they access overlapping file subsets
 export FITPP_SEED=$SEED
 
-echo "[${TAG}] nodes=1  total_servers=\$FitCache_SERVER_COUNT  cross_job=1  registry=$REGISTRY_DIR"
+echo "[${TAG}] nodes=$N_NODES_PER_JOB  total_servers=\$FitCache_SERVER_COUNT  cross_job=1  registry=$REGISTRY_DIR"
 echo "[${TAG}] DRAM=\$FitCache_DRAM_PATH (local — starts empty by design)"
 
 # Spawn FitCache servers (N/node; default 4 — see SERVERS_PER_NODE above).
-echo "[${TAG}] launching $SERVERS_PER_NODE servers via srun"
-srun -N 1 -n $SERVERS_PER_NODE --ntasks-per-node=$SERVERS_PER_NODE --cpus-per-task=1 --cpu-bind=cores \\
-     "\$FITPP_SERVER_BIN" $SERVERS_PER_NODE \\
+echo "[${TAG}] launching $TOTAL_SERVERS_PER_JOB servers across $N_NODES_PER_JOB nodes via srun"
+srun -N $N_NODES_PER_JOB -n $TOTAL_SERVERS_PER_JOB --ntasks-per-node=$SERVERS_PER_NODE --cpus-per-task=1 --cpu-bind=cores \\
+     "\$FITPP_SERVER_BIN" $TOTAL_SERVERS_PER_JOB \\
      > "\$RESULTS_DIR/server_\${SLURM_JOB_ID}.log" 2>&1 &
 SERVER_SRUN_PID=\$!
 sleep 15
@@ -179,13 +183,14 @@ LD_PRELOAD="\$FITPP_CLIENT_LIB" \$FITPP_PYTHON_TF \\
     \$FITPP_COSMOFLOW_DIR/train.py -d \\
     --data-dir "\$FitCache_DATA_DIR" \\
     --n-train $N_TRAIN \\
+    --n-valid 1024 \\
     --n-epochs $N_EPOCHS
 WEOF
 chmod +x "\$WRAPPER"
 
-echo "[${TAG}] launching training: 8 GPUs"
+echo "[${TAG}] launching training: $((N_NODES_PER_JOB * 8)) GPUs across $N_NODES_PER_JOB nodes"
 START=\$SECONDS
-srun -N 1 -c4 --gpus-per-node=8 --ntasks-per-gpu=1 --cpu-bind=cores \\
+srun -N $N_NODES_PER_JOB -c4 --gpus-per-node=8 --ntasks-per-gpu=1 --cpu-bind=cores \\
      "\$WRAPPER" 2>&1 | tee "\$RESULTS_DIR/train_\${SLURM_JOB_ID}.log"
 TRAIN_RC=\${PIPESTATUS[0]}
 END=\$SECONDS

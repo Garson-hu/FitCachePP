@@ -501,52 +501,59 @@ void* WRAP_DECL(mmap)(void *addr, size_t length, int prot, int flags,
         L4C_INFO("mmap on tracked fd %d path %s len %zu off %ld prot 0x%x flags 0x%x",
                  fd, path, length, (long)offset, prot, flags);
 
-    /* Allocate anonymous backing memory; PROT_WRITE so we can populate it.
-     * We'll mprotect down to the user-requested prot at the end. */
-    void *buf = __real_mmap(NULL, length,
-                            PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (buf == MAP_FAILED) {
-        if (DEBUG_HU)
-            L4C_INFO("mmap: anon-backing allocation failed for tracked fd %d", fd);
-        return __real_mmap(addr, length, prot, flags, fd, offset);
-    }
-
-    /* Populate from the FitCache cached copy via the existing pread path.
-     * ms_read returns the number of bytes actually read; anything less than
-     * `length` is treated as logical EOF — the anonymous pages past that
-     * point are already zero-filled, matching file-backed mmap-past-EOF
-     * behaviour closely enough for the workloads we care about. */
-    ssize_t got = ms_read(fd, buf, length, offset);
-    if (got < 0) {
-        /* Last-ditch: try a real pread on the user fd (fastest fallback
-         * for the case where the FitCache server is offline). */
-        got = __real_pread(fd, buf, length, offset);
-    }
-    if (got < 0) {
-        if (DEBUG_HU)
-            L4C_INFO("mmap: read into anon mapping failed for %s (got=%ld); "
-                     "falling back to real mmap", path, (long)got);
-        __real_munmap(buf, length);
-        return __real_mmap(addr, length, prot, flags, fd, offset);
-    }
-
-    /* Apply the caller-requested protection, if it's stricter than what we
-     * allocated with. mprotect is page-aligned by construction since `buf`
-     * came back from mmap. */
-    if (prot != (PROT_READ | PROT_WRITE)) {
-        if (mprotect(buf, length, prot) != 0 && DEBUG_HU) {
-            L4C_INFO("mmap: mprotect on anon mapping returned errno=%d "
-                     "(continuing — read access still works)", errno);
+    /* === Warm-hit direct local-NVMe mmap (2026-05-21 redesign) ===
+     * If a COMPLETE local cached copy of this file exists on the node, hand
+     * back a real file-backed mmap of the cached file so the kernel
+     * page-faults from local NVMe. The 3-way prototype showed this beats both
+     * native PFS mmap AND the old server+Mercury anon-populate path (which was
+     * the bottleneck — single-stream Mercury bulk ~900 MB/s vs Lustre ~2 GB/s
+     * vs local NVMe even faster). No Mercury, no anonymous populate.
+     *
+     * Resolution is purely client-side: fitcache_resolve_cached_path() computes
+     * the deterministic cached path (same std::hash + two-level hash-bin as the
+     * server data mover) and confirms the cached file's size matches the
+     * original (completeness gate). The cached files + their deterministic
+     * paths persist across server restart — sidecar restore rebuilds the
+     * server's map for promotion/eviction, while this client path only needs
+     * the files present on disk. Read-only only; writable MAP_SHARED was
+     * already bypassed above. */
+    char cached_path[4096];
+    if (fitcache_resolve_cached_path(path, cached_path, sizeof(cached_path))) {
+        int cfd = __real_open(cached_path, O_RDONLY);
+        if (cfd >= 0) {
+            /* Honor the caller's prot + sharing flag, but map the CACHED file.
+             * Read-only, so MAP_SHARED has no write-back concern. */
+            int map_flags = (flags & MAP_SHARED) ? MAP_SHARED : MAP_PRIVATE;
+            void *m = __real_mmap(NULL, length, prot, map_flags, cfd, offset);
+            __real_close(cfd);   /* mapping keeps the inode alive after close;
+                                  * also protects an in-use mapping if the
+                                  * reaper unlinks the cached file (Linux
+                                  * unlink-while-mapped semantics). */
+            if (m != MAP_FAILED) {
+                fitcache_mmap_tracker_record(m, length);
+                if (DEBUG_HU)
+                    L4C_INFO("mmap WARM HIT: %s -> %s (direct NVMe mmap, %zu bytes off %ld)",
+                             path, cached_path, length, (long)offset);
+                return m;
+            }
+            if (DEBUG_HU)
+                L4C_INFO("mmap: warm-hit mmap of %s failed (errno=%d); native fallback",
+                         cached_path, errno);
+        } else if (DEBUG_HU) {
+            L4C_INFO("mmap: warm-hit open of %s failed (errno=%d); native fallback",
+                     cached_path, errno);
         }
     }
 
-    /* Track addr → length so the munmap wrapper unmaps the right region. */
-    fitcache_mmap_tracker_record(buf, length);
+    /* === Cold miss: native mmap on the original PFS file ===
+     * Deliberately NOT the Mercury anon-populate path (that was the
+     * bottleneck). The file is already tracked via the open RPC, so the
+     * server data mover promotes it to local cache; the NEXT mmap of this
+     * path becomes a warm hit served directly from NVMe. Cold is therefore
+     * never slower than the native baseline. */
     if (DEBUG_HU)
-        L4C_INFO("mmap: redirected to anon %p (populated %ld of %zu requested bytes)",
-                 buf, (long)got, length);
-    return buf;
+        L4C_INFO("mmap COLD MISS: %s (native PFS mmap; promotion pending)", path);
+    return __real_mmap(addr, length, prot, flags, fd, offset);
 }
 
 /*

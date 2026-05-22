@@ -96,6 +96,29 @@ bool cross_job_enabled() {
     return cached != 0;
 }
 
+bool persist_meta_enabled() {
+    // Sidecar metadata persistence (write-on-promote + restore-on-startup).
+    // Decoupled from cross_job_enabled() so single-job runs can opt in to
+    // cache durability across server restart without engaging the cross-job
+    // registry / peer-lookup / sibling-refresh machinery (which adds
+    // background threads and per-call latency that skewed Horovod ranks at
+    // n=32768/1N in 2026-05-18 testing).
+    //
+    // Auto-on when cross_job_enabled() is true (cross-job mode needs the
+    // sidecars for peer discovery anyway); otherwise opt-in via
+    // FitCache_PERSIST_META=1.
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = std::getenv("FitCache_PERSIST_META");
+        int explicit_on = (v && std::strcmp(v, "1") == 0) ? 1 : 0;
+        cached = (explicit_on || cross_job_enabled()) ? 1 : 0;
+        L4C_INFO("persist_meta_enabled: FitCache_PERSIST_META=%s cross_job=%s -> %s",
+                 v ? v : "(unset)", cross_job_enabled() ? "ON" : "OFF",
+                 cached ? "ON" : "OFF");
+    }
+    return cached != 0;
+}
+
 // Default peer-RPC deadline for the open-time peer_lookup fanout. Picked at
 // the upper end of expected steady-state RPC latency (single-digit ms on
 // Frontier Slingshot) so legitimate slow responses don't hit the watchdog,

@@ -16,6 +16,17 @@ extern "C" {
 
 ssize_t ms_read(int fd, void* buf, size_t count, int64_t offset);
 
+// Warm-hit resolver for the direct-local-mmap path (2026-05-21 redesign).
+// Computes the deterministic cached path for `original_path` in each local
+// tier (FitCache_DRAM/PMEM/NVME_PATH) using the same std::hash<string> +
+// two-level hash-bin scheme the server data mover uses, and checks whether a
+// COMPLETE cached copy exists locally (cached file present AND its size
+// equals the original PFS file's size). On a warm hit, writes the cached
+// local path into `out` (up to outsz) and returns 1; on a miss returns 0.
+// No RPC: resolution is purely client-side + local stat().
+int fitcache_resolve_cached_path(const char *original_path,
+                                 char *out, size_t outsz);
+
 // A structure to hold the asynchronous state for the multi-source read.
 // Visible to wrappers.c (via this header) only as an opaque struct; only
 // the C++ implementation accesses its fields.

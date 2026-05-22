@@ -505,16 +505,16 @@ void *fitcache_data_mover_fn(void *args)
                              original_path.c_str(), filename.c_str(), tier_name);
                 }
 
-                // Cross-job durability: write a sidecar so this cache survives
-                // server restart and can be discovered by peer-job lookups.
-                // Only meaningful in cross-job mode; in single-job mode the
-                // sidecar is harmless extra metadata.
-                if (fitcache::cross_job_enabled()) {
+                // Sidecar durability: write a .meta next to the cached file
+                // so the cache survives server restart. Gated on
+                // persist_meta_enabled() (auto-on under cross-job; opt-in
+                // under FitCache_PERSIST_META=1 for single-job).
+                if (fitcache::persist_meta_enabled()) {
                     // Tag the sidecar with this process's dataset manifest_hash
                     // (populated by subscribe_self_to_local_dataset via the full
                     // build_dataset_id scan). 0 means "this process never
-                    // subscribed", which is the smoke-test path; production
-                    // server startup always subscribes before promotions.
+                    // subscribed", which is the smoke-test or single-job-
+                    // persist-meta path.
                     fitcache::fitcache_file_meta_v1 meta =
                         fitcache::meta_make_initial(
                             original_path,
@@ -527,13 +527,15 @@ void *fitcache_data_mover_fn(void *args)
                         L4C_INFO("Data mover: wrote sidecar for %s",
                                  filename.c_str());
                     }
+                }
 
-                    // Cross-job has_yes=0 fix Option 1: record our presence
-                    // on PFS so peer-job servers can find us in their
-                    // peer_lookup_rpc handlers. This closes the race where
-                    // a peer queries us between open-time (path_cache_map
-                    // empty) and now (cache populated) — the PFS record is
-                    // durable and is consulted in addition to path_cache_map.
+                // Cross-job peer-discovery side-effects of caching this file.
+                // Strictly cross-job-only: the PFS-presence index and the
+                // broadcast register-file RPC are mechanisms that let peer
+                // jobs find this server's cache. Pure single-job persistence
+                // (FitCache_PERSIST_META=1, FitCache_CROSS_JOB=0) skips
+                // these — there are no peers to inform.
+                if (fitcache::cross_job_enabled()) {
                     const std::string &self_addr =
                         fitcache_comm_get_self_addr_string();
                     if (!self_addr.empty()) {
@@ -545,13 +547,6 @@ void *fitcache_data_mover_fn(void *args)
                                      original_path.c_str());
                         }
                     }
-
-                    // Cross-job has_yes=0 fix Option 2: broadcast a
-                    // register-file RPC to every live peer so their
-                    // in-memory remote_presence_map gets updated without
-                    // needing a PFS read on every peer_lookup. PFS presence
-                    // (Option 1) is the durable source-of-truth; this RPC
-                    // is the fast in-cluster path.
                     fitcache_broadcast_register_file(original_path);
                 }
 

@@ -51,6 +51,16 @@ int modulo_select(const std::string &path, int server_count);
 // Cached on first call.
 bool cross_job_enabled();
 
+// Returns true iff persistent metadata sidecars should be written on
+// promote and scanned on server startup. Enabled via FitCache_PERSIST_META=1
+// OR auto-on when cross_job_enabled() (the cross-job machinery needs the
+// sidecars for peer discovery). Cached on first call.
+//
+// Decoupled from cross_job_enabled() so single-job runs can opt in to
+// cache durability across server restart without engaging the cross-job
+// registry / peer-lookup / sibling-refresh background threads.
+bool persist_meta_enabled();
+
 // Read the per-RPC deadline (seconds) the server waits before giving up on a
 // peer's peer_lookup response and falling through to PFS. Default 30.
 // 0 disables the watchdog (legacy "wait forever" behaviour). Negative values

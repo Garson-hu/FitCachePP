@@ -2,9 +2,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cassert>
+#include <cstring>
 #include <mutex>
 #include <vector>
+#include <string>
+#include <functional>
 #include <condition_variable>
+#include <sys/stat.h>
 
 #include "fitcache_internal.h"        // For fitcache_file_tracked, fitcache_get_path, etc.
 #include "fitcache_comm.h"
@@ -262,4 +266,56 @@ static hg_return_t ms_read_cb(const struct hg_cb_info *info)
     pthread_mutex_unlock(&ms->lock);
 
     return HG_SUCCESS;
+}
+// ============================================================
+// Warm-hit resolver for the direct-local-mmap path (2026-05-21).
+// Mirrors the server data mover's cached-path scheme
+// (fitcache_data_mover.cpp): cached file lives at
+//   <tier_base>/<(h>>8)&0xFF>/<h&0xFF>/<basename(original_path)>
+// with h = std::hash<std::string>(original_path). Client and server link the
+// same libstdc++, so the hash matches. A cached copy is "complete" iff it
+// exists AND its size equals the original PFS file's size (the data mover
+// does a full fs::copy before the file is usable). No RPC.
+// ============================================================
+extern "C" int fitcache_resolve_cached_path(const char *original_path,
+                                            char *out, size_t outsz)
+{
+    if (!original_path || !out || outsz == 0) return 0;
+
+    // Original file size = completeness reference.
+    struct stat ost;
+    if (stat(original_path, &ost) != 0 || ost.st_size <= 0) return 0;
+    const off_t orig_size = ost.st_size;
+
+    // Deterministic two-level hash bin (matches data_mover.cpp:482-488).
+    size_t h = std::hash<std::string>{}(std::string(original_path));
+    char subdir[16];
+    snprintf(subdir, sizeof(subdir), "%02zx/%02zx",
+             (h >> 8) & 0xFF, h & 0xFF);
+
+    // basename of the original path.
+    std::string op(original_path);
+    size_t slash = op.find_last_of('/');
+    std::string base = (slash == std::string::npos) ? op : op.substr(slash + 1);
+
+    // Probe tiers in placement priority order: DRAM, PMem, NVMe.
+    const char *tier_env[3] = {
+        getenv("FitCache_DRAM_PATH"),
+        getenv("FitCache_PMEM_PATH"),
+        getenv("FitCache_NVME_PATH"),
+    };
+    for (int i = 0; i < 3; ++i) {
+        const char *t = tier_env[i];
+        if (!t || !t[0]) continue;
+        std::string cand = std::string(t) + "/" + subdir + "/" + base;
+        struct stat cst;
+        if (stat(cand.c_str(), &cst) == 0 && S_ISREG(cst.st_mode) &&
+            cst.st_size == orig_size) {
+            // Warm hit: complete local cached copy.
+            std::strncpy(out, cand.c_str(), outsz - 1);
+            out[outsz - 1] = '\0';
+            return 1;
+        }
+    }
+    return 0;  // miss
 }

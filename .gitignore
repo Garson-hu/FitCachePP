@@ -8,6 +8,8 @@
 # but keep this script
 !/build/clear_cmake.sh
 !/build/build.sh
+tpds_extension/
+/benchmarks/
 
 fitcache_server_log.*
 .ports.cfg.*
