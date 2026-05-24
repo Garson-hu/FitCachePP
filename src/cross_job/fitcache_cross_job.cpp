@@ -85,6 +85,78 @@ int modulo_select(const std::string &path, int server_count) {
     return static_cast<int>(h % static_cast<uint64_t>(server_count));
 }
 
+// ---------------------------------------------------------------------------
+// Experiment 5 — Locality-Aware mmap Cache Placement.
+//
+// mmap warm-hit requires the cached file to live on the SAME node as the
+// requesting rank (direct mmap of a local-NVMe file). The default hash
+// placement (modulo_select) routes each path to hash(path) % total_servers
+// across ALL nodes, which scatters a node's mmap working set across the
+// cluster. When FITCACHE_MMAP_PLACEMENT=node_local, route the promotion-
+// triggering open to a server on the requester's OWN node, so each node's
+// mmap working set is promoted into local NVMe.
+//
+// Locality model: under `srun --ntasks-per-node=spn` (block distribution),
+// server global rank R (= SLURM_PROCID, the .ports.cfg key) lives on node
+// R/spn. The client's node is SLURM_NODEID; spn = server_count / SLURM_NNODES.
+// Local slots = [nodeid*spn, (nodeid+1)*spn). This changes PLACEMENT only;
+// sidecar generation flows through the normal organic promote path on the
+// chosen (now local) server, unchanged.
+// ---------------------------------------------------------------------------
+static std::atomic<long> g_ml_local{0};    // node-local placements made
+static std::atomic<long> g_ml_remote{0};   // anomalous non-local placements (should stay 0)
+
+bool mmap_placement_node_local() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = std::getenv("FITCACHE_MMAP_PLACEMENT");
+        cached = (v && std::strcmp(v, "node_local") == 0) ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+// Returns a local-server slot for `path`, or -1 if node-local routing cannot be
+// applied (missing SLURM topology env, or server_count not divisible by nnodes)
+// — in which case the caller falls back to the default hash placement.
+static int node_local_select(const std::string &path, int server_count) {
+    const char *nn = std::getenv("SLURM_NNODES");
+    if (!nn || !nn[0]) nn = std::getenv("SLURM_JOB_NUM_NODES");
+    const char *nid = std::getenv("SLURM_NODEID");
+    if (!nn || !nid || server_count <= 0) return -1;
+    int nnodes = std::atoi(nn);
+    int nodeid = std::atoi(nid);
+    if (nnodes <= 0 || nodeid < 0 || (server_count % nnodes) != 0) return -1;
+    int spn = server_count / nnodes;
+    if (spn <= 0) return -1;
+
+    static std::atomic<int> logged{0};
+    int expect0 = 0;
+    if (logged.compare_exchange_strong(expect0, 1)) {
+        L4C_INFO("mmap placement_policy=node_local requester_node=%d local_server_count=%d "
+                 "server_count=%d local_slots=[%d,%d)",
+                 nodeid, spn, server_count, nodeid * spn, (nodeid + 1) * spn);
+    }
+
+    uint64_t h = fitcache_fnv1a64(path.data(), path.size());
+    int slot = nodeid * spn + static_cast<int>(h % static_cast<uint64_t>(spn));
+
+    // Verify the selected slot maps back to this node (block-distribution check)
+    // and keep running counts; log a coarse summary every 32 placements.
+    long lc;
+    if (slot / spn == nodeid) { lc = g_ml_local.fetch_add(1) + 1; }
+    else {
+        g_ml_remote.fetch_add(1);
+        L4C_INFO("mmap placement ANOMALY: path=%s slot=%d slot_node=%d != requester_node=%d",
+                 path.c_str(), slot, slot / spn, nodeid);
+        lc = 0;
+    }
+    if (lc > 0 && (lc % 32) == 0) {
+        L4C_INFO("mmap placement summary: local=%ld remote=%ld (policy=node_local node=%d)",
+                 g_ml_local.load(), g_ml_remote.load(), nodeid);
+    }
+    return slot;
+}
+
 bool cross_job_enabled() {
     static int cached = -1;
     if (cached < 0) {
@@ -195,6 +267,14 @@ void refresh_cluster_endpoints() {
 }
 
 int select_server_for_path(const std::string &path, int local_server_count) {
+    // Experiment 5: locality-aware mmap placement (opt-in, default unchanged).
+    // Route the promotion-triggering open to a server on the requester's own
+    // node so the mmap working set lands in local NVMe. Falls through to the
+    // existing placement if topology env is missing / not divisible.
+    if (mmap_placement_node_local()) {
+        int slot = node_local_select(path, local_server_count);
+        if (slot >= 0) return slot;
+    }
     if (!cross_job_enabled()) {
         return modulo_select(path, local_server_count);
     }

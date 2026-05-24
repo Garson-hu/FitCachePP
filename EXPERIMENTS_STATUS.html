@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FitCachePP TPDS Extension — Final Experiment Status</title>
+<style>
+  :root { --fg:#1b1f24; --muted:#57606a; --border:#d0d7de; --bg:#ffffff;
+          --code-bg:#f6f8fa; --accent:#0969da; --th-bg:#f6f8fa; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e6edf3; --muted:#9198a1; --border:#30363d; --bg:#0d1117;
+            --code-bg:#161b22; --accent:#4493f8; --th-bg:#161b22; }
+  }
+  * { box-sizing:border-box; }
+  body { color:var(--fg); background:var(--bg);
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+         line-height:1.55; max-width:1000px; margin:0 auto; padding:2.5rem 1.5rem 5rem; }
+  h1,h2,h3 { line-height:1.25; margin-top:1.7em; margin-bottom:.55em; font-weight:600; }
+  h1 { font-size:1.85rem; border-bottom:1px solid var(--border); padding-bottom:.3em; }
+  h2 { font-size:1.4rem; border-bottom:1px solid var(--border); padding-bottom:.25em; }
+  h3 { font-size:1.12rem; }
+  a { color:var(--accent); text-decoration:none; }
+  code { background:var(--code-bg); padding:.13em .35em; border-radius:6px;
+         font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:.86em; }
+  table { border-collapse:collapse; width:100%; margin:1em 0; font-size:.88rem; display:block; overflow-x:auto; }
+  th,td { border:1px solid var(--border); padding:.42em .65em; text-align:left; vertical-align:top; }
+  th { background:var(--th-bg); font-weight:600; }
+  tr:nth-child(even) td { background:var(--code-bg); }
+  .badge { display:inline-block; padding:.08em .55em; border-radius:11px; font-size:.74rem;
+           font-weight:600; color:#fff; white-space:nowrap; }
+  .badge.done  { background:#1e8e3e; }
+  .badge.supp  { background:#5f6368; }
+  .badge.trade { background:#e0a400; color:#1b1f24; }
+  .badge.bad   { background:#c5221f; }
+  .note { color:var(--muted); font-size:.92em; }
+  hr { border:none; border-top:1px solid var(--border); margin:2.2em 0; }
+  footer { margin-top:3em; padding-top:1.2em; border-top:1px solid var(--border);
+           color:var(--muted); font-size:.84rem; }
+</style>
+</head>
+<body>
+
+<h1>FitCachePP TPDS Extension — Final Experiment Status</h1>
+<p class="note">Organized by contribution, not by historical order. Companion pages:
+<a href="tpds_extension/design.html">design.html</a> ·
+<a href="tpds_extension/experiments.html">experiments.html</a> ·
+<a href="tpds_extension/paper.html">paper.html</a>.</p>
+
+<h2>Summary</h2>
+<table>
+<tr><th>Contribution</th><th>Status</th><th>One-line result</th></tr>
+<tr><td><strong>1. Transparent mmap Cache Path</strong></td>
+    <td><span class="badge done">DONE</span></td>
+    <td>Warm-hit local-NVMe mmap beats <code>Native_mmap_PFS</code> across three workload classes; magnitude tracks PFS access pattern (1.2&times;&ndash;33&times;).</td></tr>
+<tr><td><strong>2. Access-Aware mmap Cache Placement</strong></td>
+    <td><span class="badge done">DONE</span></td>
+    <td>Node-local placement removes hash scatter (fallback 0, remote 0); partitioned access caches disjoint sets at 1.0&times; duplication.</td></tr>
+<tr><td>Sidecar-Based Cache-State Recovery</td>
+    <td><span class="badge supp">Supporting</span></td>
+    <td>Sidecar metadata restores server cache-state after a metadata-service restart; not the bandwidth source.</td></tr>
+<tr><td>Cross-job cache sharing</td>
+    <td><span class="badge supp">Future work</span></td>
+    <td>Deferred; no new compute. Not a claim in this paper.</td></tr>
+</table>
+
+<hr>
+
+<h2>Contribution 1 — Transparent mmap Cache Path <span class="badge done">DONE</span></h2>
+<p>An LD_PRELOAD client transparently redirects <code>mmap</code> to a local-NVMe cached copy on a warm hit
+(<code>fitcache_resolve_cached_path()</code>: client-side, deterministic hash-bin, size-match completeness gate, no RPC),
+and falls back to native PFS mmap on a cold miss while promoting the file for next time. Two views are reported for every
+result: warm-hit-only (mechanism) and amortized including pre-stage cost. Every cell passes a hard FitCachePP-vs-Native
+checksum-equality gate plus a decode gate where applicable.</p>
+
+<table>
+<tr><th>Workload class</th><th>Scale</th><th>Warm-hit speedup</th><th>Amortized break-even</th><th>Gate</th></tr>
+<tr><td>Megatron IndexedDataset (dense-sequential LLM)</td><td>N=1,2,4,8,16; 640 GiB/node, 40 shards</td><td>1.22&times;&ndash;1.60&times;</td><td>3&ndash;4 epochs</td><td>PASS</td></tr>
+<tr><td>GNN feature gather, IGB-large (sparse-random)</td><td>N=1,2,4,8,16; 902 GB feature+CSR</td><td>18&times;&ndash;33&times;</td><td>1 epoch</td><td>PASS (per-rank)</td></tr>
+<tr><td>DINOv2 / CC12M tar-shard load (sequential vision)</td><td>N=1,2,4,8,16; full corpus 996/996 shards, 541 GB/node &gt; RAM</td><td>1.63&times;&ndash;1.95&times;</td><td>2&ndash;3 passes</td><td>PASS + decode 10956</td></tr>
+</table>
+
+<p class="note"><strong>Mechanism / honesty.</strong> Magnitude is bounded by the PFS access pattern. Random small reads
+on Lustre (GNN ~3&ndash;4 MB/s per faulted page) are where local-NVMe direct mmap wins biggest (18&ndash;33&times;);
+dense-sequential reads (Megatron, DINOv2) win modestly (~1.3&ndash;1.6&times;) because Frontier Lustre sequential bandwidth is
+already high. The full-corpus DINOv2 run uses a working set &gt; node RAM, ruling out a page-cache artifact. Claims are scoped
+to mmap-backed data <em>loading</em>, not end-to-end model training.
+Result base: <code>benchmarks/results/frontier/{megatron,gnn,dinov2}_warmhit_sweep/</code>.</p>
+
+<hr>
+
+<h2>Contribution 2 — Access-Aware mmap Cache Placement <span class="badge done">DONE</span></h2>
+<p>A warm-hit needs the cached file on the requester's own node. Default <code>hash</code> placement scatters a node's mmap set
+across the cluster. Access-aware placement (<code>FITCACHE_MMAP_PLACEMENT=node_local</code> branch in
+<code>select_server_for_path()</code>, <code>src/cross_job/fitcache_cross_job.cpp</code>; default <code>hash</code> unchanged) routes
+promotion to node-local servers. Two access patterns are covered: <strong>shared</strong> (all nodes read the same set, each
+replicates locally) and <strong>partitioned</strong> (nodes read disjoint sets, each caches only its own).</p>
+
+<h3>Node-local placement cells (fallback 0, remote 0 everywhere)</h3>
+<table>
+<tr><th>Cell</th><th>Per-node working set</th><th>Node-0 cached</th><th>Restored</th><th>Fallback</th><th>Remote</th><th>Checksum</th></tr>
+<tr><td>Megatron N=2</td><td>40</td><td>40</td><td>40/40</td><td>0</td><td>0</td><td>PASS</td></tr>
+<tr><td>Megatron N=4</td><td>40</td><td>40</td><td>40/40</td><td>0</td><td>0</td><td>PASS</td></tr>
+<tr><td>GNN N=2</td><td>6</td><td>6</td><td>6/6</td><td>0</td><td>0</td><td>PASS (per-rank)</td></tr>
+<tr><td>DINOv2 N=2 shared</td><td>996</td><td>996</td><td>996/996</td><td>0</td><td>0</td><td>PASS + decode 10956</td></tr>
+<tr><td>DINOv2 N=2 partitioned</td><td>498</td><td>498</td><td>498/498</td><td>0</td><td>0</td><td>PASS (per-rank) + decode 5478</td></tr>
+<tr><td>hash baseline (Megatron N=2)</td><td>40</td><td>18</td><td>18+22 global</td><td>22</td><td>n/a</td><td>PASS</td></tr>
+</table>
+
+<h3>Placement vs access pattern (core comparison)</h3>
+<table>
+<tr><th>Mode</th><th>Access pattern</th><th>Per-node cached</th><th>Global physical copies</th><th>Dup factor</th><th>Fallback</th><th>Remote</th><th>Correct</th></tr>
+<tr><td>hash</td><td>global hash</td><td>scattered (18/40)</td><td>~1&times;</td><td>~1&times;</td><td>nonzero (22)</td><td>n/a</td><td>PASS</td></tr>
+<tr><td>node_local shared</td><td>all nodes same 996</td><td>996</td><td>1992</td><td><strong>2.0&times;</strong></td><td>0</td><td>0</td><td>PASS</td></tr>
+<tr><td>node_local partitioned</td><td>disjoint 498/node</td><td>498</td><td>996</td><td><strong>1.0&times;</strong></td><td>0</td><td>0</td><td>PASS</td></tr>
+</table>
+
+<p class="note"><strong>Headline.</strong> The mmap path provides the steady-state access speedup; access-aware placement ensures
+the data is actually node-local. Placement eliminates hash scatter (per-node fallback 0, remote 0) while avoiding unnecessary
+replication for partitioned access: partitioned DINOv2 N=2 gives full local mmap hits at duplicate factor <strong>1.0&times;</strong>
+(global unique 996 = node0 [0,497] + node1 [498,995]), versus shared mode's 2.0&times;. Shared local replication is a deliberate
+tradeoff; partitioned avoids full replication. Placement only; the sidecar and organic-promote path are unchanged.
+Result base: <code>benchmarks/results/frontier/sidecar_recovery/*_{nodelocal,partitioned}/</code>.</p>
+
+<hr>
+
+<h2>Supporting Mechanism — Sidecar-Based Cache-State Recovery <span class="badge supp">Supporting</span></h2>
+<p>A <code>.meta</code> sidecar is written per cached file by the data mover on organic promotion. After a FitCachePP
+metadata-service restart, <code>restore_from_sidecars</code> rebuilds the server-side cache-state map so original PFS paths warm-hit
+local NVMe again. This restores reusable cache <em>state</em> and reduces cold metadata recovery; it is <strong>not</strong> the source
+of the warm-hit bandwidth and does not improve every epoch. The client warm-hit resolver is server-map-independent.
+Harness: <code>scripts/frontier/frontier_sidecar_recovery.sh</code>. Result base:
+<code>benchmarks/results/frontier/sidecar_recovery/</code>.</p>
+
+<h3>Recovery (N=1, all gates PASS)</h3>
+<table>
+<tr><th>Bench</th><th>Sidecars</th><th>Restore</th><th>Restored/missing</th><th>Fallback</th><th>Checksum/decode</th></tr>
+<tr><td>Megatron</td><td>40</td><td>fast</td><td>40 / 0</td><td>0</td><td>PASS</td></tr>
+<tr><td>GNN</td><td>6</td><td>6 s</td><td>6 / 0</td><td>0</td><td>PASS</td></tr>
+<tr><td>DINOv2</td><td>996</td><td>8 s</td><td>996 / 0</td><td>0</td><td>PASS + decode 10956</td></tr>
+</table>
+
+<h3>With-sidecar vs no-sidecar ablation (DINOv2 full corpus, N=1)</h3>
+<table>
+<tr><th>Arm</th><th>Server restored</th><th>Restore time</th><th>Cache_hit / fallback</th><th>Finding</th></tr>
+<tr><td>with sidecar</td><td>996 / 996</td><td>5 s</td><td>996 / 0</td><td>Server restores authoritative cache-state map; no re-promotion churn.</td></tr>
+<tr><td>no sidecar</td><td>0 / 996</td><td>n/a</td><td>996 / 0</td><td>Client still warm-hits (resolver is server-map-independent); server starts empty and must rediscover.</td></tr>
+</table>
+<p class="note">Both arms raw-checksum correct and decode 10956. The sidecar buys server-side cache-state recovery, not the
+client bandwidth.</p>
+
+<h3>Restore scaling (DINOv2, metadata-restore only)</h3>
+<table>
+<tr><th>Shards</th><th>Sidecar entries</th><th>Meta bytes</th><th>Restore time</th><th>Entries/sec</th></tr>
+<tr><td>32</td><td>32</td><td>34,304</td><td>6 s</td><td>5.3</td></tr>
+<tr><td>256</td><td>256</td><td>274,432</td><td>5 s</td><td>51.2</td></tr>
+<tr><td>996</td><td>996</td><td>1,067,712</td><td>5 s</td><td>199.2</td></tr>
+</table>
+<p class="note">Restore time is ~flat (5&ndash;6 s) and startup/scan-dominated, independent of object count. Sidecar metadata is
+tiny (~1 KB/entry; 996 objects = ~1 MB).</p>
+
+<hr>
+
+<h2>Superseded / Do Not Cite <span class="badge bad">Superseded</span></h2>
+<ul>
+<li><strong>Eager-populate mmap (server + Mercury anon-mmap) path</strong> — replaced by the warm-hit direct-NVMe redesign. It
+added a PFS&rarr;server&rarr;client hop and could not beat <code>Native_mmap_PFS</code> in any single-pass regime.</li>
+<li><strong>1 TB sharded Megatron sweep (16 GiB shards)</strong> — <span class="badge bad">INVALID</span>. Hit the ~2 GiB read-truncation
+bug; FitCachePP read only ~1/8 of each shard and zero-filled the tail. The "order-of-magnitude speedup" was an artifact.
+Fixed (server short-read loop + &le;1 GiB chunked populate) and superseded by the warm-hit sweep above.</li>
+<li><strong>10 GB single-file Megatron compare</strong> — same truncation bug; demoted.</li>
+<li><strong>950-shard / 95.4% DINOv2 single-node run</strong> — superseded by the 100%-corpus (996/996) sweep.</li>
+<li><strong>32-shard / partial-coverage DINOv2 passes</strong> — retained only as a coverage table; the full-corpus result is the
+reported one.</li>
+<li><strong>216 MB synthetic DINOv2 I/O run</strong> — compatibility-only; never a valid performance result.</li>
+</ul>
+
+<footer>
+Last updated: 2026-05-24<br>
+Generated from markdown source, but updated to reflect latest final results. Markdown source was not modified.
+</footer>
+
+</body>
+</html>
