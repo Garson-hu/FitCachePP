@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FitCachePP — Worklog</title>
+<style>
+  :root { --fg:#1b1f24; --muted:#57606a; --border:#d0d7de; --bg:#ffffff;
+          --code-bg:#f6f8fa; --accent:#0969da; --th-bg:#f6f8fa; }
+  * { box-sizing:border-box; }
+  body { color:var(--fg); background:var(--bg);
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+         line-height:1.55; max-width:1000px; margin:0 auto; padding:2.5rem 1.5rem 5rem; }
+  h1,h2,h3 { line-height:1.25; margin-top:1.7em; margin-bottom:.55em; font-weight:600; }
+  h1 { font-size:1.85rem; border-bottom:1px solid var(--border); padding-bottom:.3em; }
+  h2 { font-size:1.25rem; border-bottom:1px solid var(--border); padding-bottom:.25em; }
+  h3 { font-size:1.05rem; }
+  a { color:var(--accent); text-decoration:none; }
+  code { background:var(--code-bg); padding:.13em .35em; border-radius:6px;
+         font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:.86em; }
+  table { border-collapse:collapse; width:100%; margin:1em 0; font-size:.88rem; display:block; overflow-x:auto; }
+  th,td { border:1px solid var(--border); padding:.42em .65em; text-align:left; vertical-align:top; }
+  th { background:var(--th-bg); font-weight:600; }
+  tr:nth-child(even) td { background:var(--code-bg); }
+  ul,ol { padding-left:1.3em; }
+  li { margin:.3em 0; }
+  .note { color:var(--muted); font-size:.92em; }
+  .entry { margin-top:2.2em; padding-top:.4em; }
+  hr { border:none; border-top:1px solid var(--border); margin:2.2em 0; }
+  footer { margin-top:3em; padding-top:1.2em; border-top:1px solid var(--border);
+           color:var(--muted); font-size:.84rem; }
+</style>
+</head>
+<body>
+
+<h1>FitCachePP — Worklog</h1>
+<p class="note">Chronological engineering log, most recent first. Companion pages:
+<a href="EXPERIMENTS_STATUS.html">EXPERIMENTS_STATUS.html</a> ·
+<a href="tpds_extension/design.html">design.html</a> ·
+<a href="tpds_extension/experiments.html">experiments.html</a> ·
+<a href="tpds_extension/paper.html">paper.html</a>.</p>
+
+<div class="entry">
+<h2>2026-05-19 — TPDS contribution pivot: mmap interceptor + sidecar warm-restart land as the two new mechanisms; cross-job becomes future work</h2>
+<p>After the cross-job campaign concluded with weak wall-time savings + recurring <code>DataLossError</code> flakiness (see 2026-05-17 / 2026-05-18 entries below), the TPDS contribution shape was revised. <strong>Two new mechanisms now anchor the paper, with cross-job sharing demoted to secondary / future work:</strong></p>
+<ol>
+<li><strong>Primary new contribution — mmap interceptor + LLM workload generalization.</strong> The IPDPS-paper FitCache intercepted only <code>{open, read, pread, close}</code>; page-fault reads from <code>mmap</code>-based loaders (numpy.memmap, Megatron <code>IndexedDataset</code>, DINOv2 ImageNet tarballs) silently bypassed the cache. The <code>src/client/wrappers.c::mmap</code> intercept allocates an anonymous region and eager-populates it via <code>ms_read</code> at <code>mmap()</code> time. Validation: bit-identical Megatron <code>lm_loss=6.1157</code> between FitCachePP and Pure_CF; <strong>11.5&times; cold-state throughput</strong> (894 MB/s vs 78 MB/s) on a 10 GB synthetic Megatron <code>IndexedDataset</code>; 1.93&times; amortized over 20 K iterations &times; batch 16 &times; seq 1024.</li>
+<li><strong>Second technical contribution — persistent sidecar metadata + warm-restart recovery.</strong> Each cached file gets a <code>.meta</code> sidecar (magic + version + <code>original_path</code> + <code>original_size</code> + <code>cached_at_unix</code> + <code>access_count</code>) written atomically alongside the data file. On server startup, <code>restore_from_sidecars()</code> scans the tier directories and rebuilds <code>path_cache_map</code> so the next training process hits the cache without refetching from PFS. <strong>Validation run (2026-05-19):</strong> Phase 1 cold (empty cache) epoch wall 340 s &rarr; kill server &rarr; Phase 3 warm-after-restart (scanned 33,789 sidecars) epoch wall <strong>260 s</strong> (= warm-baseline 285 s within noise, 80 s faster than cold-from-empty). Mechanism rebuilt <code>path_cache_map</code> with <strong>33,789</strong> entries on every one of the 4 server ranks.</li>
+<li><strong>Future / secondary — cross-job sharing.</strong> Mechanism is functional and validated end-to-end (peer_lookup, redirect_to_peer, has_yes counters work as designed). Wall-time benefit is structurally bounded (I/O fraction of cold epoch + consumer local-cache absorption). Concurrent mode has a recurring <code>DataLossError: inflate() failed</code> that is un-root-caused. Kept in the paper as secondary prototype evidence / future work.</li>
+</ol>
+<p><strong>Engineering change that enabled the sidecar validation:</strong> decoupled sidecar write + restore from <code>FitCache_CROSS_JOB</code>. The original gate ran the cross-job machinery (registry init + sibling-refresh threads) for any test that wanted sidecar persistence; those threads skewed Horovod ranks 2 + 7 at n=32768/1N. New flag <code>FitCache_PERSIST_META=1</code> (auto-on under cross-job; opt-in otherwise) gates just the sidecar write + restore. Code: <code>bool persist_meta_enabled()</code> in <code>src/cross_job/fitcache_cross_job.{h,cpp}</code>; gate replaced at <code>src/server/fitcache_data_mover.cpp:512</code> and <code>src/server/fitcache_server.cpp:179</code>. 16/16 cross-job smoke tests pass.</p>
+<p><strong>Operational note:</strong> the Frontier queue parked the original sidecar validation 19 hours behind other jobs for a ~13-minute experiment. Rule encoded: under <code>QOS=debug</code>, cancel + resubmit whenever a pending job's start time is many hours away while its time limit is short.</p>
+<p><strong>Next steps:</strong></p>
+<ul>
+<li>Restructure <code>tpds_extension/05_implementation_notes.md</code> around the three-contribution shape (done this session).</li>
+<li>Optional: re-run warm-restart at full IPDPS n=524288 to characterise the sidecar-scan walk time at 524K <code>.meta</code> files.</li>
+<li>Optional: rerun the LLM dataloader at a corpus large enough that the warm-state Pure_CF advantage disappears (50&ndash;100 GB to isolate the cold-state advantage from page-cache amortization).</li>
+</ul>
+</div>
+
+<div class="entry">
+<h2>2026-05-18 — 16-node strong-scaling + 3-run averaging; full IPDPS training set; LLM dataloader 11.5&times; cold; cross-job sharing limits identified</h2>
+<ul>
+<li><strong>16-node n=131072 single-job:</strong> cold <strong>140 s</strong>, warm <strong>73 s</strong>, mean 106 s, wall 979 s. 2.6&times; strong-scaling speedup over 1-node n=32768.</li>
+</ul>
+<p><strong>Three-run averaging</strong> for headline single-job configurations:</p>
+<table>
+<tr><th>Configuration</th><th>Cold mean ± std</th><th>Warm mean ± std</th><th>n</th></tr>
+<tr><td>1-node n=32768</td><td>352 ± 10 s</td><td>289 ± 3 s</td><td>3</td></tr>
+<tr><td>4-node n=131072</td><td>369 ± 7 s</td><td>290 ± 3 s</td><td>3</td></tr>
+<tr><td>16-node n=131072</td><td>140 s</td><td>73 s</td><td>1</td></tr>
+</table>
+<ul>
+<li><strong>Full IPDPS training set at 16 nodes:</strong> first clean run exercising all 524288 training tfrecords. Cold <strong>365 s</strong>, warm <strong>302 s</strong>, mean 333 s, wall 917 s. Cold-epoch wall within 1 s of the 1-node baseline — weak-scaling overhead essentially zero.</li>
+<li><strong>LLM dataloader benchmark (10 GB synthetic Megatron IndexedDataset):</strong> FitCachePP cold 894 MB/s vs Pure_CF cold 78 MB/s = <strong>11.5&times; cold-state speedup</strong>; amortized over 20 K iters <strong>1.93&times;</strong> (855 vs 443 MB/s). Built <code>generate_synth_corpus.py</code> + <code>llm_dataloader_bench.py</code>.</li>
+<li><strong>Cross-job warm-provider controlled experiment (null result).</strong> Consumer cold = <strong>354 s</strong> (matches single-job 352 s) with <code>has_yes</code> ≤ 27. Structural cause: consumer local NVMe cache absorbs the per-rank working set (~20 GB) within epoch 1.</li>
+<li><strong>Cross-job multi-node concurrent escalation (recurring flakiness).</strong> Consumer crashed with <code>DataLossError: inflate() failed with error -3</code> in epoch 1 — same corruption pattern as every prior concurrent attempt at scale.</li>
+<li><strong>Cross-job summary:</strong> mechanism validated end-to-end; per-call profiling confirms peer reads ~10% faster than local-HRW. Wall benefit bounded by I/O fraction + local-cache absorption. One clean data point stands (consumer cold 338 s vs single-job 352 s, <strong>−14 s</strong>). Concurrent-mode <code>DataLossError</code> is a real defect, un-root-caused.</li>
+</ul>
+</div>
+
+<div class="entry">
+<h2>2026-05-17 — 4-servers-per-node fix unblocks n=32768; cross-job speedup scales 9&times; at larger dataset; multi-node weak-scaling clean; Megatron + DINOv2 re-verified</h2>
+<ul>
+<li><strong>4-servers-per-node fix landed and unblocks n=32768.</strong> A single server progress thread serialised RPC handlers on slow Lustre <code>open()</code> under MDS contention. Bumping <code>SERVERS_PER_NODE=4</code> distributes the hashring across four progress threads. n=32768 single-job then completed: cold 366 s, warm 285 s, wall 708 s, 65,764 opens, no stall.</li>
+</ul>
+<p><strong>Cross-job sharing wall-time speedup scales with dataset size:</strong></p>
+<table>
+<tr><th>Dataset</th><th>Single-job cold</th><th>Cross-job consumer cold</th><th>Δ</th><th>Rel. speedup</th><th>Redirects/opens</th></tr>
+<tr><td>n=8192 (~8 GB)</td><td>135 s</td><td>132 s</td><td>−3 s</td><td>−2.2%</td><td>4790 / 8226 = 58%</td></tr>
+<tr><td>n=32768 (~32 GB)</td><td>366 s</td><td><strong>338 s</strong></td><td><strong>−28 s</strong></td><td><strong>−7.7%</strong></td><td>7036 / 33456 = 21%</td></tr>
+</table>
+<ul>
+<li><strong>Per-call profiling captured.</strong> n=8192 consumer histogram: raw Lustre <code>__real_pread</code> 1033 µs/call, FitCache local-server HRW 613 µs, FitCache <strong>peer-server 551 µs</strong> — peer reads ~10% faster than local HRW. Predicted wall savings matches the observed 135&rarr;132 s exactly.</li>
+<li><strong>4-node n=131072 single-job</strong> clean weak-scaling: cold 375 s, warm 289 s, mean 332 s, wall 723 s. Epoch only 9 s slower than 1-node.</li>
+<li><strong>16-node n=131072 first submission failed</strong> on a cosmoflow divisibility check (default <code>n_valid=256</code> doesn't divide 128 ranks × batch 4 = 512). Patched to export <code>FITPP_N_VALID=1024</code>.</li>
+<li><strong>Megatron-LM correctness check passed.</strong> GPT pretrain (12 layers, 200 iters, enwik8): bit-identical <code>lm_loss=6.1157</code>. Wall: FitCachePP 66 s vs Pure_CF 77 s.</li>
+<li><strong>DINOv2 compatibility check passed.</strong> I/O-only iterator completes under both; FitCachePP slower (5 s vs 2 s) because the workload is too I/O-light (216 MB) to amortize RPC overhead. Compatibility, not regression.</li>
+<li><strong>Two failed attempts at cross-job peer-death recovery, both reverted.</strong> Both reproduced <code>DataLossError: inflate() failed</code> on the producer's first IteratorGetNext. Cause not root-caused; recorded that <code>ms_read</code> init is fragile.</li>
+</ul>
+</div>
+
+<div class="entry">
+<h2>2026-05-12 — Single-job CosmoFlow baseline complete, sidecar restore validated; cross-job-concurrent and real-PMem investigation</h2>
+<p>End-to-end cluster experiments after fixing 6+ session bugs (path-filter mismatch in train.py vs FitCache_DATA_DIR, mpirun-strips-env, parallel-srun-deadlock, hardcoded overrides, unbound var under <code>set -u</code>).</p>
+<p><strong>Single-job FitCachePP-vs-Pure_CF CosmoFlow baseline</strong>, n_train=8192 on c66 (1 GPU, 188 GB RAM):</p>
+<table>
+<tr><th>Cell</th><th>Mean epoch</th><th>Cold ep1</th><th>Warm ep2-5</th><th>σ</th></tr>
+<tr><td>Pure_CF, OS-warm ×2</td><td>842 s</td><td>856 / 855</td><td>841 s</td><td>&lt; 2 s</td></tr>
+<tr><td>Pure_CF OS-cold</td><td>840 s</td><td>855 s</td><td>838 s</td><td>1 rep</td></tr>
+<tr><td>FitCachePP, OS-warm ×3</td><td>905 s</td><td>940-941</td><td>897 s</td><td>&lt; 3 s</td></tr>
+<tr><td>FitCachePP OS-cold ×1.5</td><td>899 s</td><td>935-936</td><td>891 s</td><td>&lt; 2 s</td></tr>
+</table>
+<p><strong>Headline:</strong> at n_train=8192/1-GPU, <strong>FitCachePP adds 58 s = +7% overhead</strong>. Root cause: train_61440 dataset (167 GB) fits in c66's 188 GB RAM, so OS page cache absorbs the working set and the local-NVMe cache has nothing structural to win against. GPU compute (~205 ms/step × 4096 steps = 840 s) is the bottleneck, not I/O.</p>
+<p><strong>Two-job sequential, sidecar restoration across job boundary</strong> (shared local cache):</p>
+<table>
+<tr><th>Job</th><th>Cold ep1</th><th>Warm ep2-4</th><th>Sidecars at startup</th></tr>
+<tr><td>Job A (no prior cache)</td><td>1023 s</td><td>863 s ± 2 s</td><td>0</td></tr>
+<tr><td><strong>Job B (sidecar restore)</strong></td><td><strong>979 s</strong></td><td>864 s ± 1 s</td><td><strong>9,216</strong></td></tr>
+</table>
+<p><strong>Headline:</strong> Job B rebuilt path_cache_map from 9,216 sidecars; epoch-1 = 979 s = Job A cold (1023 s) − 44 s = the cache-promotion overhead Job B avoided. <strong>The persistent-sidecar-metadata mechanism is validated.</strong></p>
+<p><strong>Two-job concurrent peer_lookup redirect — UNRESOLVED.</strong> Both attempts cancelled stuck on epoch 1. peer_lookup RPCs fire (11,662 forwarded) but every response is has_no across 12,196 lookups. Hypothesis: HRW with 8 servers picks different servers across jobs for the same path. Deferred.</p>
+<p><strong>Real DAX-mode PMem hardware evaluation on c35.</strong> Two sustained-read micro-benchmarks: warm-vs-cold 0.13&times; (local /tmp source) and 0.21&times; (BeeGFS source). The cache-hit path pays ~250 ms per-open RPC overhead; PMem vs NVMe doesn't matter at this granularity. Tier placement on real PMem works end-to-end. CosmoFlow follow-up infeasible: c35 has DAX PMem but no GPU; GPU nodes have no DAX PMem.</p>
+<p><strong>Workload-generalization (Megatron-LM + DINOv2) — architectural limit.</strong> Both use <code>mmap</code>-based zero-copy reads; the LD_PRELOAD client intercepts <code>open/read/pread</code> but not <code>mmap</code>, so page-fault reads bypass FitCachePP. Three options for the paper: drop these workloads, add an mmap interceptor, or reframe the contract as syscall-based-I/O only. (The mmap interceptor was later chosen — see 2026-05-19.)</p>
+</div>
+
+<div class="entry">
+<h2>2026-05-11 (latest) — Post-engineering hardening pass: HRW addr-in-hash, cross-job telemetry, PMem tier</h2>
+<p>Picked up after a two-job concurrent run surfaced a routing collapse: identical <code>/etc/machine-id</code> across hosts made <code>node_uuid</code> identical, so the HRW score tied across hosts and all paths landed on whichever host registered first. Five changes landed:</p>
+<ul>
+<li><strong>HRW addr-in-hash fix.</strong> Appended <code>s.addr</code> (the Mercury endpoint string, unique per endpoint) to the HRW input. Breaks the tie; preserves behaviour for clusters with distinct machine-ids.</li>
+<li><strong>Cross-job telemetry counters.</strong> Eight atomic counters for open + peer-lookup events; periodic info line emitted from the heartbeat thread when <code>FitCache_CROSS_JOB=1</code>, gated so single-job runs stay silent.</li>
+<li><strong>Bit-equivalence smoke.</strong> Same 8-file workload with <code>FitCache_CROSS_JOB=0</code> and <code>=1</code>; per-file sha256 of cached payloads matches across passes and against source. PASS.</li>
+<li><strong>Opt-in PMem tier.</strong> Added <code>CACHE_TIER_PMEM=4</code>; placement priority DRAM &rarr; PMem &rarr; NVMe; restore-sidecars scans the PMem dir; eviction reaper handles the third tier. Dormant when env vars unset.</li>
+<li><strong>Three-tier pilot scripts.</strong> Local smoke verified 4/4/4 placement split across DRAM/PMem/NVMe and full restoration of all 12 files from sidecars per-tier across server restart. Cluster pilot deferred (no node with both GPU and DAX PMem).</li>
+</ul>
+<p><strong>MAJOR FINDING:</strong> every cluster CosmoFlow run in this session executed with <strong>zero FitCache Open RPCs</strong>. Likely root cause: <code>FitCache_DATA_DIR</code> points at <code>train_61440/train/</code> but <code>train.py</code> reads <code>train_1024</code> per <code>configs/cosmo.yaml</code>, and the LD_PRELOAD path filter doesn't match — all reads pass through to BeeGFS direct. Implication: the prior "cold epoch −45%" / "per-job wall −14%" / "aggregate −57%" numbers should NOT be quoted until the path-filter mismatch is fixed and reruns verify the pathway is engaged. What is still defended: bit-equivalence smoke, three-tier local smoke, unit smoke suite, and the HRW addr-in-hash fix.</p>
+</div>
+
+<div class="entry">
+<h2>2026-05-11 (later) — End-to-end cross-job sharing proven on Mercury; cluster experiments started</h2>
+<p>Multi-server localhost smoke harness — the first real Mercury test of the cross-job redirect path. Surfaced and fixed three bugs:</p>
+<ol>
+<li><strong>Silent hang on lookup_addr=NULL.</strong> Three RPC functions returned without firing the per-file sync context when lookup returned NULL, blocking the caller forever. Now all three signal <code>-1</code> so the wait unblocks.</li>
+<li><strong><code>std::string</code> global state silently zeroed mid-process.</strong> Registry globals had their heap-backed <code>c_str()</code> become <code>""</code> between write and first read. Workaround: fixed-size <code>char[1024]</code> buffers with thin getters, never reallocated after init.</li>
+<li><strong><code>ms_read</code> missing peer-slot override.</strong> Reads on a redirected fd went back to the HRW-chosen server. Fixed: <code>ms_read</code> now consults the peer-slot override before HRW selection.</li>
+</ol>
+<p><strong>Smoke harness result:</strong> 5 peer_lookup hits, 5 server-side redirects, 5 client-side redirects handled, all 8 files read end-to-end. Cross-job sharing proven on real Mercury for the first time.</p>
+<p><strong>First cluster experiment:</strong> single-job baseline on c66, epochs 362 / 189 / 188 / 188 / 186 s, cold/warm speedup 1.93&times;; peer_lookup and sidecar counters correctly zero in single-job mode.</p>
+<p><strong>Two-job concurrent experiment:</strong> after fixing a registry race (switched to one file per server-instance), the second attempt ran clean:</p>
+<table>
+<tr><th>Metric</th><th>Single-job baseline</th><th>Two-job concurrent</th><th>Δ</th></tr>
+<tr><td>Cold epoch</td><td>362 s</td><td>~199 s</td><td><strong>−45%</strong></td></tr>
+<tr><td>Per-job wall</td><td>19m00s</td><td>16m19s</td><td><strong>−14%</strong></td></tr>
+<tr><td>Aggregate I/O work (2 jobs)</td><td>38m00s sequential</td><td>16m19s concurrent</td><td><strong>−57%</strong></td></tr>
+</table>
+<p class="note">Caveat: c70 and c71 share <code>/etc/machine-id</code>, so HRW scores tied and routing wasn't node-balanced. (Superseded by the 2026-05-11 path-filter finding above: these numbers should not be quoted until reruns verify the FitCache pathway is engaged.)</p>
+</div>
+
+<div class="entry">
+<h2>2026-05-11 — Cross-job extension engineering work complete (four mechanisms)</h2>
+<p>Four commits land the open-time peer-fanout path, persistent sidecar metadata, refcount-respecting eviction, and the subscriber-lease machinery (~1,500 LOC, within the ~1,600 LOC budget).</p>
+<ul>
+<li><strong>Open-time peer-lookup fanout.</strong> Server-side async state machine: on <code>path_cache_map</code> miss with cross-job on, fan out <code>fitcache_peer_lookup_rpc</code> to every live peer; first <code>has=1</code> wins, open returns <code>FITCACHE_OPEN_REDIRECT</code> plus the peer's Mercury addr. Client registers the peer addr as a routing slot and re-issues the open.</li>
+<li><strong>Persistent sidecar metadata.</strong> New module: atomic write (tmp+fsync+rename), magic+version-validated read, flock-serialised refcount RMW, directory scan that quarantines corrupt sidecars to <code>.broken</code>. Server startup scans DRAM + NVMe paths and rebuilds <code>path_cache_map</code> + used-bytes counters.</li>
+<li><strong>Refcount-respecting eviction + background reaper.</strong> Picks lowest-<code>access_count</code> among refcount=0 sidecars; refcount&gt;0 files protected. Reaper thread runs every <code>FitCache_REAPER_SEC</code> (default 30 s) until used bytes drop below the low watermark.</li>
+<li><strong>Subscriber-lease management.</strong> Subscribe/release compute a lightweight <code>dataset_id</code> and insert/remove a subscriber record with a renewing lease. Collapsed the spec's RPCs into direct PFS-backed registry writes since the registry is already PFS-backed.</li>
+</ul>
+<p><strong>Smoke test:</strong> 8/8 pass (FNV vectors, HRW balance + churn vs modulo, dataset_id, registry roundtrip, client-side routing, sidecar write/read/refcount/scan/quarantine, eviction victim selection, subscriber-lease roundtrip).</p>
+<p><strong>Backward compatibility:</strong> every new path gated by <code>cross_job_enabled()</code>; <code>FitCache_CROSS_JOB=0</code> keeps single-job builds bit-identical to IPDPS at runtime.</p>
+</div>
+
+<div class="entry">
+<h2>2026-05-11 — Client-side HRW routing wired end-to-end</h2>
+<ul>
+<li>Added cluster endpoint table + routing API in <code>src/fitcache_cross_job.{h,cpp}</code>: <code>select_server_for_path(path, local_server_count)</code> (cross-job: HRW over the registry's live-server snapshot with 5 s TTL refresh; single-job: passthrough to <code>modulo_select</code>), <code>slot_to_addr(slot)</code>, <code>refresh_cluster_endpoints()</code>. ~110 LOC.</li>
+<li>Swapped all six routing call sites that previously computed <code>hash(path) % g_fitcache_server_count</code> to <code>select_server_for_path(...)</code>.</li>
+<li>Extended <code>fitcache_client_comm_lookup_addr</code> with a cross-job branch consulting the cluster endpoint table before falling back to <code>.ports.cfg.${SLURM_JOBID}</code>.</li>
+<li>Fixed a placeholder: <code>fitcache_server.cpp</code> was passing <code>addr=""</code> to <code>registry_register_server</code>; now captures the real Mercury self-addr. Gated by cross-job so single-job builds are unaffected.</li>
+<li>Added a fifth smoke case covering slot stability, HRW spread, addr resolution, and unknown-slot fallback. All five pass.</li>
+<li>Backward compatibility: with <code>FitCache_CROSS_JOB=0</code>, <code>select_server_for_path</code> short-circuits to <code>modulo_select</code> so single-job routing is bit-identical to IPDPS.</li>
+</ul>
+<p><strong>Next step (at the time):</strong> open-time peer-lookup fanout in <code>fitcache_open_rpc_handler</code> — the change that actually achieves cache sharing across jobs (landed in the entry above).</p>
+</div>
+
+<footer>
+Last updated: 2026-05-24<br>
+Generated from markdown source (WORKLOG.md). Markdown source was not modified.
+</footer>
+
+</body>
+</html>

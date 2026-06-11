@@ -20,13 +20,18 @@ struct Stat {
 };
 
 inline std::unordered_map<std::string, Stat>& get_table() {
-    static std::unordered_map<std::string, Stat> tbl;
-    return tbl;
+    // Intentionally leaked: the shutdown dump runs from an
+    // __attribute__((destructor)) function, which glibc executes AFTER
+    // function-local statics are destroyed (verified empirically on
+    // Frontier SLES15: the dump printed an empty table). A heap-allocated,
+    // never-freed table stays valid for the whole process teardown.
+    static auto* tbl = new std::unordered_map<std::string, Stat>();
+    return *tbl;
 }
 
 inline std::mutex& get_mutex() {
-    static std::mutex m;
-    return m;
+    static auto* m = new std::mutex();  // leaked for the same reason as the table
+    return *m;
 }
 
 class TimerGuard {
@@ -60,6 +65,24 @@ private:
     const char* tag_;
     std::chrono::steady_clock::time_point start_;
 };
+
+// Value-accumulation counter (P1-b instrumentation, 2026-06-10): reuses the
+// Stat table to accumulate arbitrary values (e.g., bytes) under a tag.
+// total_us then holds the running sum and calls the event count; the
+// shutdown dump's Avg column becomes value-per-event.
+inline void add_value(const char* tag, double v) {
+    auto& tbl = get_table();
+    std::lock_guard<std::mutex> lk(get_mutex());
+    auto& s = tbl[tag];
+    double cur = s.total_us.load(std::memory_order_relaxed);
+    double nw;
+    do {
+        nw = cur + v;
+    } while (!s.total_us.compare_exchange_weak(cur, nw,
+                                               std::memory_order_release,
+                                               std::memory_order_relaxed));
+    s.calls.fetch_add(1, std::memory_order_relaxed);
+}
 
 inline void print_all_stats() {
     std::stringstream ss;

@@ -113,6 +113,7 @@ ssize_t ms_read(int fd, void* buf, size_t count, int64_t offset)
         L4C_INFO("ms_read: peer-slot override %d active for fd %d", override_slot, fd);
     }
 
+    fitcache::add_value("ms_read.fetch_rpcs_issued", 1.0);
     fitcache_client_comm_gen_read_rpc_with_ms(host, fd, buf, count, offset,
         ms_read_cb, dram_state);
     
@@ -251,10 +252,20 @@ static hg_return_t ms_read_cb(const struct hg_cb_info *info)
     }
     // if success => set ms->completed
     if (bytes_read >= 0 && !ms->completed) {
+        // P1-b traffic accounting: this response is the one delivered to the
+        // application (the "winner" of the multi-source race).
+        fitcache::add_value("ms_read.bytes_winner", (double)bytes_read);
         ms->completed = true;
         pthread_cond_signal(&ms->cond);
     } else 
     {
+        // P1-b traffic accounting: a successful response that arrives after
+        // completion carries redundant payload. Structurally this stays 0 in
+        // the resolved-tier fast path (one RPC per read); the counter proves
+        // it empirically.
+        if (bytes_read >= 0 && ms->completed) {
+            fitcache::add_value("ms_read.bytes_redundant", (double)bytes_read);
+        }
         // if the other side also done or both fail => complete
         if ((ms->pm_done && ms->ssd_done) &&
             (ms->pm_result < 0 && ms->ssd_result < 0)) 
@@ -318,4 +329,12 @@ extern "C" int fitcache_resolve_cached_path(const char *original_path,
         }
     }
     return 0;  // miss
+}
+
+
+// P1-b instrumentation bridge: lets plain-C call sites (wrappers.c) record
+// into the C++ stat table. Value semantics match fitcache::add_value.
+extern "C" void fitcache_stat_add(const char *tag, double v)
+{
+    fitcache::add_value(tag, v);
 }

@@ -437,6 +437,18 @@ ssize_t WRAP_DECL(readv)(int fd, const struct iovec *iov, int iovcnt)
 
 }
 #include "fitcache_mmap_tracker.h"
+#include <time.h>
+
+/* P1-b instrumentation bridge into the C++ stat table (defined in
+ * fitcache_multi_source_read.cpp). Dumped at shutdown when
+ * FITPP_TIMING_DUMP_ON_EXIT=1. */
+extern void fitcache_stat_add(const char *tag, double v);
+static inline double fitpp_now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e6 + (double)ts.tv_nsec / 1e3;
+}
 
 /*
  * mmap wrapper — the centerpiece of the 2026-05-15 mmap-interceptor work.
@@ -518,7 +530,10 @@ void* WRAP_DECL(mmap)(void *addr, size_t length, int prot, int flags,
      * the files present on disk. Read-only only; writable MAP_SHARED was
      * already bypassed above. */
     char cached_path[4096];
-    if (fitcache_resolve_cached_path(path, cached_path, sizeof(cached_path))) {
+    double __t0 = fitpp_now_us();
+    int __resolved = fitcache_resolve_cached_path(path, cached_path, sizeof(cached_path));
+    fitcache_stat_add("mmap.resolve_us", fitpp_now_us() - __t0);
+    if (__resolved) {
         int cfd = __real_open(cached_path, O_RDONLY);
         if (cfd >= 0) {
             /* Honor the caller's prot + sharing flag, but map the CACHED file.
@@ -530,6 +545,7 @@ void* WRAP_DECL(mmap)(void *addr, size_t length, int prot, int flags,
                                   * reaper unlinks the cached file (Linux
                                   * unlink-while-mapped semantics). */
             if (m != MAP_FAILED) {
+                fitcache_stat_add("mmap.warmhit_total_us", fitpp_now_us() - __t0);
                 fitcache_mmap_tracker_record(m, length);
                 if (DEBUG_HU)
                     L4C_INFO("mmap WARM HIT: %s -> %s (direct NVMe mmap, %zu bytes off %ld)",
@@ -553,6 +569,7 @@ void* WRAP_DECL(mmap)(void *addr, size_t length, int prot, int flags,
      * never slower than the native baseline. */
     if (DEBUG_HU)
         L4C_INFO("mmap COLD MISS: %s (native PFS mmap; promotion pending)", path);
+    fitcache_stat_add("mmap.coldmiss_check_us", fitpp_now_us() - __t0);
     return __real_mmap(addr, length, prot, flags, fd, offset);
 }
 
