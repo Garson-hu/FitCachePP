@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FitCachePP TPDS Extension — Experiments</title>
+<style>
+  :root { --fg:#1b1f24; --muted:#57606a; --border:#d0d7de; --bg:#ffffff;
+          --code-bg:#f6f8fa; --accent:#0969da; --th-bg:#f6f8fa; }
+  * { box-sizing:border-box; }
+  body { color:var(--fg); background:var(--bg);
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+         line-height:1.55; max-width:1000px; margin:0 auto; padding:2.5rem 1.5rem 5rem; }
+  h1,h2,h3 { line-height:1.25; margin-top:1.7em; margin-bottom:.55em; font-weight:600; }
+  h1 { font-size:1.85rem; border-bottom:1px solid var(--border); padding-bottom:.3em; }
+  h2 { font-size:1.4rem; border-bottom:1px solid var(--border); padding-bottom:.25em; }
+  h3 { font-size:1.12rem; }
+  a { color:var(--accent); text-decoration:none; }
+  code { background:var(--code-bg); padding:.13em .35em; border-radius:6px;
+         font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:.86em; }
+  table { border-collapse:collapse; width:100%; margin:1em 0; font-size:.88rem; display:block; overflow-x:auto; }
+  th,td { border:1px solid var(--border); padding:.42em .65em; text-align:left; vertical-align:top; }
+  th { background:var(--th-bg); font-weight:600; }
+  tr:nth-child(even) td { background:var(--code-bg); }
+  .badge { display:inline-block; padding:.08em .55em; border-radius:11px; font-size:.74rem;
+           font-weight:600; color:#fff; white-space:nowrap; }
+  .badge.done  { background:#1e8e3e; }
+  .badge.supp  { background:#5f6368; }
+  .badge.trade { background:#e0a400; color:#1b1f24; }
+  .badge.bad   { background:#c5221f; }
+  .note { color:var(--muted); font-size:.92em; }
+  hr { border:none; border-top:1px solid var(--border); margin:2.2em 0; }
+  footer { margin-top:3em; padding-top:1.2em; border-top:1px solid var(--border);
+           color:var(--muted); font-size:.84rem; }
+</style>
+</head>
+<body>
+
+<h1>FitCachePP TPDS Extension — Experiments</h1>
+<p class="note" style="border:2px solid #e0a400; background:#fff8e1; padding:.7em 1em; border-radius:8px; color:#1b1f24;">
+<strong>2026-06-14 TPDS revision note.</strong> The GNN warm-speedup cells below (18.6&ndash;33.2&times;) were found to be
+<em>regime-contaminated</em> by the review panel (the warm cell is partly page-cache served and the native baseline was the most
+favorable Lustre condition, mislabeled &ldquo;cold&rdquo;). They are superseded by a regime-pinned rerun: <strong>NVMe-bound warm
+82.7&nbsp;s, page-cache resident ~5&nbsp;s, cold native 1870&ndash;2457&nbsp;s &rarr; ~6&times; vs favorable Lustre, 22&ndash;30&times;
+vs cold</strong>. A 32&ndash;256-node Megatron warm-flat ladder (175&ndash;178&nbsp;s flat) and a DRAM-tier (tmpfs) warm-hit proof
+were also added. See <a href="../EXPERIMENTS_STATUS.html">EXPERIMENTS_STATUS.html &sect; TPDS Revision Campaign</a> for the
+authoritative tables; the raw cells below are kept as the record of the original C1 sweep.</p>
+<p class="note">Grouped by contribution. Every performance cell passes a hard FitCachePP-vs-<code>Native_mmap_PFS</code>
+checksum-equality gate (per-rank for multi-seed benches), and a decode gate where applicable. Companion pages:
+<a href="../EXPERIMENTS_STATUS.html">EXPERIMENTS_STATUS.html</a> ·
+<a href="design.html">design.html</a> ·
+<a href="paper.html">paper.html</a>.</p>
+
+<h2>Contribution 1 — Transparent mmap cache path <span class="badge done">DONE</span></h2>
+<p>Warm-hit local-NVMe mmap vs <code>Native_mmap_PFS</code>, across three workload classes. Two views: warm-hit-only (mechanism)
+and amortized including pre-stage cost.</p>
+
+<h3>Megatron IndexedDataset (dense-sequential LLM)</h3>
+<table>
+<tr><th>N</th><th>pre-stage</th><th>FitCachePP warm epoch</th><th>Native epoch</th><th>warm speedup</th></tr>
+<tr><td>1</td><td>262 s</td><td>271.9 s</td><td>350.3 s</td><td>1.29&times;</td></tr>
+<tr><td>2</td><td>252 s</td><td>284.6 s</td><td>348.5 s</td><td>1.22&times;</td></tr>
+<tr><td>4</td><td>262 s</td><td>222.0 s</td><td>344.8 s</td><td>1.55&times;</td></tr>
+<tr><td>8</td><td>259 s</td><td>219.7 s</td><td>341.5 s</td><td>1.55&times;</td></tr>
+<tr><td>16</td><td>270 s</td><td>214.8 s</td><td>344.1 s</td><td>1.60&times;</td></tr>
+</table>
+<p class="note">Amortized (Native&times;E &divide; (pre-stage + warm&times;E)) breaks even at 3&ndash;4 epochs; @5ep ~1.08&ndash;1.28&times;.</p>
+
+<h3>GNN feature gather, IGB-large (sparse-random)</h3>
+<table>
+<tr><th>N</th><th>pre-stage</th><th>FitCachePP warm epoch</th><th>Native epoch</th><th>warm speedup</th><th>checksum</th></tr>
+<tr><td>1</td><td>359 s</td><td>18.6 s</td><td>510.2 s</td><td>27.4&times;</td><td>PASS (1 rank)</td></tr>
+<tr><td>2</td><td>367 s</td><td>27.3 s</td><td>506.4 s</td><td>18.5&times;</td><td>PASS (2 ranks)</td></tr>
+<tr><td>4</td><td>359 s</td><td>17.2 s</td><td>571.2 s</td><td>33.2&times;</td><td>PASS (4 ranks)</td></tr>
+<tr><td>8</td><td>357 s</td><td>25.0 s</td><td>507.8 s</td><td>20.3&times;</td><td>PASS (8 ranks)</td></tr>
+<tr><td>16</td><td>367 s</td><td>25.3 s</td><td>524.9 s</td><td>20.7&times;</td><td>PASS (16 ranks)</td></tr>
+</table>
+<p class="note">Break-even is the 1st epoch at every N; @2ep ~2.5&ndash;2.9&times;. Sparse random 4 KB-row gather is pathologically
+slow on Lustre, which is the source of the large win. Claim is scoped to mmap-backed feature loading, not end-to-end GNN
+training. <strong>Superseded (see top banner):</strong> these warm cells are regime-contaminated; the regime-pinned restatement is
+~6&times; vs favorable Lustre / 22&ndash;30&times; vs cold (NVMe-bound warm 82.7&nbsp;s, cold native 1870&ndash;2457&nbsp;s).</p>
+
+<h3>DINOv2 / CC12M tar-shard load (sequential vision, full corpus)</h3>
+<p class="note">Full corpus 996/996 shards, shared mode: every node stages + reads all 541 GB &gt; 512 GB RAM (rules out a
+page-cache artifact). All checksum EQUAL + decode 10956/10956.</p>
+<table>
+<tr><th>N</th><th>pre-stage</th><th>FitCachePP warm pass</th><th>Native pass</th><th>warm-hit</th><th>break-even</th><th>@5 passes</th></tr>
+<tr><td>1</td><td>382 s</td><td>233.3 s</td><td>426.2 s</td><td>1.83&times;</td><td>2</td><td>1.38&times;</td></tr>
+<tr><td>2</td><td>372 s</td><td>235.5 s</td><td>418.2 s</td><td>1.78&times;</td><td>3</td><td>~1.36&times;</td></tr>
+<tr><td>4</td><td>375 s</td><td>215.9 s</td><td>421.9 s</td><td>1.95&times;</td><td>2</td><td>1.45&times;</td></tr>
+<tr><td>8</td><td>453 s</td><td>225.4 s</td><td>420.9 s</td><td>1.87&times;</td><td>3</td><td>1.33&times;</td></tr>
+<tr><td>16</td><td>417 s</td><td>259.8 s</td><td>422.6 s</td><td>1.63&times;</td><td>3</td><td>1.23&times;</td></tr>
+</table>
+<p class="note">Warm-hit flat ~1.6&ndash;1.95&times; across all scales. Claim scoped to mmap-backed vision data loading, not
+end-to-end DINOv2 training.</p>
+
+<p class="note"><strong>Three-class breadth.</strong> dense-sequential LLM (~1.3&ndash;1.6&times;), sparse-random GNN gather
+(18&ndash;33&times;), sequential vision tar loading (~1.6&times;). Magnitude tracks the PFS access pattern.</p>
+
+<hr>
+
+<h2>Contribution 2 — Access-aware mmap cache placement <span class="badge done">DONE</span></h2>
+<p>Node-local placement (<code>FITCACHE_MMAP_PLACEMENT=node_local</code>) vs default hash. Fallback 0, remote 0 in every
+node-local cell.</p>
+<table>
+<tr><th>Cell</th><th>Per-node working set</th><th>Node-0 cached</th><th>Restored</th><th>Fallback</th><th>Remote</th><th>Checksum</th></tr>
+<tr><td>Megatron N=2</td><td>40</td><td>40</td><td>40/40</td><td>0</td><td>0</td><td>PASS</td></tr>
+<tr><td>Megatron N=4</td><td>40</td><td>40</td><td>40/40</td><td>0</td><td>0</td><td>PASS</td></tr>
+<tr><td>GNN N=2</td><td>6</td><td>6</td><td>6/6</td><td>0</td><td>0</td><td>PASS (per-rank)</td></tr>
+<tr><td>DINOv2 N=2 shared</td><td>996</td><td>996</td><td>996/996</td><td>0</td><td>0</td><td>PASS + decode 10956</td></tr>
+<tr><td>DINOv2 N=2 partitioned</td><td>498</td><td>498</td><td>498/498</td><td>0</td><td>0</td><td>PASS (per-rank) + decode 5478</td></tr>
+<tr><td>hash baseline (Megatron N=2)</td><td>40</td><td>18</td><td>18+22 global</td><td>22</td><td>n/a</td><td>PASS</td></tr>
+</table>
+
+<h3>Placement vs access pattern</h3>
+<table>
+<tr><th>Mode</th><th>Access pattern</th><th>Per-node cached</th><th>Global copies</th><th>Dup factor</th><th>Fallback</th><th>Remote</th></tr>
+<tr><td>hash <span class="badge trade">scatter</span></td><td>global hash</td><td>scattered (18/40)</td><td>~1&times;</td><td>~1&times;</td><td>nonzero (22)</td><td>n/a</td></tr>
+<tr><td>node_local shared <span class="badge trade">replicate</span></td><td>all nodes same 996</td><td>996</td><td>1992</td><td><strong>2.0&times;</strong></td><td>0</td><td>0</td></tr>
+<tr><td>node_local partitioned <span class="badge done">1.0&times;</span></td><td>disjoint 498/node</td><td>498</td><td>996</td><td><strong>1.0&times;</strong></td><td>0</td><td>0</td></tr>
+</table>
+<p class="note">The mmap path provides the steady-state speedup; access-aware placement ensures the data is node-local. Shared
+local replication is a deliberate tradeoff; partitioned avoids full replication (global unique 996 = node0 [0,497] + node1
+[498,995]).</p>
+
+<hr>
+
+<h2>Supporting — Sidecar cache-state recovery <span class="badge supp">Supporting</span></h2>
+<h3>Recovery (N=1, all gates PASS)</h3>
+<table>
+<tr><th>Bench</th><th>Sidecars</th><th>Restore</th><th>Restored/missing</th><th>Fallback</th><th>Checksum/decode</th></tr>
+<tr><td>Megatron</td><td>40</td><td>fast</td><td>40 / 0</td><td>0</td><td>PASS</td></tr>
+<tr><td>GNN</td><td>6</td><td>6 s</td><td>6 / 0</td><td>0</td><td>PASS</td></tr>
+<tr><td>DINOv2</td><td>996</td><td>8 s</td><td>996 / 0</td><td>0</td><td>PASS + decode 10956</td></tr>
+</table>
+
+<h3>With-sidecar vs no-sidecar ablation (DINOv2 full corpus, N=1)</h3>
+<table>
+<tr><th>Arm</th><th>Server restored</th><th>Restore time</th><th>Cache_hit / fallback</th></tr>
+<tr><td>with sidecar</td><td>996 / 996</td><td>5 s</td><td>996 / 0</td></tr>
+<tr><td>no sidecar</td><td>0 / 996</td><td>n/a</td><td>996 / 0</td></tr>
+</table>
+<p class="note">Both arms raw-checksum correct + decode 10956. The client warm-hits in both because the resolver is
+server-map-independent; the sidecar buys server-side cache-state recovery, not bandwidth.</p>
+
+<h3>Restore scaling (metadata-restore only)</h3>
+<table>
+<tr><th>Shards</th><th>Entries</th><th>Meta bytes</th><th>Restore time</th><th>Entries/sec</th></tr>
+<tr><td>32</td><td>32</td><td>34,304</td><td>6 s</td><td>5.3</td></tr>
+<tr><td>256</td><td>256</td><td>274,432</td><td>5 s</td><td>51.2</td></tr>
+<tr><td>996</td><td>996</td><td>1,067,712</td><td>5 s</td><td>199.2</td></tr>
+</table>
+<p class="note">Restore time ~flat (5&ndash;6 s), startup/scan-dominated, independent of object count.</p>
+
+<hr>
+
+<h2>Superseded / Do Not Cite <span class="badge bad">Superseded</span></h2>
+<ul>
+<li>Eager-populate (server + Mercury anon-mmap) mmap path.</li>
+<li>1 TB sharded Megatron sweep (16 GiB shards) — INVALID, &gt;2 GiB read truncation.</li>
+<li>10 GB single-file Megatron compare — same truncation bug.</li>
+<li>950-shard / 95.4% DINOv2 single-node run — superseded by 100%-corpus sweep.</li>
+<li>32-shard partial-coverage DINOv2 passes — coverage table only.</li>
+<li>216 MB synthetic DINOv2 I/O run — compatibility only.</li>
+</ul>
+
+<h2>What remains missing</h2>
+<p><strong>None for the current claims.</strong> Contribution 1 covers N=1&ndash;16 across all three workload classes; Contribution 2
+demonstrates the policy on Megatron N=2/4, GNN N=2, and DINOv2 N=2 shared + partitioned (N=8/16 are not required to show the
+policy); the supporting sidecar mechanism is complete with recovery, ablation, and scaling.</p>
+
+<footer>
+Last updated: 2026-05-24<br>
+Generated from markdown source, but updated to reflect latest final results. Markdown source was not modified.
+</footer>
+
+</body>
+</html>

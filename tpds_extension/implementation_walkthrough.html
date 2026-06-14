@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FitCachePP TPDS Extension — Implementation Walkthrough (line-by-line)</title>
+<style>
+  :root { --fg:#1b1f24; --muted:#57606a; --border:#d0d7de; --bg:#ffffff;
+          --code-bg:#f6f8fa; --accent:#0969da; --th-bg:#f6f8fa; --warn:#9a6700; }
+  * { box-sizing:border-box; }
+  body { color:var(--fg); background:var(--bg);
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+         line-height:1.6; max-width:1040px; margin:0 auto; padding:2.5rem 1.5rem 6rem; }
+  h1,h2,h3,h4 { line-height:1.25; margin-top:1.7em; margin-bottom:.55em; font-weight:600; }
+  h1 { font-size:1.85rem; border-bottom:1px solid var(--border); padding-bottom:.3em; }
+  h2 { font-size:1.45rem; border-bottom:1px solid var(--border); padding-bottom:.25em; margin-top:2.4em; }
+  h3 { font-size:1.18rem; }
+  h4 { font-size:1.02rem; color:var(--muted); }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  p { margin:.7em 0; }
+  code { background:var(--code-bg); padding:.13em .35em; border-radius:6px;
+         font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:.85em; }
+  pre { background:var(--code-bg); padding:1rem 1.1rem; border-radius:8px; overflow:auto;
+        font-size:.82rem; line-height:1.5; border:1px solid var(--border); }
+  pre code { background:none; padding:0; font-size:inherit; }
+  .filetag { display:inline-block; font-family:ui-monospace,Menlo,Consolas,monospace;
+             font-size:.78rem; background:#eaeef2; color:#24292f; border:1px solid var(--border);
+             border-radius:6px 6px 0 0; padding:.25em .6em; margin-bottom:-1px; }
+  .filetag + pre { border-radius:0 8px 8px 8px; }
+  table { border-collapse:collapse; width:100%; margin:1em 0; font-size:.88rem; display:block; overflow-x:auto; }
+  th,td { border:1px solid var(--border); padding:.42em .65em; text-align:left; vertical-align:top; }
+  th { background:var(--th-bg); font-weight:600; }
+  tr:nth-child(even) td { background:var(--code-bg); }
+  .badge { display:inline-block; padding:.08em .55em; border-radius:11px; font-size:.74rem;
+           font-weight:600; color:#fff; white-space:nowrap; }
+  .badge.done  { background:#1e8e3e; }
+  .badge.supp  { background:#5f6368; }
+  .badge.trade { background:#e0a400; color:#1b1f24; }
+  .badge.bad   { background:#c5221f; }
+  .callout { border-left:4px solid var(--accent); background:var(--code-bg);
+             padding:.6em 1em; border-radius:0 8px 8px 0; margin:1.1em 0; }
+  .callout.warn { border-left-color:var(--warn); }
+  .note { color:var(--muted); font-size:.92em; }
+  .toc { background:var(--code-bg); border:1px solid var(--border); border-radius:8px; padding:1em 1.4em; }
+  .toc ol { margin:.3em 0; }
+  ann { } /* inline annotation marker, styled via .ann */
+  .step { font-weight:600; color:var(--accent); }
+  hr { border:none; border-top:1px solid var(--border); margin:2.4em 0; }
+  footer { margin-top:3em; padding-top:1.2em; border-top:1px solid var(--border);
+           color:var(--muted); font-size:.84rem; }
+</style>
+</head>
+<body>
+
+<h1>FitCachePP TPDS Extension — Implementation Walkthrough</h1>
+<p class="note">A code-level account of <strong>what we set out to build</strong> and <strong>what is already built</strong>, walked through almost line by line against the real source tree. Companion pages:
+<a href="../EXPERIMENTS_STATUS.html">EXPERIMENTS_STATUS.html</a> ·
+<a href="design.html">design.html</a> ·
+<a href="experiments.html">experiments.html</a> ·
+<a href="paper.html">paper.html</a> ·
+<a href="../WORKLOG.html">WORKLOG.html</a>.</p>
+
+<div class="toc">
+<strong>Contents</strong>
+<ol>
+<li><a href="#goal">The goal — what we want to do</a></li>
+<li><a href="#arch">Architecture at a glance</a></li>
+<li><a href="#m1">Mechanism 1 — Transparent mmap cache path <span class="badge done">DONE</span></a>
+  <ol type="a">
+    <li><a href="#m1-mmap">The <code>mmap</code> wrapper (the centerpiece)</a></li>
+    <li><a href="#m1-resolver">The client-side resolver <code>fitcache_resolve_cached_path()</code></a></li>
+    <li><a href="#m1-tracker">The mmap tracker + <code>munmap</code></a></li>
+    <li><a href="#m1-promote">Open-time promotion (the server side that fills the cache)</a></li>
+  </ol></li>
+<li><a href="#m2">Mechanism 2 — Access-aware mmap cache placement <span class="badge done">DONE</span></a>
+  <ol type="a">
+    <li><a href="#m2-select"><code>select_server_for_path()</code> — the routing entry point</a></li>
+    <li><a href="#m2-nodelocal"><code>node_local_select()</code> — the node-local math</a></li>
+    <li><a href="#m2-modulo"><code>modulo_select()</code> + the partitioned-access story</a></li>
+    <li><a href="#m2-epoch">Cross-epoch consistency — why the same node keeps warm-hitting</a></li>
+  </ol></li>
+<li><a href="#m3">Supporting — Sidecar cache-state recovery <span class="badge supp">Supporting</span></a>
+  <ol type="a">
+    <li><a href="#m3-write">Writing a sidecar on promotion</a></li>
+    <li><a href="#m3-format">The sidecar format + atomic write</a></li>
+    <li><a href="#m3-restore"><code>restore_from_sidecars()</code> on server startup</a></li>
+    <li><a href="#m3-gate">The <code>persist_meta_enabled()</code> gate</a></li>
+  </ol></li>
+<li><a href="#exp">What we ran — the experiments</a></li>
+<li><a href="#status">What is done vs. what remains</a></li>
+</ol>
+</div>
+
+<h2 id="goal">1. The goal — what we want to do</h2>
+<p>The IPDPS-era FitCache intercepted <code>open</code> / <code>read</code> / <code>pread</code> / <code>close</code> and served cached data over Mercury RPC. The TPDS extension has <strong>two new contributions plus one supporting mechanism</strong>:</p>
+<table>
+<tr><th>#</th><th>What we want</th><th>Why it was needed</th><th>Status</th></tr>
+<tr><td>1</td><td><strong>Transparent mmap cache path.</strong> Make <code>mmap()</code>-based loaders (numpy.memmap → Megatron IndexedDataset, DINOv2 tar slices, GNN feature gather) benefit from the node-local cache, with the warm read served by a <em>direct mmap of the cached file from whichever local tier holds it</em> (DRAM/tmpfs → PMem → NVMe; no RPC).</td><td>Page-fault reads on an mmap never call <code>read()</code>, so the old client missed them entirely — those workloads measured "0 Open RPC". The data flowed straight from the PFS.</td><td><span class="badge done">DONE</span></td></tr>
+<tr><td>2</td><td><strong>Access-aware mmap cache placement.</strong> Make the cached file land on the <em>same node</em> as the rank that needs it, and support disjoint (partitioned) access without full replication.</td><td>A warm mmap hit needs the file in a local cache tier (DRAM/PMem/NVMe) on the same node. Default hash placement scatters a node's working set across the cluster, so at N≥2 a node misses half its own set.</td><td><span class="badge done">DONE</span></td></tr>
+<tr><td>3</td><td><strong>Sidecar cache-state recovery</strong> (supporting). Persist a <code>.meta</code> sidecar per cached file so a restarted metadata service can rebuild its cache map.</td><td>Lets the cache survive a server restart without re-promoting from PFS. It restores server-side <em>state</em>; it is not the bandwidth source.</td><td><span class="badge supp">Supporting</span></td></tr>
+</table>
+
+<h2 id="arch">2. Architecture at a glance</h2>
+<p>An application links the LD_PRELOAD client (<code>libfitcache_client.so</code>); Mercury-RPC servers run alongside (default 4/node). The path through the system for an mmap-based loader:</p>
+<pre><code>app mmap()/mmap64()  ──►  wrappers.c::mmap   (LD_PRELOAD interposition)
+                              │
+                    ┌─────────┴───────────┐
+              WARM HIT                 COLD MISS
+                    │                       │
+   fitcache_resolve_cached_path()    __real_mmap on the PFS file
+   (client-side, deterministic,            │  (open RPC already fired →
+    size-match gate, NO RPC)               │   server enqueues promotion)
+                    │                       │
+   __real_open(cached file, local tier) data mover: select_server_for_path()
+   __real_mmap(...) → page-fault           │   picks the slot (Mechanism 2)
+   straight from local cache tier    fs::copy(PFS → selected local tier:
+                                              DRAM/tmpfs → PMem → NVMe)
+                    │                 meta_write_sidecar(...)  (Mechanism 3)
+   record (addr→len) in tracker            │
+                    │                 NEXT mmap of this path = WARM HIT
+   return mapping to app
+
+server restart ──► restore_from_sidecars() rebuilds path_cache_map</code></pre>
+<p>The three mechanisms live in three areas of the tree:</p>
+<table>
+<tr><th>Mechanism</th><th>Primary files</th></tr>
+<tr><td>1 — mmap path</td><td><code>src/client/wrappers.c</code>, <code>src/client/fitcache_multi_source_read.cpp</code>, <code>src/client/fitcache_mmap_tracker.cpp</code>, <code>src/comm/fitcache_comm_server.cpp</code></td></tr>
+<tr><td>2 — placement</td><td><code>src/cross_job/fitcache_cross_job.cpp</code></td></tr>
+<tr><td>3 — sidecar</td><td><code>src/cross_job/fitcache_persistent_meta.cpp</code>, <code>src/server/fitcache_data_mover.cpp</code>, <code>src/server/fitcache_server.cpp</code></td></tr>
+</table>
+
+<hr>
+
+<h2 id="m1">3. Mechanism 1 — Transparent mmap cache path <span class="badge done">DONE</span></h2>
+
+<h3 id="m1-mmap">3a. The <code>mmap</code> wrapper</h3>
+<p>This is the centerpiece, at <a href="../src/client/wrappers.c#L490">wrappers.c:490</a>. It interposes on the libc <code>mmap</code> symbol. The logic is: bypass anything we can't safely redirect, then try a warm hit (direct mmap of the cached file), then fall back to a native PFS mmap on a cold miss.</p>
+
+<span class="filetag">src/client/wrappers.c:490 — entry + safety bypasses</span>
+<pre><code>void* WRAP_DECL(mmap)(void *addr, size_t length, int prot, int flags,
+                      int fd, off_t offset)
+{
+    MAP_OR_FAIL(mmap);                 // resolve __real_mmap via dlsym(RTLD_NEXT)
+    MAP_OR_FAIL(munmap);
+
+    if (g_disable_redirect || tl_disable_redirect)
+        return __real_mmap(addr, length, prot, flags, fd, offset);   // global/thread kill-switch
+
+    if (fd &lt; 0 || length == 0 ||
+        (flags &amp; MAP_ANONYMOUS) || (flags &amp; MAP_FIXED) ||
+        ((flags &amp; MAP_SHARED) &amp;&amp; (prot &amp; PROT_WRITE)))
+        return __real_mmap(addr, length, prot, flags, fd, offset);   // can't safely intercept</code></pre>
+<p>Line by line:</p>
+<ul>
+<li><code>MAP_OR_FAIL(mmap)</code> / <code>MAP_OR_FAIL(munmap)</code> — resolve the real glibc symbols once (we need <code>munmap</code> too because the tracker undoes the mapping later).</li>
+<li>The kill-switch check lets internal FitCache code map files without recursing into our own redirect.</li>
+<li>The big bypass <code>if</code> excludes the cases where redirecting would be wrong: <code>fd&lt;0</code> / <code>length==0</code> (nothing to back), <code>MAP_ANONYMOUS</code> (no file), <code>MAP_FIXED</code> (caller demands a specific address), and <strong>writable</strong> <code>MAP_SHARED</code> (the app expects writes to flush to the file — our redirect can't honor that). Crucially, <em>read-only</em> <code>MAP_SHARED</code> is <strong>not</strong> bypassed: that is exactly the path <code>numpy.memmap(mode='r')</code> takes (CPython maps <code>ACCESS_READ → MAP_SHARED | PROT_READ</code>), and with no <code>PROT_WRITE</code> there is no write-back to honor, so redirecting it is safe.</li>
+</ul>
+
+<span class="filetag">src/client/wrappers.c:508 — is this fd one we track?</span>
+<pre><code>    const char *path = fitcache_get_path(fd);
+    if (!path)
+        return __real_mmap(addr, length, prot, flags, fd, offset);   // untracked fd → passthrough</code></pre>
+<p><code>fitcache_get_path(fd)</code> returns the original PFS path if this fd came through our <code>open</code> wrapper; otherwise we pass through. From here on we know the original path.</p>
+
+<span class="filetag">src/client/wrappers.c:532 — the warm-hit path (direct local-tier mmap, no RPC)</span>
+<pre><code>    char cached_path[4096];
+    double __t0 = fitpp_now_us();
+    int __resolved = fitcache_resolve_cached_path(path, cached_path, sizeof(cached_path));
+    fitcache_stat_add("mmap.resolve_us", fitpp_now_us() - __t0);
+    if (__resolved) {
+        int cfd = __real_open(cached_path, O_RDONLY);
+        if (cfd &gt;= 0) {
+            int map_flags = (flags &amp; MAP_SHARED) ? MAP_SHARED : MAP_PRIVATE;
+            void *m = __real_mmap(NULL, length, prot, map_flags, cfd, offset);
+            __real_close(cfd);                 // inode stays alive via the mapping
+            if (m != MAP_FAILED) {
+                fitcache_stat_add("mmap.warmhit_total_us", fitpp_now_us() - __t0);
+                fitcache_mmap_tracker_record(m, length);
+                return m;                       // ← app now page-faults from the local cache tier
+            }
+        }
+    }</code></pre>
+<p>This is the heart of the 2026-05-21 redesign. Step by step:</p>
+<ol>
+<li><span class="step">resolve</span> — <code>fitcache_resolve_cached_path()</code> (next section) deterministically computes where the cached copy <em>would</em> be and confirms it is present + complete. Purely client-side, <strong>no Mercury RPC</strong>. The two <code>fitcache_stat_add</code> calls time this for the shutdown profile.</li>
+<li><span class="step">open</span> — on a hit, <code>__real_open</code> the cached file on its local tier read-only (the resolver returns whichever of DRAM/PMem/NVMe matched).</li>
+<li><span class="step">map</span> — <code>__real_mmap(NULL, ...)</code> on the cached fd. We honor the caller's <code>prot</code> and sharing flag (read-only, so <code>MAP_SHARED</code> has no write-back concern). The kernel will now satisfy page faults from the local cache tier instead of Lustre.</li>
+<li><span class="step">close</span> — <code>__real_close(cfd)</code> immediately. The mapping keeps the inode alive after the fd is closed (POSIX unlink/close-while-mapped semantics), which <em>also</em> protects an in-use mapping if the eviction reaper unlinks the cached file underneath us.</li>
+<li><span class="step">track + return</span> — record <code>(addr → length)</code> so <code>munmap</code> can undo it, then return the mapping. The app never knows it is reading from a local cache tier instead of the PFS.</li>
+</ol>
+<div class="callout">
+<strong>Why this beats the old design.</strong> The first attempt populated an <em>anonymous</em> region via Mercury bulk transfer at mmap time. That single-stream Mercury bulk path (~900 MB/s) was slower than Lustre itself (~2 GB/s) and far slower than a local cache tier (DRAM/NVMe). The redesign drops Mercury from the read path entirely: the warm hit is just <code>open</code> + <code>mmap</code> of a local file.
+</div>
+
+<span class="filetag">src/client/wrappers.c:564 — cold miss</span>
+<pre><code>    /* Cold miss: native mmap on the original PFS file. The file is already
+     * tracked via the open RPC, so the server data mover promotes it; the
+     * NEXT mmap of this path becomes a warm hit. Cold is never slower than
+     * the native baseline. */
+    return __real_mmap(addr, length, prot, flags, fd, offset);</code></pre>
+<p>On a miss we do exactly what the application would have done without FitCache — a native PFS mmap — so we can never be slower than baseline on the cold pass. Because the <code>open</code> RPC for this fd already fired, the server has enqueued the file for promotion (section 3d), so the <em>next</em> mmap of this path resolves to a warm hit.</p>
+
+<span class="filetag">src/client/wrappers.c:584 — mmap64 alias</span>
+<pre><code>void* WRAP_DECL(mmap64)(void *addr, size_t length, int prot, int flags,
+                        int fd, off64_t offset)
+{
+    return WRAP_DECL(mmap)(addr, length, prot, flags, fd, (off_t)offset);
+}</code></pre>
+<p>This alias matters in practice: CPython's <code>_mmap.so</code> calls <code>mmap64</code> (the explicit 64-bit variant), <em>not</em> plain <code>mmap</code>. Without intercepting <code>mmap64</code> the entire numpy.memmap path would skip our redirect. On 64-bit Linux the two are identical, so we just delegate.</p>
+
+<h3 id="m1-resolver">3b. The resolver — <code>fitcache_resolve_cached_path()</code></h3>
+<p>At <a href="../src/client/fitcache_multi_source_read.cpp#L291">fitcache_multi_source_read.cpp:291</a>. This is what makes the warm hit RPC-free: it reconstructs the cached path with the <em>same</em> hashing the server uses, then confirms completeness by size.</p>
+
+<span class="filetag">src/client/fitcache_multi_source_read.cpp:291</span>
+<pre><code>extern "C" int fitcache_resolve_cached_path(const char *original_path,
+                                            char *out, size_t outsz)
+{
+    if (!original_path || !out || outsz == 0) return 0;
+
+    struct stat ost;
+    if (stat(original_path, &amp;ost) != 0 || ost.st_size &lt;= 0) return 0;
+    const off_t orig_size = ost.st_size;          // completeness reference
+
+    size_t h = std::hash&lt;std::string&gt;{}(std::string(original_path));
+    char subdir[16];
+    snprintf(subdir, sizeof(subdir), "%02zx/%02zx", (h &gt;&gt; 8) &amp; 0xFF, h &amp; 0xFF);
+
+    std::string op(original_path);
+    size_t slash = op.find_last_of('/');
+    std::string base = (slash == std::string::npos) ? op : op.substr(slash + 1);
+
+    const char *tier_env[3] = {
+        getenv("FitCache_DRAM_PATH"),
+        getenv("FitCache_PMEM_PATH"),
+        getenv("FitCache_NVME_PATH"),
+    };
+    for (int i = 0; i &lt; 3; ++i) {
+        const char *t = tier_env[i];
+        if (!t || !t[0]) continue;
+        std::string cand = std::string(t) + "/" + subdir + "/" + base;
+        struct stat cst;
+        if (stat(cand.c_str(), &amp;cst) == 0 &amp;&amp; S_ISREG(cst.st_mode) &amp;&amp;
+            cst.st_size == orig_size) {            // ← the completeness GATE
+            std::strncpy(out, cand.c_str(), outsz - 1);
+            out[outsz - 1] = '\0';
+            return 1;                              // warm hit
+        }
+    }
+    return 0;                                      // miss
+}</code></pre>
+<p>The key design points:</p>
+<ul>
+<li><strong>Same hash as the server.</strong> <code>std::hash&lt;std::string&gt;</code> of the original path, then a two-level bucket <code>&lt;(h&gt;&gt;8)&amp;0xFF&gt;/&lt;h&amp;0xFF&gt;</code>. The server's data mover computes the identical bucket (section 3d, <a href="../src/server/fitcache_data_mover.cpp#L482">data_mover.cpp:482-484</a>). Client and server link the same libstdc++, so the hash value matches bit for bit — this is what lets the client reconstruct the path with no RPC.</li>
+<li><strong>The completeness gate</strong> is <code>cst.st_size == orig_size</code>. The data mover does a full <code>fs::copy</code> before a file is usable; if a partial copy is on disk its size won't match, and we correctly treat it as a miss and fall through to the PFS. This is what makes the warm hit safe to take without asking the server.</li>
+<li><strong>Tier-general, DRAM-first.</strong> The probe order is <code>tier_env[3] = {DRAM_PATH, PMEM_PATH, NVME_PATH}</code> and the warm hit maps <em>whichever tier matched</em> — the returned <code>cand</code> path is tier-agnostic. This mirrors the server data mover, which places a promoted file <strong>DRAM (tmpfs) first, then PMem, then NVMe</strong> by remaining capacity (<a href="../src/server/fitcache_data_mover.cpp#L443">data_mover.cpp:443-466</a>: <code>target_tier = CACHE_TIER_DRAM</code> unless DRAM is full). So the mechanism is a tiered node-local cache, not an NVMe-only cache.</li>
+<li><strong>Server-map independent.</strong> Notice it only <code>stat()</code>s the filesystem; it never consults a server. This is why the with/no-sidecar ablation (section 5) shows the client warm-hits in <em>both</em> arms — the resolver needs only the files on disk, not the server's in-memory map.</li>
+</ul>
+<div class="callout warn">
+<strong>Mechanism vs. what the Frontier experiments used — and why not tmpfs.</strong> The cache is tier-general (DRAM/tmpfs → PMem → NVMe, DRAM-first by capacity), but the reported warm-hit numbers were served from <strong>NVMe</strong>, not DRAM. What decides tmpfs feasibility is the <em>per-node</em> working set, which depends on the <em>access pattern</em>, not on the total dataset size. These sweeps keep the per-node set <strong>larger than the 512&nbsp;GiB node RAM</strong> on purpose, by <strong>replicating</strong> it on every node: the Megatron stage loop copies all 40 shards (640&nbsp;GiB) to every node, the GNN stage loop copies the whole feature files (~902&nbsp;GB) to every node (it must — the random row-gather can touch any row, and the resolver requires a complete file), and DINOv2 full-corpus runs in shared mode (all 996 shards, 541&nbsp;GB, per node). Because the per-node set is replicated, <strong>aggregating DRAM across N nodes does not shrink it</strong> — each node still needs the whole set locally, which a per-node tmpfs (<code>/tmp</code> <em>is</em> tmpfs on Frontier, but RAM-sized) cannot hold. NVMe (<code>/mnt/bb</code> burst buffer, ~2&nbsp;TB/node) is the only local tier large enough. (The warm hit lands on NVMe because that is where the pre-stage <code>cp</code> wrote it; the client resolver does no RPC and never reads <code>FitCache_DRAM_CAPACITY</code> — a server-only knob, 256&nbsp;MiB for DINOv2/GNN, 40&nbsp;GiB for Megatron.)</p>
+<p><strong>The partitioned exception (you are right here).</strong> Under a <em>partitioned</em> access pattern — DINOv2 disjoint mode, i.e. the Access-Aware partitioned placement of <a href="#m2">Mechanism 2</a> — each node caches only 1/N of the corpus, so at 16 nodes ~62 shards ≈ <strong>34&nbsp;GB/node</strong>, which <em>does</em> fit a per-node tmpfs, and the aggregate 16&times;DRAM holds the whole dataset. So tmpfs caching is feasible there. The catch is that once the per-node set fits in RAM, the <code>Native_mmap_PFS</code> baseline page-caches it too (an mmap of a tmpfs file and a page-cached Lustre file fault from the same kind of RAM pages), so the <em>sustained</em> warm-hit gap collapses toward parity — which is exactly the page-cache artifact the over-RAM sizing was chosen to avoid. <em>Net: NVMe is the correct tier for a sustained warm-hit claim with these (replicated, &gt;RAM) working sets; a DRAM/tmpfs datapoint is feasible under partitioned placement but measures a different (cold-start / under-memory-pressure) gap, not a better-configured version of these sweeps.</em> (Refs: <code>frontier_megatron_warmhit_sweep.sh:6,76-83</code> replicated stage; <code>frontier_gnn_warmhit_sweep.sh:88-101</code> whole-file stage; <code>frontier_dinov2_warmhit_sweep.sh:80-88</code> shared/disjoint <code>base</code>.)
+</div>
+
+<h3 id="m1-tracker">3c. The mmap tracker + <code>munmap</code></h3>
+<p>Because we returned a mapping of the <em>cached</em> file (a different length bookkeeping than the caller may assume), <code>munmap</code> needs to know the exact length we mapped. The tracker is a tiny mutex-guarded map at <a href="../src/client/fitcache_mmap_tracker.cpp#L21">fitcache_mmap_tracker.cpp</a>:</p>
+<span class="filetag">src/client/fitcache_mmap_tracker.cpp</span>
+<pre><code>std::unordered_map&lt;void*, size_t&gt; g_addr_to_length;   // guarded by g_mtx
+
+void   fitcache_mmap_tracker_record(void *addr, size_t length);  // insert on warm hit
+size_t fitcache_mmap_tracker_lookup(void *addr);                 // 0 if not ours
+void   fitcache_mmap_tracker_drop(void *addr);                   // erase on munmap</code></pre>
+<p>mmap is not a hot path (one call per file open in a training job), so a single global mutex is fine. The <code>munmap</code> wrapper at <a href="../src/client/wrappers.c#L590">wrappers.c:590</a> uses it:</p>
+<span class="filetag">src/client/wrappers.c:590</span>
+<pre><code>int WRAP_DECL(munmap)(void *addr, size_t length)
+{
+    MAP_OR_FAIL(munmap);
+    size_t tracked_len = fitcache_mmap_tracker_lookup(addr);
+    if (tracked_len &gt; 0) {
+        fitcache_mmap_tracker_drop(addr);
+        return __real_munmap(addr, tracked_len);    // use OUR length, not the caller's
+    }
+    return __real_munmap(addr, length);             // not ours → caller's length
+}</code></pre>
+<p>If the address is one we handed out, we unmap with the length <em>we</em> recorded (numpy.memmap sometimes rounds the user-visible length, so the tracker value is authoritative). Otherwise we defer to the caller's length.</p>
+
+<h3 id="m1-promote">3d. Open-time promotion (filling the cache)</h3>
+<p>The warm-hit path is only useful if the cache actually gets populated. That happens on the server when an <code>open</code> RPC arrives, at <a href="../src/comm/fitcache_comm_server.cpp#L400">fitcache_comm_server.cpp:400</a>:</p>
+<span class="filetag">src/comm/fitcache_comm_server.cpp:400</span>
+<pre><code>        bool need_promote = false;
+        {
+            std::unique_lock&lt;std::shared_mutex&gt; wlock(cache_mtx);
+            fd_to_path[out.ret_status] = path_str;
+            need_promote = (path_cache_map.find(path_str) == path_cache_map.end());
+        }
+        // Promote at OPEN time (not only at close)...
+        if (need_promote) {
+            L4C_INFO("Open-time promote enqueue: %s", path_str.c_str());
+            pthread_mutex_lock(&amp;data_mutex);
+            data_queue.push(path_str);
+            pthread_cond_signal(&amp;data_cond);
+            pthread_mutex_unlock(&amp;data_mutex);
+        }</code></pre>
+<div class="callout warn">
+<strong>Why open-time, not close-time.</strong> numpy.memmap reuses the same fd per shard. Under that access pattern the client's <code>open_cb</code> response is sometimes dropped as stale by the epoch guard, leaving <code>fd_redir_map[fd]==0</code>, which makes the client skip the close RPC — so close-time promotion never fired and the cache stayed empty (exactly the cache the warm-hit path needs). Enqueuing at open time guarantees promotion regardless of the close RPC. The data mover dedups against <code>path_cache_map</code>, so a double enqueue is harmless.
+</div>
+<p>The data mover thread then does the physical copy and computes the cached path — covered in section 3 of Mechanism 3 below, because the same code also writes the sidecar.</p>
+
+<hr>
+
+<h2 id="m2">4. Mechanism 2 — Access-aware mmap cache placement <span class="badge done">DONE</span></h2>
+<p>A warm hit needs the cached file on the requester's <em>own</em> node. Placement is decided when the data mover picks which server slot a path's promotion routes to. All of this lives in <a href="../src/cross_job/fitcache_cross_job.cpp">fitcache_cross_job.cpp</a>.</p>
+
+<h3 id="m2-select">4a. <code>select_server_for_path()</code> — the routing entry point</h3>
+<span class="filetag">src/cross_job/fitcache_cross_job.cpp:269</span>
+<pre><code>int select_server_for_path(const std::string &amp;path, int local_server_count) {
+    // Experiment 5: access-aware mmap placement (opt-in, default unchanged).
+    if (mmap_placement_node_local()) {
+        int slot = node_local_select(path, local_server_count);
+        if (slot &gt;= 0) return slot;             // ← node-local branch
+    }
+    if (!cross_job_enabled()) {
+        return modulo_select(path, local_server_count);   // ← default single-job
+    }
+    // ... cross-job HRW path (future work) ...
+}</code></pre>
+<p>Three branches, in priority order:</p>
+<ol>
+<li><strong>Node-local</strong> (new, Mechanism 2): taken only when <code>FITCACHE_MMAP_PLACEMENT=node_local</code>. If <code>node_local_select</code> returns a usable slot we use it; if topology env is missing or doesn't divide cleanly it returns <code>-1</code> and we fall through, so the opt-in is fail-safe.</li>
+<li><strong>Default single-job</strong>: <code>modulo_select</code> — the plain <code>hash(path) % count</code>. This is the unchanged baseline; setting nothing keeps IPDPS behavior bit-for-bit.</li>
+<li><strong>Cross-job HRW</strong>: highest-random-weight over the live-server registry. This is the future-work path and is not exercised by the reported experiments.</li>
+</ol>
+<p>The opt-in is read once and cached at <a href="../src/cross_job/fitcache_cross_job.cpp#L109">cross_job.cpp:109</a>:</p>
+<span class="filetag">src/cross_job/fitcache_cross_job.cpp:109</span>
+<pre><code>bool mmap_placement_node_local() {
+    static int cached = -1;
+    if (cached &lt; 0) {
+        const char *v = std::getenv("FITCACHE_MMAP_PLACEMENT");
+        cached = (v &amp;&amp; std::strcmp(v, "node_local") == 0) ? 1 : 0;
+    }
+    return cached == 1;
+}</code></pre>
+
+<h3 id="m2-nodelocal">4b. <code>node_local_select()</code> — the node-local math</h3>
+<span class="filetag">src/cross_job/fitcache_cross_job.cpp:121</span>
+<pre><code>static int node_local_select(const std::string &amp;path, int server_count) {
+    const char *nn = std::getenv("SLURM_NNODES");
+    if (!nn || !nn[0]) nn = std::getenv("SLURM_JOB_NUM_NODES");
+    const char *nid = std::getenv("SLURM_NODEID");
+    if (!nn || !nid || server_count &lt;= 0) return -1;
+    int nnodes = std::atoi(nn);
+    int nodeid = std::atoi(nid);
+    if (nnodes &lt;= 0 || nodeid &lt; 0 || (server_count % nnodes) != 0) return -1;
+    int spn = server_count / nnodes;                 // servers per node
+    if (spn &lt;= 0) return -1;
+
+    // ... one-time log of local_slots=[nodeid*spn, (nodeid+1)*spn) ...
+
+    uint64_t h = fitcache_fnv1a64(path.data(), path.size());
+    int slot = nodeid * spn + static_cast&lt;int&gt;(h % static_cast&lt;uint64_t&gt;(spn));
+
+    if (slot / spn == nodeid) { g_ml_local.fetch_add(1); }   // verify locality
+    else {
+        g_ml_remote.fetch_add(1);
+        L4C_INFO("mmap placement ANOMALY: ... slot_node=%d != requester_node=%d", ...);
+    }
+    return slot;
+}</code></pre>
+<p>The locality model, line by line:</p>
+<ul>
+<li>Under <code>srun --ntasks-per-node=spn</code> with block distribution, server global rank <code>R</code> (= <code>SLURM_PROCID</code>, which is also the <code>.ports.cfg</code> key) lives on node <code>R / spn</code>.</li>
+<li><code>spn = server_count / nnodes</code> is the servers-per-node count. The guard <code>(server_count % nnodes) != 0</code> bails to <code>-1</code> (→ fall through to hash) if the topology isn't a clean multiple, so we never produce a wrong slot.</li>
+<li>The requester's node is <code>SLURM_NODEID</code>. Its local slots are the contiguous range <code>[nodeid*spn, (nodeid+1)*spn)</code>.</li>
+<li><code>slot = nodeid*spn + (hash(path) % spn)</code> — hash the path to pick <em>which</em> of this node's servers, then offset into this node's range. So the path always lands on a server on <em>this</em> node, while still spreading evenly across the node's own servers.</li>
+<li>The <code>slot / spn == nodeid</code> check is a self-audit: it recomputes the slot's node and bumps <code>g_ml_local</code> on success or <code>g_ml_remote</code> + an ANOMALY log on failure. In every reported run <code>remote</code> stayed 0.</li>
+</ul>
+<p>This is what turns the hash baseline's "node-0 caches 18 of its 40, fallback 22" into "node-0 caches all 40, fallback 0."</p>
+
+<h3 id="m2-modulo">4c. <code>modulo_select()</code> + the partitioned-access story</h3>
+<span class="filetag">src/cross_job/fitcache_cross_job.cpp:82</span>
+<pre><code>int modulo_select(const std::string &amp;path, int server_count) {
+    if (server_count &lt;= 0) return -1;
+    uint64_t h = fitcache_fnv1a64(path.data(), path.size());
+    return static_cast&lt;int&gt;(h % static_cast&lt;uint64_t&gt;(server_count));
+}</code></pre>
+<p>The default. <code>server_count</code> here spans <em>all</em> nodes, so the modulo scatters a path to any node — that is precisely the scatter Mechanism 2 fixes. Note this hashes over the whole cluster's slots while <code>node_local_select</code> hashes only within a node's slots.</p>
+<p><strong>Shared vs. partitioned access</strong> is not in this file — it is a property of <em>which paths each rank opens</em>, decided by the benchmark:</p>
+<table>
+<tr><th>Mode</th><th>Who opens what</th><th>Placement effect</th><th>Global copies</th><th>Dup factor</th></tr>
+<tr><td><span class="badge trade">hash</span></td><td>any rank, any path</td><td>scattered; a node misses ~half its own set</td><td>~1&times;</td><td>~1&times; (but fallback ≠ 0)</td></tr>
+<tr><td><span class="badge trade">node_local shared</span></td><td>all nodes open all 996 shards</td><td>each node caches all 996 locally</td><td>1992 (2 nodes)</td><td><strong>2.0&times;</strong></td></tr>
+<tr><td><span class="badge done">node_local partitioned</span></td><td>node0 opens [0,497], node1 opens [498,995]</td><td>each node caches only its half</td><td>996</td><td><strong>1.0&times;</strong></td></tr>
+</table>
+<p>Partitioning is driven from the harness: <code>DINO_SHARD_MODE=partitioned</code> drops the bench's <code>--shared</code> flag so each rank reads a disjoint shard range (the cc12m bench's <code>base = rank * num_shards</code> disjoint mode). The placement code is identical; only the access pattern differs. Result: full local hits at duplicate factor 1.0&times; instead of shared mode's 2.0&times;.</p>
+
+<h3 id="m2-epoch">4d. Cross-epoch consistency: why the same node keeps warm-hitting</h3>
+<p>A natural worry about partitioned placement: in epoch 1 a shard is cached on node 0; in epoch 2, what stops the GPU from looking for it on node 2 and missing? The answer has two halves, and the first one usually surprises people.</p>
+
+<div class="callout">
+<strong>A warm hit never goes to a server.</strong> In epoch 2, <code>mmap(shard)</code> runs <code>fitcache_resolve_cached_path()</code>, which computes the cached path and <code>stat</code>s the <em>local node's own</em> tier directories (<code>FitCache_NVME_PATH=/mnt/bb/$USER/...</code> is a node-local mount) — no RPC, no routing. So "read from node 2's cache" is not a path the warm code can even take: a hit is a local file, a miss falls back to PFS. In single-job <code>node_local</code> mode each node is an island.
+</div>
+
+<p>Two deterministic pieces decide where a file lives and how it is found:</p>
+<ul>
+<li><strong>Which node holds it</strong> — fixed at <em>promotion</em> time (the epoch-1 cold miss). <code>node_local_select()</code> routes the promotion to a server on the requester's own node via <code>SLURM_NODEID</code> (<a href="../src/cross_job/fitcache_cross_job.cpp#L121">cross_job.cpp:121-141</a>), so whatever node 0 reads gets copied into node 0's local tier.</li>
+<li><strong>Where on that node</strong> — the <code>hash(path)</code> two-level bucket (<a href="../src/client/fitcache_multi_source_read.cpp#L302">multi_source_read.cpp:302</a>). Same path &rarr; same bucket every epoch, so the resolver always probes the right place.</li>
+</ul>
+
+<p>The third piece is <em>not</em> FitCachePP's to control — <strong>whether the same node re-reads the same files</strong>. That is the application's data assignment. In the cc12m bench it is fixed by rank, computed once, then reused for every epoch (<a href="../benchmarks/dinov2/cc12m_mmap_bench.py#L107">cc12m_mmap_bench.py:107,164-168</a>):</p>
+
+<span class="filetag">benchmarks/dinov2/cc12m_mmap_bench.py:107 + epoch loop</span>
+<pre><code>base = 0 if args.shared else rank * args.num_shards   # shard set fixed BY RANK
+shard_index = [ ... ]                                 # built ONCE
+for ep in range(args.epochs):                         # every epoch reuses
+    for (sp, sz, members) in shard_index:             #   the SAME shard set
+        ...</code></pre>
+
+<p>So rank <code>r</code> reads shards <code>[r&middot;N, (r+1)&middot;N)</code> in every epoch. Putting it together for two nodes:</p>
+
+<pre><code>            NODE 0  (rank 0 -> shards 0..N-1)        NODE 2  (rank 2 -> shards 2N..3N-1)
+EPOCH 1     mmap shard0  -MISS->  read PFS           mmap shard2N -MISS->  read PFS
+(cold)      open RPC -> node_local_select(shard0)    open RPC -> node_local_select(shard2N)
+                     = a NODE-0 server -> copy to              = a NODE-2 server -> copy to
+            /mnt/bb(node0)/[hash]/shard0             /mnt/bb(node2)/[hash]/shard2N
+
+EPOCH 2     resolver stat /mnt/bb(node0)/[hash]/     resolver stat /mnt/bb(node2)/[hash]/
+(warm)      -> FOUND -> HIT (local mmap, no RPC)     -> FOUND -> HIT (local mmap, no RPC)
+            ^ never looks at node 2's disk           ^ never looks at node 0's disk</code></pre>
+
+<div class="callout warn">
+<strong>The one assumption that must hold.</strong> Cross-epoch reuse needs the per-node access pattern to be <em>stable</em> — the same node re-reads its own partition each epoch. If a pipeline reshuffled the shard-to-rank mapping every epoch, epoch-2 node 0 might want a shard that lives on node 2; node 0's resolver would <code>stat</code> its local disk, miss, fall back to PFS, and <em>re-promote that shard onto node 0</em> — it self-heals locally, it does <strong>not</strong> reach over to node 2. You would pay a one-time cold miss per reshuffled shard. This is fine for the standard WebDataset/DDP pattern, where shards are assigned to ranks once and only the samples <em>within</em> a shard are shuffled, so the per-node shard set is stable. Stated as a paper assumption: <em>warm-hit reuse across epochs assumes a per-node-stable shard partition (shard-to-rank fixed; intra-shard shuffling is fine).</em>
+</div>
+
+<hr>
+
+<h2 id="m3">5. Supporting — Sidecar cache-state recovery <span class="badge supp">Supporting</span></h2>
+<p>A <code>.meta</code> sidecar is written next to each cached file so a restarted server can rebuild its cache map. It restores server-side <em>state</em>; the client warm-hit (Mechanism 1) is already server-map-independent, so the sidecar is not the bandwidth source.</p>
+
+<h3 id="m3-write">5a. Writing a sidecar on promotion</h3>
+<p>The data mover thread does the physical copy and writes the sidecar in one place, at <a href="../src/server/fitcache_data_mover.cpp#L482">fitcache_data_mover.cpp:482</a>:</p>
+<span class="filetag">src/server/fitcache_data_mover.cpp:482</span>
+<pre><code>            size_t h = std::hash&lt;std::string&gt;{}(original_path);
+            char subdir[8];
+            sprintf(subdir, "%02zx/%02zx", (h &gt;&gt; 8) &amp; 0xFF, h &amp; 0xFF);   // SAME bucket as resolver
+            string dirpath = basepath + "/" + subdir;
+            fs::create_directories(dirpath);
+            string filename = dirpath + "/" + fs::path(original_path).filename().string();
+
+            try {
+                fs::copy(original_path, filename);            // PFS → local tier
+                path_cache_map[original_path] = filename;
+                switch (target_tier) { /* bump g_*_used_bytes */ }
+
+                if (fitcache::persist_meta_enabled()) {       // ← the gate (section 5d)
+                    fitcache::fitcache_file_meta_v1 meta =
+                        fitcache::meta_make_initial(
+                            original_path, file_size,
+                            fitcache::get_self_dataset_manifest_hash());
+                    fitcache::meta_write_sidecar(filename, meta);
+                }</code></pre>
+<p>The line that ties Mechanism 1 and 3 together is <code>sprintf(subdir, "%02zx/%02zx", (h&gt;&gt;8)&amp;0xFF, h&amp;0xFF)</code> — byte-for-byte the same bucket computation the client resolver uses at <a href="../src/client/fitcache_multi_source_read.cpp#L302">multi_source_read.cpp:302</a>. That shared formula is the contract: the server writes here, the client looks here, no message is exchanged.</p>
+
+<h3 id="m3-format">5b. The sidecar format + atomic write</h3>
+<p><code>meta_make_initial</code> at <a href="../src/cross_job/fitcache_persistent_meta.cpp#L64">persistent_meta.cpp:64</a> builds a fixed-size record:</p>
+<span class="filetag">src/cross_job/fitcache_persistent_meta.cpp:64 (fields)</span>
+<pre><code>m.magic            = FITCACHE_META_MAGIC;     // sanity tag
+m.version          = FITCACHE_META_VERSION;
+m.dataset_id_hash  = dataset_id_hash;         // which dataset this belongs to
+m.original_size    = original_size;           // used to bump used-bytes on restore
+m.cached_at_unix   = now;  m.last_access_unix = now;
+m.access_count     = 0;    m.refcount         = 0;
+strncpy(m.original_path, original_path, ...);  // the key for path_cache_map</code></pre>
+<p>The write is atomic via temp-file + fsync + rename, at <a href="../src/cross_job/fitcache_persistent_meta.cpp#L83">persistent_meta.cpp:83</a>:</p>
+<span class="filetag">src/cross_job/fitcache_persistent_meta.cpp:83</span>
+<pre><code>const std::string final_path = cached_path + ".meta";
+const std::string tmp_path   = final_path + ".tmp." + std::to_string(getpid());
+int fd = open(tmp_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+// ... write the whole struct, looping on partial writes / EINTR ...
+fdatasync(fd);
+close(fd);
+rename(tmp_path.c_str(), final_path.c_str());   // POSIX-atomic publish</code></pre>
+<p>A reader therefore sees either the old sidecar or the new one, never a torn one. The per-pid temp suffix avoids collisions between concurrent server processes on the same node. On read, <code>meta_read_sidecar</code> validates <code>magic</code> + <code>version</code> and the scan helper quarantines anything that fails to <code>&lt;path&gt;.broken</code> rather than deleting it.</p>
+
+<h3 id="m3-restore">5c. <code>restore_from_sidecars()</code> on startup</h3>
+<p>At <a href="../src/server/fitcache_data_mover.cpp#L208">fitcache_data_mover.cpp:208</a>. On boot the server scans each tier directory and rebuilds the in-memory map:</p>
+<span class="filetag">src/server/fitcache_data_mover.cpp:208</span>
+<pre><code>int fitcache_data_mover_restore_from_sidecars() {
+    // for each of FitCache_{DRAM,PMEM,NVME}_PATH that is set:
+    auto make_restorer = [&amp;](uint64_t &amp;target_used) {
+        return [&amp;target_used](const std::string &amp;cached_path,
+                              const fitcache::fitcache_file_meta_v1 &amp;meta) {
+            std::unique_lock&lt;std::shared_mutex&gt; wlock(cache_mtx);
+            path_cache_map[meta.original_path] = cached_path;   // rebuild the map
+            target_used += meta.original_size;                  // restore used-bytes
+        };
+    };
+    int n = fitcache::meta_scan_tier_dir(dram_env, make_restorer(g_dram_used_bytes));
+    // ... same for PMem, NVMe; sum into total_restored ...
+    return total_restored;
+}</code></pre>
+<p>The <code>meta_scan_tier_dir</code> walker (at <a href="../src/cross_job/fitcache_persistent_meta.cpp#L247">persistent_meta.cpp:247</a>) recursively finds every <code>*.meta</code>, strips the suffix to get the cached path, skips orphaned sidecars whose data file is gone, validates each, and calls the visitor. The visitor above re-inserts <code>original_path → cached_path</code> and adds back the bytes. After this, the server's eviction/promotion accounting is correct again and it won't re-promote files it already has. This is the measured "restored 996/996 in 5 s, missing 0" result.</p>
+<p>The call is wired into server startup at <a href="../src/server/fitcache_server.cpp#L210">fitcache_server.cpp:210</a>, also behind the gate:</p>
+<span class="filetag">src/server/fitcache_server.cpp:210</span>
+<pre><code>if (fitcache::persist_meta_enabled()) {
+    int restored = fitcache_data_mover_restore_from_sidecars();
+    // ... log restored count ...
+}</code></pre>
+
+<h3 id="m3-gate">5d. The <code>persist_meta_enabled()</code> gate</h3>
+<p>Sidecar write + restore is decoupled from the heavyweight cross-job machinery, at <a href="../src/cross_job/fitcache_cross_job.cpp#L171">cross_job.cpp:171</a>:</p>
+<span class="filetag">src/cross_job/fitcache_cross_job.cpp:171</span>
+<pre><code>bool persist_meta_enabled() {
+    static int cached = -1;
+    if (cached &lt; 0) {
+        const char *v = std::getenv("FitCache_PERSIST_META");
+        int explicit_on = (v &amp;&amp; std::strcmp(v, "1") == 0) ? 1 : 0;
+        cached = (explicit_on || cross_job_enabled()) ? 1 : 0;   // auto-on under cross-job
+    }
+    return cached != 0;
+}</code></pre>
+<p>Why this exists: the original gate ran the full cross-job stack (registry init + heartbeat + sibling-refresh threads) for any test that merely wanted sidecar persistence, and those background threads skewed Horovod ranks at n=32768/1N. <code>FitCache_PERSIST_META=1</code> turns on just the sidecar write + restore — no registry, no peer-lookup, no extra threads — so a single-job run can get cache durability across restart without the latency tax. It is auto-on under cross-job (which needs the sidecars for peer discovery anyway).</p>
+
+<hr>
+
+<h2 id="exp">6. What we ran — the experiments</h2>
+<p>Every performance cell passes a hard FitCachePP-vs-<code>Native_mmap_PFS</code> checksum-equality gate (per-rank for multi-seed benches) plus a decode gate where applicable. Full tables on <a href="experiments.html">experiments.html</a>; the headline shape:</p>
+<table>
+<tr><th>Contribution</th><th>Workload / cells</th><th>Result</th><th>Harness</th></tr>
+<tr><td>1 — mmap path</td><td>Megatron N=1–16 (+ scale ladder 32–256); GNN IGB-large N=1–16; DINOv2 CC12M 996/996 N=1–16</td><td>warm-hit 1.2–1.6&times; (Megatron); GNN ~6&times; vs favorable / 22–30&times; vs cold Lustre (regime-pinned, supersedes 18–33&times;); 1.6–1.95&times; (DINOv2); warm flat 175–178&nbsp;s across 32–128 nodes</td><td><code>benchmarks/{megatron,gnn,dinov2}/*</code> + <code>results/frontier/{*_warmhit_sweep,megatron_scale_ladder,mmap_dram_tier,gnn_regime_pinned}/</code></td></tr>
+<tr><td>2 — placement</td><td>Megatron N=2/4, GNN N=2, DINOv2 N=2 shared + partitioned, vs hash baseline</td><td>fallback 0, remote 0; partitioned dup 1.0&times; vs shared 2.0&times;</td><td><code>frontier_sidecar_recovery.sh</code> with <code>PLACEMENT=node_local</code> / <code>DINO_SHARD_MODE</code></td></tr>
+<tr><td>3 — sidecar</td><td>recovery N=1; with/no-sidecar ablation; restore scaling 32→996</td><td>restore ~flat 5–6 s; client warm-hits in both ablation arms</td><td><code>frontier_sidecar_recovery.sh</code></td></tr>
+</table>
+<p>The harness wires the placement env at <a href="../scripts/frontier/frontier_sidecar_recovery.sh#L122">frontier_sidecar_recovery.sh:122</a> (<code>export FITCACHE_MMAP_PLACEMENT=$PLACEMENT</code>) and selects shared/partitioned at line 77 (<code>SHARED_ARG="--shared"; [ "$DINO_SHARD_MODE" = "partitioned" ] &amp;&amp; SHARED_ARG=""</code>).</p>
+
+<h2 id="status">7. What is done vs. what remains</h2>
+<table>
+<tr><th>Item</th><th>State</th></tr>
+<tr><td>mmap + mmap64 interception, warm-hit direct local-tier path, tracker, munmap</td><td><span class="badge done">DONE</span> — built, checksum-gated across 3 workload classes N=1–16</td></tr>
+<tr><td>Client-side resolver with completeness gate (no RPC)</td><td><span class="badge done">DONE</span></td></tr>
+<tr><td>Open-time promotion (fixes the empty-cache-under-fd-reuse bug)</td><td><span class="badge done">DONE</span></td></tr>
+<tr><td>Node-local placement + partitioned access (1.0&times; dup)</td><td><span class="badge done">DONE</span> — fallback 0 / remote 0 in all cells</td></tr>
+<tr><td>Sidecar write + atomic publish + restore-on-startup + gate</td><td><span class="badge done">DONE</span> — recovery, ablation, scaling all measured</td></tr>
+<tr><td>&gt;2 GiB read-truncation fix (server short-read loop + ≤1 GiB chunked populate)</td><td><span class="badge done">DONE</span> — was the bug that invalidated the old 1 TB sweep</td></tr>
+<tr><td>Cross-job HRW sharing path</td><td><span class="badge supp">Future work</span> — code present, not a paper claim; concurrent-mode <code>DataLossError</code> un-root-caused</td></tr>
+<tr><td>Node-local placement at N=8/16</td><td><span class="badge supp">Not required</span> to demonstrate the policy; N=2/4 suffice</td></tr>
+<tr><td>Eager-populate via Mercury anon-mmap</td><td><span class="badge bad">Superseded</span> — replaced by the warm-hit direct path</td></tr>
+</table>
+<p><strong>Bottom line:</strong> both contributions and the supporting mechanism are implemented and gated. Nothing is missing for the current claims (C1–C4 on <a href="paper.html">paper.html</a>); the only open items are explicitly scoped as future work.</p>
+
+<footer>
+Last updated: 2026-05-24<br>
+Generated from the source tree (line numbers verified against the working copy at write time). No markdown source was modified.
+</footer>
+
+</body>
+</html>

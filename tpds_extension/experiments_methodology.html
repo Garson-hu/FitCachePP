@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FitCachePP — Experiments Methodology (how we run &amp; measure)</title>
+<style>
+  :root { --fg:#1b1f24; --muted:#57606a; --border:#d0d7de; --bg:#ffffff; --code-bg:#f6f8fa;
+          --accent:#0969da; --th-bg:#f6f8fa; --warn:#9a6700; }
+  * { box-sizing:border-box; }
+  body { color:var(--fg); background:var(--bg);
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+         line-height:1.6; max-width:1060px; margin:0 auto; padding:2.5rem 1.5rem 6rem; }
+  h1,h2,h3,h4 { line-height:1.25; margin-top:1.6em; margin-bottom:.5em; font-weight:600; }
+  h1 { font-size:1.85rem; border-bottom:1px solid var(--border); padding-bottom:.3em; }
+  h2 { font-size:1.4rem; border-bottom:1px solid var(--border); padding-bottom:.22em; margin-top:2.2em; }
+  h3 { font-size:1.16rem; color:#24292f; }
+  h4 { font-size:1rem; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; margin-bottom:.3em; }
+  a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
+  code { background:var(--code-bg); padding:.12em .35em; border-radius:6px;
+         font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:.85em; }
+  pre { background:var(--code-bg); padding:.9rem 1rem; border-radius:8px; overflow:auto;
+        font-size:.8rem; line-height:1.5; border:1px solid var(--border); }
+  pre code { background:none; padding:0; font-size:inherit; }
+  table { border-collapse:collapse; width:100%; margin:1em 0; font-size:.86rem; display:block; overflow-x:auto; }
+  th,td { border:1px solid var(--border); padding:.42em .6em; text-align:left; vertical-align:top; }
+  th { background:var(--th-bg); font-weight:600; }
+  tr:nth-child(even) td { background:var(--code-bg); }
+  .src { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:.78rem; color:var(--muted); }
+  .callout { border-left:4px solid var(--accent); background:var(--code-bg); padding:.6em 1em;
+             border-radius:0 8px 8px 0; margin:1em 0; }
+  .callout.warn { border-left-color:var(--warn); }
+  .note { color:var(--muted); font-size:.92em; }
+  .toc { background:var(--code-bg); border:1px solid var(--border); border-radius:8px; padding:.9em 1.3em; }
+  .toc ol { margin:.3em 0; } .toc li { margin:.2em 0; }
+  hr { border:none; border-top:1px solid var(--border); margin:2.2em 0; }
+  footer { margin-top:3em; padding-top:1.2em; border-top:1px solid var(--border); color:var(--muted); font-size:.84rem; }
+  .pill { display:inline-block; font-size:.72rem; font-weight:700; padding:.1em .55em; border-radius:11px;
+          background:#ddf4ff; color:#0969da; }
+</style>
+</head>
+<body>
+
+<h1>FitCachePP — Experiments Methodology</h1>
+<p class="note">How each experiment is <strong>built, run, and measured</strong> — datasets &amp; formats, the access pattern that
+stands in for a "model" in these I/O benchmarks, and the exact run procedure. This document is about <strong>method, not
+results</strong>; every claim is sourced to <code>file:line</code> in the repo. Companion pages:
+<a href="../EXPERIMENTS_STATUS.html">EXPERIMENTS_STATUS.html</a> ·
+<a href="experiments.html">experiments.html</a> · <a href="implementation_walkthrough.html">implementation_walkthrough.html</a>.</p>
+
+<div class="toc">
+<strong>Contents</strong>
+<ol>
+<li><a href="#platform">Platform &amp; software stack</a></li>
+<li><a href="#glossary">Glossary (cold / warm-hit-prestaged / warm / amortized / regime-pinned)</a></li>
+<li><a href="#common">Common experimental machinery</a> — server launch · tiers &amp; hash-bin path · pre-stage · eviction · checksum gate · two-view reporting</li>
+<li><a href="#megatron">Workload 1 — Megatron (dense-sequential LLM)</a></li>
+<li><a href="#gnn">Workload 2 — GNN feature gather (sparse-random, IGB-large)</a></li>
+<li><a href="#dinov2">Workload 3 — DINOv2 / CC12M (sequential vision tar)</a></li>
+<li><a href="#placement">Method variant — access-aware placement</a></li>
+<li><a href="#scaleladder">Method variant — Megatron scale ladder (32–256 nodes)</a></li>
+<li><a href="#dramtier">Method variant — DRAM-tier (tmpfs) proof</a></li>
+<li><a href="#sidecar">Method variant — sidecar recovery (4 phases)</a></li>
+<li><a href="#honesty">Methodological honesty &amp; known limitations</a></li>
+</ol>
+</div>
+
+<h2 id="platform">1. Platform &amp; software stack</h2>
+<table>
+<tr><th>Item</th><th>Detail</th><th>Source</th></tr>
+<tr><td>System</td><td>ORNL <strong>Frontier</strong> (HPE Cray EX). Per node: 1× AMD EPYC CPU, 4× MI250X GPUs (8 logical GCDs), <strong>512 GiB</strong> DDR4 RAM, HPE Slingshot.</td><td class="src">benchmarks/sites/frontier.sh:3-6</td></tr>
+<tr><td>Parallel FS (PFS)</td><td><strong>Orion</strong> Lustre. All datasets live under <code>/lustre/orion/gen008/proj-shared/ghu4/data/…</code>.</td><td class="src">frontier.sh; per-bench DATA_DIR</td></tr>
+<tr><td>Node-local fast tier</td><td><strong>NVMe burst buffer</strong> <code>/mnt/bb/$USER</code> (2×1.92 TB), provisioned per job via <code>#SBATCH -C nvme</code>. <strong>tmpfs</strong> at <code>/tmp</code> (RAM-backed) used as the DRAM tier.</td><td class="src">frontier.sh:83-98</td></tr>
+<tr><td>FitCache client</td><td><code>libfitcache_client.so</code> injected with <code>LD_PRELOAD</code>; intercepts <code>mmap</code>/<code>mmap64</code> (+ open/read/pread/close). Omitting <code>LD_PRELOAD</code> = the <code>Native_mmap_PFS</code> baseline.</td><td class="src">FITPP_CLIENT_LIB; all warmhit scripts</td></tr>
+<tr><td>FitCache servers</td><td><code>fitcache_server</code> binary, default <strong>4 per node</strong>, launched as a separate <code>srun</code> step (see §3).</td><td class="src">frontier.sh:131 (FITPP_SERVERS_PER_NODE_DEFAULT=4)</td></tr>
+<tr><td>Python</td><td>PyTorch+ROCm env (<code>torch_rocm</code>); NumPy is the actual I/O engine for the benchmarks (numpy.memmap).</td><td class="src">frontier.sh:45-46</td></tr>
+</table>
+
+<h2 id="glossary">2. Glossary</h2>
+<p>These benchmarks are <strong>I/O benchmarks</strong>: there is no model forward/backward pass. The "model" is replaced by a
+deterministic <em>access pattern</em> + a <em>byte-touch</em> that forces every read through the page-fault path. Terms used
+throughout:</p>
+<table>
+<tr><th>Term</th><th>Meaning in these experiments</th></tr>
+<tr><td><strong>cold</strong> (native baseline)</td><td>First read of a file whose pages are <em>not</em> resident — for <code>Native_mmap_PFS</code> this is an organic read straight from Lustre, run after a page-cache eviction. This is the comparison baseline.</td></tr>
+<tr><td><strong>warm-hit-prestaged</strong></td><td>FitCachePP's epoch&nbsp;0: the file was pre-copied to a local tier, so the very first pass already faults from local NVMe/DRAM (not Lustre). Semantically a warm hit, temporally the first epoch. Tagged <code>warm-hit-prestaged</code> in the logs.</td></tr>
+<tr><td><strong>warm</strong> (page-cache resident)</td><td>Epoch&nbsp;1+: re-reading the same bytes when they are already in the OS page cache (applies to both sides).</td></tr>
+<tr><td><strong>amortized</strong></td><td>Total wall over all epochs <em>including</em> the one-time pre-stage cost; reported as a break-even-in-epochs view (see §3.6).</td></tr>
+<tr><td><strong>regime-pinned</strong></td><td>Per-node working set is sized <em>&gt; node RAM</em> (e.g. 640 GiB &gt; 512 GiB) so neither side can hide the read behind the page cache — every epoch hits a storage tier. Prevents a page-cache artifact.</td></tr>
+<tr><td><strong>checksum gate</strong></td><td>The hard correctness test: FitCachePP and Native must produce <em>byte-identical</em> checksums (per rank) over the same access plan, or the cell fails.</td></tr>
+</table>
+
+<hr>
+
+<h2 id="common">3. Common experimental machinery</h2>
+
+<h3>3.1 Server launch &amp; rendezvous</h3>
+<p>Servers run as a <strong>separate, backgrounded <code>srun</code> step</strong> alongside the benchmark step. Each node runs
+<code>SERVERS_PER_NODE=4</code> server processes; <code>TOTAL_SERVERS = N_NODES × 4</code>. Port endpoints are written to
+<code>.ports.cfg.$SLURM_JOBID</code> under <code>FitCache_PORTS_CFG_DIR</code>, which the client reads to find servers.</p>
+<pre><code># servers (backgrounded), then the benchmark step
+srun -N $N_NODES -n $TOTAL_SERVERS --ntasks-per-node=$SERVERS_PER_NODE \
+     --cpus-per-task=1 --cpu-bind=cores "$FITPP_SERVER_BIN" $TOTAL_SERVERS \
+     &gt; "$RESULTS_DIR/server.log" 2&gt;&amp;1 &amp;
+sleep 15                       # readiness (older scripts); scale-ladder polls the port-cfg file instead</code></pre>
+<p class="src">scripts/frontier/frontier_sidecar_recovery.sh:136-139 · scale-ladder job.sh polls port-cfg (harness fix)</p>
+<p class="note">Note: for the <em>warm-hit</em> measurements the servers are not on the read critical path at all — the warm hit is a
+client-side resolver + local <code>mmap</code> (see §4–§6). Servers still run so the open-RPC/promotion path stays realistic.</p>
+
+<h3>3.2 Tier configuration &amp; the deterministic hash-bin path</h3>
+<p>Two cache tiers are configured by env var; capacities are tuned per experiment (often DRAM is set <em>tiny</em> on purpose so
+the resolver lands on NVMe):</p>
+<pre><code>export FitCache_DRAM_PATH=/tmp/fitcachepp_&lt;tag&gt;_dram          # tmpfs (RAM-backed)
+export FitCache_NVME_PATH=/mnt/bb/$USER/fitcachepp_&lt;tag&gt;_nvme  # burst-buffer NVMe
+export FitCache_DRAM_CAPACITY=$((256*1024*1024))             # e.g. 256 MiB -&gt; forces NVMe tier
+export FitCache_NVME_CAPACITY=$((2000*1024*1024*1024))       # e.g. 2 TB
+export FitCache_LOG_LEVEL=600    # verbose server logging
+export FitCache_CROSS_JOB=0      # single-job mode for all reported experiments</code></pre>
+<p>Both the server (data mover) and the client (warm-hit resolver) compute the <strong>same deterministic cached path</strong>, so
+a pre-staged copy is found with no RPC. The path scheme (used by the pre-stage tool and the resolver alike):</p>
+<pre><code>// tools/fitcache_cached_path.cpp:14-19
+size_t h = std::hash&lt;std::string&gt;(original_path);
+subdir   = sprintf("%02zx/%02zx", (h &gt;&gt; 8) &amp; 0xFF, h &amp; 0xFF);
+cached   = tier_base + "/" + subdir + "/" + basename(original_path);</code></pre>
+<p class="src">tools/fitcache_cached_path.cpp:14-19 · benchmarks/sites/frontier.sh:83-98</p>
+
+<h3>3.3 Pre-staging (warm-hit setup)</h3>
+<p>To measure a <em>warm hit</em>, each node copies the files it will read from the PFS into its local tier at the resolver's
+hash-bin location, using the <code>fitcache_cached_path</code> tool. The pre-stage wall is reported <strong>separately</strong> (it is
+not charged as a cold epoch).</p>
+<pre><code>dst=$("$FITPP_REPO/tools/fitcache_cached_path" "$src" "$FitCache_NVME_PATH")
+mkdir -p "$(dirname "$dst")"
+if [ ! -f "$dst" ] || [ "$(stat -c %s "$dst")" != "$(stat -c %s "$src")" ]; then
+  cp "$src" "$dst"        # whole-file copy; resolver gate is a full-size match
+fi</code></pre>
+<p class="src">frontier_megatron_warmhit_sweep.sh:75-86 · frontier_gnn_warmhit_sweep.sh:98-102</p>
+<div class="callout warn"><strong>Gate is size-match, not content hash.</strong> The pre-stage / resolver acceptance test is
+"file exists AND size equals the original" — there is no per-file content hash at stage time. A corrupt same-size copy would pass
+the stage gate, but it would be caught end-to-end by the checksum-equality gate (§3.5), which compares the actual bytes touched
+against the native baseline.</div>
+
+<h3>3.4 Page-cache eviction (enforcing "cold")</h3>
+<p>Before a <em>native cold</em> measurement (and before each FitCachePP rep in the regime-pinned/scale-ladder runs), the page
+cache is flushed with a memory-pressure tool, <code>benchmarks/util/mem_hog.c</code> (allocate + touch every 4 KiB page of a large
+<code>MAP_PRIVATE|MAP_ANONYMOUS</code> region so the kernel evicts file-backed pages). A bounded loop reads <code>Cached:</code> from
+<code>/proc/meminfo</code> and hogs until it drops below a threshold:</p>
+<pre><code>evict_all() {  # scale-ladder, per node, before each rep
+  srun --overlap -N $N -n $N --ntasks-per-node=1 --cpus-per-task=16 bash -c '
+    for pass in 1 2 3 4 5; do
+      cached_gb=$(awk "/^Cached:/{printf \"%d\", \$2/1048576}" /proc/meminfo)
+      [ $cached_gb -le 8 ] &amp;&amp; break        # target: Cached <= 8 GB
+      hog=$((cached_gb+30)); per=$(( (hog+7)/8 ))
+      for i in 1 2 3 4 5 6 7 8; do "$RESULTS_DIR/mem_hog" $per 1 &gt;/dev/null 2&gt;&amp;1 &amp; done; wait
+    done'
+}</code></pre>
+<p class="src">megatron_scale_ladder/…/job.sh:43-59 · gnn_regime_pinned/…/job.sh:44-64 · benchmarks/util/mem_hog.c:64 · (older scripts also use <code>posix_fadvise(POSIX_FADV_DONTNEED)</code>: frontier_llm_dataloader_compare.sh:107-120)</p>
+<div class="callout warn"><strong>Eviction is best-effort.</strong> On 512 GiB nodes with a <em>tiny</em> working set (e.g. GNN touches
+only ~2.67 GB), <code>mem_hog</code> cannot always fully evict — so for GNN, <strong>rep 1 (cleanest eviction) is the anchor</strong> and
+rep 2/3 (which retained page cache) are kept for variance context only. Reproducers should verify <code>/proc/meminfo</code>.</div>
+
+<h3>3.5 The checksum-equality gate (correctness)</h3>
+<p>Every benchmark forces real byte reads with a vectorized sum and prints a <code>GLOBAL_CHECKSUM</code> per rank. The harness
+compares the <strong>full set of per-rank checksums</strong> (sorted <code>rank=cksum</code> pairs), not just rank&nbsp;0 — FitCachePP
+and Native must match exactly, or the cell is a FAIL:</p>
+<pre><code>pairs() { grep 'SUMMARY' "$1" | sed -nE 's/.*rank=([0-9]+).*GLOBAL_CHECKSUM=([0-9]+).*/\1=\2/p' | sort -n; }
+if [ "$(pairs native.log)" = "$(pairs fitcachepp.log)" ]; then echo "CHECKSUM_GATE: PASS"; else echo FAIL; fi</code></pre>
+<p class="src">frontier_gnn_warmhit_sweep.sh:159-173 · frontier_megatron_warmhit_sweep.sh:127-132</p>
+<p>The byte-touch differs slightly per workload (all reduce to an int64 to avoid overflow over TB-scale runs):
+Megatron sums a <code>uint16</code> view; GNN sums a <code>uint32</code> view masked to 63 bits; DINOv2 sums a <code>uint8</code> view
+masked to 63 bits. The same dtype/view is used on both sides, so equality is exact.
+<span class="src">llm_coverage_bench.py:100 · gnn_feature_bench.py:198 · cc12m_mmap_bench.py:170</span></p>
+
+<h3>3.6 Two-view reporting (mechanism vs. amortized)</h3>
+<p>Each summary reports two views so the pre-stage cost is never hidden:</p>
+<ul>
+<li><strong>View 1 — warm-hit-only (mechanism):</strong> warm epoch vs native epoch, isolating the local-tier-mmap speedup.</li>
+<li><strong>View 2 — amortized incl. pre-stage:</strong> break-even epoch <code>E</code> where <code>pre_stage + E·warm &lt; E·cold</code>,
+reported at E = 1…5.</li>
+</ul>
+<p class="src">frontier_dinov2_warmhit_sweep.sh:135-147</p>
+
+<hr>
+
+<h2 id="megatron">4. Workload 1 — Megatron (dense-sequential LLM)</h2>
+
+<h4>Dataset &amp; format</h4>
+<table>
+<tr><td>What</td><td>Synthetic <strong>Megatron IndexedDataset</strong> (real on-disk format, meaningless content) — exercises the exact numpy.memmap I/O shape of a tokenized corpus.</td></tr>
+<tr><td>Format</td><td><code>shard_NNNN.bin</code> = raw <strong>uint16 tokens</strong> (2 bytes/token); <code>shard_NNNN.idx</code> = Megatron index written by <code>_IndexWriter(idx, np.uint16)</code>. Tokens uniform-random in <code>[0, 50256)</code>; doc length 2048 tokens.</td></tr>
+<tr><td>Size</td><td><strong>16 GiB/shard</strong>; runs use 40 shards (640 GiB/node, the warm-hit sweep + scale ladder) or 64 shards (1 TB corpus). 16 GiB shard ≈ 4.2 M docs.</td></tr>
+<tr><td>Generation</td><td><code>python generate_synth_corpus_sharded.py --output-dir P --num-shards N --shard-bytes $((16*1024**3)) --doc-len 2048 [--seed 42] [--parallel-workers W]</code> (chunked <code>rng.integers(0,50256,dtype=uint16)</code> writes + matching <code>.idx</code>).</td></tr>
+<tr><td>Location</td><td><code>/lustre/orion/gen008/proj-shared/ghu4/data/megatron/synth_1tb_64x16gb/</code></td></tr>
+</table>
+<p class="src">generate_synth_corpus_sharded.py:1-35,53-109 · llm_coverage_bench.py:41-48 · frontier_megatron_warmhit_sweep.sh:32</p>
+
+<h4>"Model" / access pattern</h4>
+<p>No model. The driver is <code>llm_coverage_bench.py</code>: each shard is <code>mmap</code>'d as one region; it touches a
+<code>--coverage</code> fraction of the shard via <code>--n-chunks</code> contiguous segments spread evenly across the shard, summing the
+<code>uint16</code> view into <code>GLOBAL_CHECKSUM</code>. Multi-node: rank <code>R</code> of <code>N</code> reads shards
+<code>[R, R+N, R+2N, …]</code> (uniform load). (A second driver, <code>llm_dataloader_bench_sharded.py</code>, uses
+<code>IndexedDataset.get(doc, length=seq_length)</code> for random-sequence reads; the warm-hit sweep uses the coverage bench.)</p>
+<p class="src">llm_coverage_bench.py:44-47,87-102 · llm_dataloader_bench_sharded.py:101-103,177-182</p>
+
+<h4>How we ran it (warm-hit sweep)</h4>
+<ul>
+<li><strong>Node counts:</strong> N ∈ {1, 2, 4, 8, 16}; each node runs the identical workload (40 shards/node, replicated).</li>
+<li><strong>Servers:</strong> 4/node.</li>
+<li><strong>Epochs:</strong> <code>EPOCHS=2</code> — epoch 0 = cold (warm-hit-prestaged for FCP), epoch 1 = warm (page-cache resident); <code>--coverage 1.0 --n-chunks 4000 --seed</code>.</li>
+<li><strong>Pre-stage:</strong> every node copies all 40 shards to <code>/mnt/bb/$USER/…</code> at the hash-bin path before timing.</li>
+<li><strong>Two arms, same nodes:</strong> one run with <code>LD_PRELOAD</code> (FitCachePP), one without (Native baseline).</li>
+</ul>
+<pre><code>srun -N $N -n $N --ntasks-per-node=1 --cpus-per-task=8 --cpu-bind=cores bash -c \
+  'LD_PRELOAD="$FITPP_CLIENT_LIB" "$PY" llm_coverage_bench.py \
+     --data-dir $PFS_DIR --num-shards 40 --coverage 1.0 --n-chunks 4000 \
+     --epochs 2 --seed $SEED --label FitCachePP_warmhit_mmap'</code></pre>
+<p class="src">frontier_megatron_warmhit_sweep.sh:104-116 · env at :62-72 (DRAM 40 GiB, NVMe 2 TB)</p>
+
+<hr>
+
+<h2 id="gnn">5. Workload 2 — GNN feature gather (sparse-random, IGB-large)</h2>
+
+<h4>Dataset &amp; format</h4>
+<table>
+<tr><td>What</td><td><strong>Real IGB-large</strong> heterogeneous academic graph: 100 M paper nodes, 116.96 M author nodes, 2 relations (<code>paper_cites_paper</code>, <code>paper_written_by_author</code>).</td></tr>
+<tr><td>Format</td><td>Node features: raw <strong>float32</strong> numpy arrays, <code>paper_node_feat.npy</code> shape (100 M, 1024), <code>author_node_feat.npy</code> shape (116.96 M, 1024). Each feature row = 1024×4 = <strong>4096 B = page-aligned</strong>. Graph in <strong>CSR</strong> (int64 <code>indptr</code> + <code>indices</code>).</td></tr>
+<tr><td>Size</td><td>paper_node_feat <strong>409.6 GB</strong> + author_node_feat <strong>479.1 GB</strong> + CSR (~14 GB) = <strong>~902 GB</strong> total (features alone ~889 GB).</td></tr>
+<tr><td>Generation</td><td>CSR built by <code>build_igb_csr.py</code> from <code>edge_index.npy</code> (argsort by src, <code>bincount</code> degree, <code>cumsum</code> → indptr). Features are the real IGB-large arrays.</td></tr>
+<tr><td>Location</td><td><code>/lustre/orion/gen008/proj-shared/ghu4/data/gnn/igb_large_real/</code></td></tr>
+</table>
+<p class="src">gnn_feature_bench.py:11-14,67-68 · build_igb_csr.py:32-66 · frontier_gnn_warmhit_sweep.sh:43</p>
+
+<h4>"Model" / access pattern</h4>
+<p>The "model" is a <strong>2-hop heterogeneous graph sampler</strong> driving a sparse feature gather (no GNN layers, no training):</p>
+<ol>
+<li>Pick <strong>1024 random seed papers</strong> (hop 0).</li>
+<li>Hop 1: sample ≤<strong>12</strong> paper→paper neighbours + ≤<strong>8</strong> paper→author neighbours (<code>--fanout-pp 12 --fanout-pa 8</code>).</li>
+<li>Hop 2: sample ≤<strong>8</strong> paper→paper neighbours of the hop-1 papers (sub-sampled to ≤4096) (<code>--fanout-pp2 8</code>).</li>
+<li>Dedup the union of touched paper + author row ids; <strong>block-major mmap gather</strong>: partition rows by 12 GiB blocks (3,145,728 rows), <code>mmap</code> each block via offset, scatter-gather its rows, sum the <code>uint32</code> view → masked checksum.</li>
+</ol>
+<p>This touches only <strong>~2.67 GB (~0.3 %)</strong> of the 902 GB corpus — the sparse, random, small-row access pattern that is
+pathological on Lustre. 20 batches × 1024 seeds per epoch.</p>
+<p class="src">gnn_feature_bench.py:36-58,190-203 · touched_rows/bytes in the run log</p>
+
+<h4>How we ran it (regime-pinned, 2026-06-14)</h4>
+<ul>
+<li><strong>Node count:</strong> N=1; servers 4/node.</li>
+<li><strong>Pre-stage:</strong> the 6 feature+CSR files copied <em>whole</em> to <code>/mnt/bb/$USER/…</code> (whole-file because the resolver gate is a full-size match, and the random gather can touch any row).</li>
+<li><strong>FitCachePP arm:</strong> 2 epochs × <strong>3 reps</strong>; <code>mem_hog</code> eviction before each rep. Epoch 0 = evicted NVMe-bound warm hit; epoch 1 = page-cache-resident reuse.</li>
+<li><strong>Native arm:</strong> run as <strong>separate single-rep jobs</strong> (<code>gnn_nat1/2/3</code>), 1 evicted epoch each — because one evicted native epoch alone takes 35–50 min.</li>
+</ul>
+<pre><code>srun --overlap -N 1 -n 1 --ntasks-per-node=1 --cpus-per-task=8 --cpu-bind=cores bash -c \
+  'LD_PRELOAD="$FITPP_CLIENT_LIB" python gnn_feature_bench.py --data-dir $DATA \
+     --num-batches 20 --batch-size 1024 --fanout-pp 12 --fanout-pa 8 --fanout-pp2 8 \
+     --block-bytes 12884901888 --epochs 2 --seed 0 --label FitCachePP_regimepinned'</code></pre>
+<p class="src">gnn_regime_pinned/…/job.sh:28-100 · gnn_nat1/job.sh:10-12,41-42 · env DRAM 256 MiB / NVMe 3 TB</p>
+<div class="callout"><strong>Baseline pairing is asymmetric — by design and stated honestly.</strong> The comparison is
+"FitCachePP <em>warm-hit-prestaged</em>" vs "Native <em>organic cold-from-Lustre</em>" (separate evicted jobs), not warm-vs-warm.
+That is the intended question (local tier vs PFS); the checksum gate proves both touch identical bytes.</div>
+
+<hr>
+
+<h2 id="dinov2">6. Workload 3 — DINOv2 / CC12M (sequential vision tar)</h2>
+
+<h4>Dataset &amp; format</h4>
+<table>
+<tr><td>What</td><td><strong>Real CC12M-wds</strong> WebDataset (image-caption shards).</td></tr>
+<tr><td>Format</td><td><strong>996</strong> uncompressed tar shards <code>cc12m-train-NNNN.tar</code> (<code>0000…0995</code>); each holds <code>.jpg/.json/.txt</code> triplets. Tar headers (512-byte blocks) are parsed <em>directly from the mmap</em> to find <code>.jpg</code> offsets — no extra <code>read()</code> syscalls.</td></tr>
+<tr><td>Size</td><td>~<strong>540 MB/shard</strong> (513–526 MB actual) → <strong>~541 GB</strong> total, 5,020,836 jpgs. Per-rank working set = <code>NUM_SHARDS × 540 MB</code> (e.g. 32 shards ≈ 17.3 GB).</td></tr>
+<tr><td>Generation</td><td>Pre-existing real dataset (not generated).</td></tr>
+<tr><td>Location</td><td><code>/lustre/orion/gen008/proj-shared/ghu4/data/dinov2/cc12m_wds/</code></td></tr>
+</table>
+<p class="src">cc12m_mmap_bench.py:8-17,58-78 · frontier_dinov2_warmhit_sweep.sh:34</p>
+
+<h4>"Model" / access pattern</h4>
+<p>The unit of work is a <strong>"shard pass", not a full-corpus epoch</strong>. Each rank <code>mmap</code>'s its shard set and forces
+every byte through the page-fault path with a vectorized <code>np.sum(dtype=uint64)</code> over the whole shard. Two modes:
+<strong>disjoint</strong> (rank <code>r</code> reads shards <code>[r·num_shards, (r+1)·num_shards)</code>) or <strong>shared</strong>
+(<code>--shared</code>: all ranks read <code>[0, num_shards)</code>). A 1-in-50 PIL JPEG decode runs <strong>off the timed path</strong> as a
+secondary correctness signal (<code>decode_ok</code> count, e.g. 10956/10956).</p>
+<p class="note">There is no <code>--seed</code> in this bench: the access order is static and the checksum is the sum of fixed tar bytes,
+so it is deterministic by construction. <span class="src">cc12m_mmap_bench.py:81-97,156-199</span></p>
+
+<h4>How we ran it</h4>
+<ul>
+<li><strong>Node counts:</strong> N=1 (and 2/4); servers 4/node; <strong>2–3 shard-passes</strong> (pass 0 cold/warm-hit-prestaged, pass 1+ warm).</li>
+<li><strong>Pre-stage:</strong> each rank copies its shard set to <code>/mnt/bb/$USER/…</code> (or <code>/tmp</code> for the DRAM-tier proof, §9).</li>
+<li><strong>Native arm:</strong> <code>mem_hog</code> eviction before each rep so each native pass is genuinely cold.</li>
+<li><strong>Gate:</strong> per-rank <code>GLOBAL_CHECKSUM</code> equality + decode-success count.</li>
+</ul>
+<pre><code>srun -N $N -n $N --ntasks-per-node=1 --cpus-per-task=8 --cpu-bind=cores bash -c \
+  'LD_PRELOAD="$FITPP_CLIENT_LIB" "$PY" cc12m_mmap_bench.py \
+     --data-dir $DATA_DIR --num-shards $NUM_SHARDS --epochs 2 [--shared]'</code></pre>
+<p class="src">frontier_dinov2_warmhit_sweep.sh:96,104-110 · env DRAM 256 MiB / NVMe 2 TB</p>
+
+<hr>
+
+<h2 id="placement">7. Method variant — access-aware placement</h2>
+<p>Selects where a promoted file is cached. Two env knobs:</p>
+<ul>
+<li><code>FITCACHE_MMAP_PLACEMENT</code> = <code>hash</code> (default; <code>modulo_select</code>, scattered cluster-wide) or
+<code>node_local</code> (route promotion to a server on the requester's own node).</li>
+<li><code>DINO_SHARD_MODE</code> = <code>shared</code> (<code>--shared</code>) or <code>partitioned</code> (drop <code>--shared</code> → disjoint
+ranges) — drives the duplication-factor comparison.</li>
+</ul>
+<p>The node-local routing math (block-distribution assumption):</p>
+<pre><code>// src/cross_job/fitcache_cross_job.cpp:121-158
+int spn  = server_count / nnodes;          // servers per node; -1 (→ hash fallback) if not divisible
+uint64_t h = fitcache_fnv1a64(path);
+int slot = nodeid*spn + (h % spn);         // a server on THIS node (SLURM_NODEID)</code></pre>
+<p><strong>Cells run</strong> (each measured by a resolver probe counting cache-hit vs fallback vs remote, plus the checksum gate):
+Megatron N=2 &amp; N=4, GNN N=2, DINOv2 N=2 shared, DINOv2 N=2 partitioned (498 shards/node: node 0 reads <code>[0,498)</code>, node 1
+<code>[498,996)</code>), plus a hash baseline (Megatron N=2) to show the scatter.</p>
+<p class="src">frontier_sidecar_recovery.sh:47,70-78,122 · EXPERIMENTS_STATUS.html:166-175</p>
+
+<h2 id="scaleladder">8. Method variant — Megatron scale ladder (32–256 nodes)</h2>
+<ul>
+<li><strong>Regime:</strong> 640 GiB/node (40 shards replicated), <em>regime-pinned</em> &gt; 512 GiB RAM; <code>FITCACHE_MMAP_PLACEMENT=node_local</code>.</li>
+<li><strong>Per rep:</strong> <code>mem_hog</code> eviction on all nodes, then <code>--num-shards 40 --coverage 1.0 --n-chunks 4000 --epochs 2 --seed 0</code>.</li>
+<li><strong>Arms:</strong> Native = 1 rep × 2 epochs (cold-from-Lustre); FitCachePP = 2 reps × 2 epochs (epoch 0 = evicted NVMe-bound warm hit).</li>
+<li><strong>Every step uses <code>srun --overlap</code></strong> to avoid step-creation deadlock.</li>
+<li><strong>Checksum gate gates the ladder:</strong> all <code>native/warm_rep*</code> logs must share one <code>GLOBAL_CHECKSUM</code>; a FAIL exit blocks the next-larger N via the SLURM dependency chain.</li>
+<li><strong>Walltime bins:</strong> learned empirically (e.g. 256 nodes needs 8 h — native epoch 0 reached ~98 min under contention).</li>
+</ul>
+<pre><code>srun --overlap -N $N -n $N --ntasks-per-node=1 --cpus-per-task=8 --cpu-bind=cores bash -c \
+  '... llm_coverage_bench.py --num-shards 40 --coverage 1.0 --n-chunks 4000 --epochs 2 --seed 0 ...'
+CKS=$(grep -h SUMMARY $RESULTS_DIR/{native,warm}_rep*.log | grep -oE 'GLOBAL_CHECKSUM=[0-9]+' | sort -u | wc -l)
+[ "$CKS" = "1" ] &amp;&amp; echo "CHECKSUM_GATE: PASS"</code></pre>
+<p class="src">megatron_scale_ladder/…/job.sh:43-121 · EXPERIMENTS_STATUS.html:77-89,119</p>
+<p class="note">Harness fixes that made the ladder reliable: <code>srun --overlap</code> on post-server steps; bounded <code>mem_hog</code>
+convergence loop; server readiness via the port-cfg file (not the stdout log); and removal of a <code>… | head -8</code> SIGPIPE that
+was killing the bench mid-run.</p>
+
+<h2 id="dramtier">9. Method variant — DRAM-tier (tmpfs) proof</h2>
+<p>Shows the warm-hit path is tier-general, not NVMe-only. An 8-shard Megatron subset (128 GiB) is staged to <code>/tmp</code> tmpfs;
+the DRAM tier capacity is set <em>large</em> (160 GB) so the resolver lands on tmpfs, and a second arm uses NVMe (DRAM capacity 256 MiB).
+The intercept log shows <code>WARM HIT … -&gt; /tmp/…</code> lines (48 hits), and both arms produce the <strong>bit-identical</strong>
+checksum <code>3453497658530916</code>. A 4-arm probe (tmpfs-native ≈ nvme-native ≈ fitcache-dram) confirms the tiers tie here because the
+coverage bench is compute-bound (~4.4 GB/s).</p>
+<pre><code>start_servers() { export FitCache_DRAM_CAPACITY=$1; srun --overlap -N 1 -n 4 --ntasks-per-node=4 ... ; }
+# arm NVMe: FitCache_DRAM_CAPACITY=256 MiB   (forces NVMe)
+# arm DRAM: FitCache_DRAM_CAPACITY=160 GiB   (lands on /tmp tmpfs); 3 reps, evict before each</code></pre>
+<p class="src">mmap_dram_tier/…/job.sh · EXPERIMENTS_STATUS.html:91-101</p>
+
+<h2 id="sidecar">10. Method variant — sidecar recovery (4 phases)</h2>
+<p>Tests that cache state survives a metadata-service restart. Driven by <code>frontier_sidecar_recovery.sh</code> for any of the three
+workloads (<code>BENCH=megatron|gnn|dinov2</code>):</p>
+<ol>
+<li><strong>P1 Populate:</strong> server #1 up, run an organic cold epoch — open-time promotion copies files to the local tier and writes a <code>.meta</code> sidecar per file.</li>
+<li><strong>P2 Kill:</strong> kill server #1, wipe the port-cfg.</li>
+<li><strong>P3 Restart:</strong> server #2 up; <code>restore_from_sidecars</code> scans the tier dirs and rebuilds the cache map. The harness waits (≤120 s) for <code>total restored = N</code> in the server log.</li>
+<li><strong>P4 Post-restart pass:</strong> re-run the bench over the same PFS paths; a resolver probe confirms every file warm-hits (hit==expected, fallback==0); checksum must equal the populate phase (both run <code>--epochs 2</code> so the raw checksum is comparable).</li>
+</ol>
+<p>A <code>SKIP_POST=1</code> variant measures <strong>restore time only</strong> (the restore-scaling sweep over 32/256/996 objects).</p>
+<p class="src">frontier_sidecar_recovery.sh:12-26,125-247</p>
+
+<hr>
+
+<h2 id="honesty">11. Methodological honesty &amp; known limitations</h2>
+<p>Stated plainly so the method is reproducible and not over-read:</p>
+<ul>
+<li><strong>Asymmetric baseline (intended).</strong> FitCachePP's measured epoch is a <em>warm-hit-prestaged</em> read of a local copy; the
+Native baseline is an <em>organic cold</em> read from Lustre (separately evicted). That is the question being asked (local tier vs PFS),
+and the checksum gate proves identical bytes — but it is not a warm-vs-warm comparison.</li>
+<li><strong>Eviction is best-effort.</strong> On 512 GiB nodes with a small working set (GNN ~2.67 GB), <code>mem_hog</code> cannot fully
+flush; the GNN headline uses <strong>rep 1 (cleanest eviction)</strong> as the anchor, with rep 2/3 retained only as variance context.</li>
+<li><strong>Native Lustre is condition-dependent.</strong> The same native epoch varies with cluster time-of-day contention (e.g. 944–2567 s
+at fixed N in the scale ladder). The <em>warm</em> side is the stable quantity; reported speedups inherit the native variance — hence the
+GNN result is given <em>per regime</em> (vs favorable vs cold Lustre) rather than a single ratio.</li>
+<li><strong>Pre-stage gate is size-match, not content hash</strong> (§3.3) — relies on the end-to-end checksum gate for integrity.</li>
+<li><strong>Working sets are sized &gt; node RAM on purpose</strong> (regime-pinned) so the native baseline cannot hide reads in the page
+cache; a sub-RAM (partitioned) layout would let both sides page-cache and wash the gap out.</li>
+<li><strong>These are data-loading I/O benchmarks</strong> — the "model" is a deterministic access pattern + byte-touch, not a forward/backward
+pass. Claims are scoped to mmap-backed data loading, not end-to-end training.</li>
+<li><strong>Pre-stage cost is reported separately</strong> and folded back only in the amortized (View 2) break-even, never hidden inside a
+warm epoch.</li>
+</ul>
+
+<footer>
+Generated 2026-06-14 from the benchmark sources + harness scripts (mined and cross-checked; every claim cites <code>file:line</code>).
+Focus is methodology (how experiments are built, run, and measured), not results. No markdown source was modified.
+</footer>
+
+</body>
+</html>

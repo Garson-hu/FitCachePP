@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FitCachePP TPDS Extension — Final Design</title>
+<style>
+  :root { --fg:#1b1f24; --muted:#57606a; --border:#d0d7de; --bg:#ffffff;
+          --code-bg:#f6f8fa; --accent:#0969da; --th-bg:#f6f8fa; }
+  * { box-sizing:border-box; }
+  body { color:var(--fg); background:var(--bg);
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+         line-height:1.55; max-width:1000px; margin:0 auto; padding:2.5rem 1.5rem 5rem; }
+  h1,h2,h3 { line-height:1.25; margin-top:1.7em; margin-bottom:.55em; font-weight:600; }
+  h1 { font-size:1.85rem; border-bottom:1px solid var(--border); padding-bottom:.3em; }
+  h2 { font-size:1.4rem; border-bottom:1px solid var(--border); padding-bottom:.25em; }
+  h3 { font-size:1.12rem; }
+  a { color:var(--accent); text-decoration:none; }
+  code { background:var(--code-bg); padding:.13em .35em; border-radius:6px;
+         font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:.86em; }
+  pre { background:var(--code-bg); padding:1rem; border-radius:8px; overflow:auto; font-size:.84rem; }
+  pre code { background:none; padding:0; }
+  table { border-collapse:collapse; width:100%; margin:1em 0; font-size:.88rem; display:block; overflow-x:auto; }
+  th,td { border:1px solid var(--border); padding:.42em .65em; text-align:left; vertical-align:top; }
+  th { background:var(--th-bg); font-weight:600; }
+  tr:nth-child(even) td { background:var(--code-bg); }
+  .badge { display:inline-block; padding:.08em .55em; border-radius:11px; font-size:.74rem;
+           font-weight:600; color:#fff; white-space:nowrap; }
+  .badge.done  { background:#1e8e3e; }
+  .badge.supp  { background:#5f6368; }
+  .badge.bad   { background:#c5221f; }
+  .note { color:var(--muted); font-size:.92em; }
+  hr { border:none; border-top:1px solid var(--border); margin:2.2em 0; }
+  footer { margin-top:3em; padding-top:1.2em; border-top:1px solid var(--border);
+           color:var(--muted); font-size:.84rem; }
+</style>
+</head>
+<body>
+
+<h1>FitCachePP TPDS Extension — Final Design</h1>
+<p class="note">System view of the mechanisms that back the paper claims. Companion pages:
+<a href="../EXPERIMENTS_STATUS.html">EXPERIMENTS_STATUS.html</a> ·
+<a href="experiments.html">experiments.html</a> ·
+<a href="paper.html">paper.html</a>.</p>
+
+<h2>Pipeline overview</h2>
+<p>FitCachePP is an LD_PRELOAD client paired with Mercury-RPC metadata/data servers (default 4 servers/node). An application's
+file access is intercepted transparently; on a warm hit the data is served from a node-local cached copy held in a local cache
+tier (DRAM/tmpfs → PMem → NVMe), on a cold miss from the parallel filesystem (PFS) while the file is promoted to local cache for
+next time.</p>
+<pre><code>app open()/mmap()  ──►  LD_PRELOAD client
+                          │
+                ┌─────────┴──────────┐
+            warm hit               cold miss
+                │                     │
+   resolve cached path          native PFS read/mmap
+   (deterministic, no RPC)            │
+                │              enqueue promotion (open-time)
+   __real_mmap of cached file   ──►  data mover copies to a local
+   (page-fault from local tier)      tier (DRAM-first → PMem → NVMe)
+                                     + writes .meta sidecar</code></pre>
+<p class="note">The cache is tier-general: the data mover places a promoted file <strong>DRAM (tmpfs) first, then PMem, then
+NVMe</strong> by remaining capacity, and the resolver probes the tiers in the same order and maps whichever holds the file. On
+<strong>Frontier</strong> the warm-hit experiments were served from the <strong>NVMe</strong> tier (per-node burst buffer
+<code>/mnt/bb</code>). What matters is the <em>per-node</em> working set, not the total dataset: these sweeps keep it &gt; the
+512&nbsp;GiB node RAM on purpose by <strong>replicating</strong> the set on every node (Megatron stages all 40 shards = 640&nbsp;GiB/node;
+GNN stages the whole feature files ~902&nbsp;GB/node; DINOv2 full-corpus is shared, 541&nbsp;GB/node), so aggregate DRAM across
+nodes does not shrink it and a per-node tmpfs cannot hold it. PMem is unset (Frontier has no PMem). A <em>partitioned</em> access
+pattern (DINOv2 disjoint = the Mechanism-2 placement) is the exception — at 16 nodes each holds ~34&nbsp;GB, which fits tmpfs — but
+then the <code>Native_mmap_PFS</code> baseline page-caches it too, washing out the sustained warm-hit gap. So NVMe is the correct
+tier for the sustained claim; a DRAM datapoint would be a different (cold-start) experiment.</p>
+
+<h2>Mechanism 1 — Transparent mmap cache path <span class="badge done">DONE</span></h2>
+<p>The warm-hit path resolves the cached copy with <code>fitcache_resolve_cached_path()</code>: client-side, deterministic
+hash-bin, with a size-match completeness gate, and <strong>no RPC</strong>. On match it calls <code>__real_mmap</code> on the cached
+file in whichever local tier holds it (DRAM/PMem/NVMe), so the kernel page-faults directly from that local tier. On a cold miss it uses the native PFS mmap and enqueues promotion at
+<em>open</em> time (the mmap/fd-reuse pattern made a close-time RPC skip leave the cache empty). The populate path copies in
+&le;1 GiB chunks and the server loops on short reads, so files larger than ~2 GiB are no longer truncated. Eviction safety relies
+on Linux unlink-while-mapped semantics protecting active mappings.</p>
+
+<h2>Mechanism 2 — Access-aware mmap cache placement <span class="badge done">DONE</span></h2>
+<p>A warm hit requires the cached file on the requester's own node. Placement is decided in
+<code>select_server_for_path()</code> (<code>src/cross_job/fitcache_cross_job.cpp</code>):</p>
+<ul>
+<li><strong>Default <code>hash</code></strong> — <code>modulo_select() = fnv1a64(path) % total_servers</code>. Saves space but scatters a
+node's mmap set across the cluster, producing remote/fallback misses at N&ge;2.</li>
+<li><strong><code>node_local</code> branch</strong> — gated by <code>FITCACHE_MMAP_PLACEMENT=node_local</code>. Routes promotion to the
+node's own slots <code>[nodeid&middot;spn, (nodeid+1)&middot;spn)</code>, where <code>spn = total_servers / SLURM_NNODES</code> and
+<code>nodeid = SLURM_NODEID</code>. Logs <code>placement_policy=node_local</code> and a per-node <code>local/remote</code> summary.
+Default <code>hash</code> path is unchanged.</li>
+</ul>
+<p>Two access patterns ride on top of <code>node_local</code>: <strong>shared</strong> (all nodes read the same set, each replicates
+locally) and <strong>partitioned</strong> (nodes read disjoint sets via the cc12m bench's disjoint mode, so each node caches only
+its own shards at ~1&times; global copies).</p>
+
+<h2>Mechanism 3 — Sidecar cache-state recovery <span class="badge supp">Supporting</span></h2>
+<p>The data mover writes a <code>.meta</code> sidecar per cached file on organic promotion. After a metadata-service restart,
+<code>restore_from_sidecars</code> rebuilds the server-side cache-state map (eviction/promotion accounting). The client warm-hit
+resolver is independent of the server map: it recomputes the deterministic cached path and <code>stat</code>s the local cache tier, so as
+long as the cached files persist on local storage (the burst buffer in the Frontier runs) the client warm-hits in both the with- and without-sidecar arms. The sidecar
+therefore restores reusable cache <em>state</em> and reduces cold metadata recovery; it is not the bandwidth source.</p>
+
+<h2>Future work — cross-job cache sharing <span class="badge supp">Future work</span></h2>
+<p>Cross-job sharing (<code>FitCache_CROSS_JOB=1</code>, HRW/peer-read path) remains future work only; no new compute is spent on
+it and it is not a claim in this paper. The single-job placement path (<code>CROSS_JOB=0</code>) is the one exercised by all
+reported experiments.</p>
+
+<h2>Invalid / rejected designs <span class="badge bad">Rejected</span></h2>
+<ul>
+<li><strong>Eager-populate via server + Mercury anon-mmap</strong> — rejected. It added a PFS&rarr;server&rarr;client hop and could
+not beat <code>Native_mmap_PFS</code> in any single-pass regime. Replaced by the client-side warm-hit direct local-tier path.</li>
+<li><strong>Single unbounded <code>read()</code>/bulk-RMA populate</strong> — invalid. The Linux kernel caps a single read near
+0x7ffff000 (~2 GiB) and a single Mercury/libfabric bulk RMA caps near 2 GiB; neither was looped, truncating &gt;2 GiB files.
+Fixed with the server short-read loop and &le;1 GiB chunked populate.</li>
+</ul>
+
+<footer>
+Last updated: 2026-05-24<br>
+Generated from markdown source, but updated to reflect latest final results. Markdown source was not modified.
+</footer>
+
+</body>
+</html>

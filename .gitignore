@@ -4,12 +4,17 @@
 .clangd
 /logs/*
 *log*
+core
+WORKLOG.md
 
 # but keep this script
 !/build/clear_cmake.sh
 !/build/build.sh
-tpds_extension/
 /benchmarks/
+
+# track the TPDS extension docs (also negate the broad *log* rule above,
+# which otherwise catches e.g. experiments_methodology.html → "methodology")
+!/tpds_extension/**
 
 fitcache_server_log.*
 .ports.cfg.*

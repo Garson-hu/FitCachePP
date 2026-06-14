@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FitCachePP — Work Overview</title>
+<style>
+  :root { --fg:#1b1f24; --muted:#5f6368; --border:#d0d7de; --bg:#ffffff;
+          --code-bg:#f1f3f5; --accent:#2563eb; --card:#f8fafc;
+          --blue:#2563eb; --green:#16a34a; --amber:#d97706; --gray:#b0b6bd; --red:#dc2626; }
+  * { box-sizing:border-box; }
+  body { color:var(--fg); background:var(--bg);
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+         line-height:1.6; max-width:1080px; margin:0 auto; padding:2.5rem 1.6rem 6rem; }
+  h1 { font-size:2.1rem; margin:0 0 .15em; letter-spacing:-.5px; }
+  .sub { color:var(--muted); font-size:1.1rem; margin-top:.1em; }
+  h2 { font-size:1.05rem; text-transform:uppercase; letter-spacing:1.5px; color:var(--accent);
+       margin:2.8em 0 .2em; }
+  .mech { font-size:1.45rem; font-weight:650; margin:.1em 0 .1em; }
+  p { margin:.55em 0; }
+  .lede { font-size:1.05rem; background:var(--card); border:1px solid var(--border);
+          border-left:4px solid var(--accent); border-radius:0 10px 10px 0; padding:1em 1.3em; margin:1.4em 0; }
+  code { background:var(--code-bg); padding:.1em .35em; border-radius:5px;
+         font-family:ui-monospace,Menlo,Consolas,monospace; font-size:.84em; }
+  .fig { border:1px solid var(--border); border-radius:12px; padding:1.1em 1.2em 1.3em; margin:1.1em 0;
+         background:#fff; }
+  .fig .cap { color:var(--muted); font-size:.9rem; margin-top:.55em; }
+  .grid2 { display:grid; grid-template-columns:repeat(2,1fr); gap:1.1rem; margin:1.1em 0; }
+  .legend { display:flex; gap:1.2rem; flex-wrap:wrap; font-size:.85rem; margin:.1em 0 .7em; }
+  .legend span { display:inline-flex; align-items:center; gap:.4em; }
+  .sw { width:13px; height:13px; border-radius:3px; display:inline-block; }
+  table { border-collapse:collapse; width:100%; margin:1em 0; font-size:.9rem; }
+  th,td { border:1px solid var(--border); padding:.45em .7em; text-align:left; }
+  th { background:var(--code-bg); font-weight:600; }
+  tr:nth-child(even) td { background:#fafbfc; }
+  .takeaway { background:#f0fdf4; border:1px solid #bbf7d0; border-left:4px solid var(--green);
+              border-radius:0 10px 10px 0; padding:.7em 1.1em; margin:.9em 0; font-size:.95rem; }
+  .caveat { background:#fffbeb; border:1px solid #fde68a; border-left:4px solid var(--amber);
+            border-radius:0 10px 10px 0; padding:.7em 1.1em; margin:.9em 0; font-size:.95rem; }
+  ul { padding-left:1.2em; } li { margin:.3em 0; }
+  svg { max-width:100%; height:auto; display:block; }
+  .st { font-size:13px; } .stb { font-size:13px; font-weight:600; }
+  footer { margin-top:3.5em; padding-top:1.2em; border-top:1px solid var(--border);
+           color:var(--muted); font-size:.84rem; }
+  a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
+</style>
+</head>
+<body>
+
+<h1>FitCachePP</h1>
+<p class="sub">Transparent local-storage caching for memory-mapped data loading on Frontier</p>
+
+<p class="lede">
+Training jobs that read data with <code>mmap</code> (LLM token shards, GNN feature tables, vision tar shards) get the
+data served transparently from a fast node-local cache instead of the parallel filesystem &mdash; with
+<strong>no change to the application</strong>. Below: <strong>what the system does</strong> (shown as diagrams), then
+<strong>how much it helps</strong> (measured, checksum-verified).
+</p>
+
+<!-- ===================== THE PROBLEM ===================== -->
+<h2>The problem</h2>
+<p>The old cache hooked <code>read()</code>/<code>pread()</code>. But modern loaders read by memory-mapping a file and
+<strong>page-faulting</strong> &mdash; they never call <code>read()</code>, so they slipped straight past the cache to Lustre.</p>
+
+<div class="fig">
+<svg viewBox="0 0 720 195" role="img" aria-label="mmap bypasses the cache">
+  <!-- lane 1: read path (cached) -->
+  <rect x="20" y="30" width="165" height="44" rx="8" fill="#eef2ff" stroke="#c7d2fe"/>
+  <text x="102" y="57" text-anchor="middle" class="st">app: read() / pread()</text>
+  <line x1="185" y1="52" x2="232" y2="52" stroke="#94a3b8" stroke-width="2"/>
+  <path d="M238 52 l-9 -4.5 v9 z" fill="#94a3b8"/>
+  <rect x="240" y="30" width="150" height="44" rx="8" fill="#eef2ff" stroke="#c7d2fe"/>
+  <text x="315" y="57" text-anchor="middle" class="st">FitCachePP hook</text>
+  <line x1="390" y1="52" x2="442" y2="52" stroke="#16a34a" stroke-width="2"/>
+  <path d="M448 52 l-9 -4.5 v9 z" fill="#16a34a"/>
+  <rect x="450" y="30" width="200" height="44" rx="8" fill="#dcfce7" stroke="#86efac"/>
+  <text x="550" y="57" text-anchor="middle" class="stb" fill="#15803d">served from local cache</text>
+  <!-- lane 2: mmap path (bypass) -->
+  <rect x="20" y="120" width="165" height="44" rx="8" fill="#eef2ff" stroke="#c7d2fe"/>
+  <text x="102" y="147" text-anchor="middle" class="st">app: mmap() page-fault</text>
+  <line x1="185" y1="142" x2="442" y2="142" stroke="#dc2626" stroke-width="2" stroke-dasharray="6 4"/>
+  <path d="M448 142 l-9 -4.5 v9 z" fill="#dc2626"/>
+  <text x="312" y="133" text-anchor="middle" class="st" fill="#dc2626">bypasses the cache entirely</text>
+  <rect x="450" y="120" width="220" height="44" rx="8" fill="#fee2e2" stroke="#fca5a5"/>
+  <text x="560" y="147" text-anchor="middle" class="stb" fill="#b91c1c">straight to Lustre PFS</text>
+</svg>
+<div class="cap">On the workloads we target, the cache measured <strong>0 cache hits</strong> &mdash; every byte came from Lustre. (Lustre streams at ~2&nbsp;GB/s sequentially, but sparse-random 4&nbsp;KB page-faults crawl at ~3–4&nbsp;MB/s &mdash; which is why the access pattern decides the win.)</div>
+</div>
+
+<!-- ===================== MECHANISM 1 ===================== -->
+<h2>What we do — 1 / 3</h2>
+<div class="mech">Transparent <code>mmap</code> cache path</div>
+<p>We intercept <code>mmap</code>. On a warm hit, the client itself computes where the cached copy lives (the same
+deterministic hash the server uses), checks it's complete, and hands back a direct mmap of that local file &mdash; the
+kernel then page-faults from <strong>local storage</strong> (the DRAM/tmpfs or NVMe tier &mdash; whichever holds the file), with <strong>no network round-trip</strong>.</p>
+
+<div class="fig">
+<svg viewBox="0 0 720 320" role="img" aria-label="warm-hit mmap flow">
+  <!-- app mmap -->
+  <rect x="270" y="12" width="180" height="40" rx="8" fill="#eef2ff" stroke="#c7d2fe"/>
+  <text x="360" y="37" text-anchor="middle" class="stb">app calls mmap(file)</text>
+  <line x1="360" y1="52" x2="360" y2="80" stroke="#94a3b8" stroke-width="2"/>
+  <path d="M360 86 l-4.5 -9 h9 z" fill="#94a3b8"/>
+  <!-- resolver -->
+  <rect x="150" y="88" width="420" height="56" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="360" y="110" text-anchor="middle" class="stb">client resolver  (no network)</text>
+  <text x="360" y="130" text-anchor="middle" class="st" fill="#475569">recompute cached path · same hash as server · check file size is complete</text>
+  <!-- branch arrows -->
+  <line x1="300" y1="144" x2="205" y2="182" stroke="#16a34a" stroke-width="2"/>
+  <path d="M201 185 l1 -10 7 6 z" fill="#16a34a"/>
+  <line x1="420" y1="144" x2="515" y2="182" stroke="#d97706" stroke-width="2"/>
+  <path d="M519 185 l-8 -4 1 10 z" fill="#d97706"/>
+  <!-- warm hit box -->
+  <rect x="35" y="186" width="310" height="78" rx="9" fill="#dcfce7" stroke="#86efac"/>
+  <text x="55" y="210" class="stb" fill="#15803d">WARM HIT</text>
+  <text x="55" y="232" class="st" fill="#14532d">mmap the local cached file →</text>
+  <text x="55" y="251" class="st" fill="#14532d">kernel faults from the local tier (DRAM/NVMe)</text>
+  <!-- cold miss box -->
+  <rect x="375" y="186" width="310" height="78" rx="9" fill="#fef3c7" stroke="#fcd34d"/>
+  <text x="395" y="210" class="stb" fill="#b45309">COLD MISS</text>
+  <text x="395" y="232" class="st" fill="#78350f">native PFS mmap</text>
+  <text x="395" y="251" class="st" fill="#78350f">(never slower than the baseline)</text>
+  <!-- promote -->
+  <line x1="530" y1="264" x2="530" y2="282" stroke="#94a3b8" stroke-width="2"/>
+  <path d="M530 288 l-4.5 -9 h9 z" fill="#94a3b8"/>
+  <rect x="375" y="290" width="310" height="26" rx="7" fill="#fff" stroke="#cbd5e1"/>
+  <text x="530" y="307" text-anchor="middle" class="st">server promotes the file in the background</text>
+  <!-- loop back arrow -->
+  <path d="M375 303 C 250 303, 190 300, 190 266" fill="none" stroke="#16a34a" stroke-width="1.6" stroke-dasharray="5 4"/>
+  <path d="M190 266 l-4 9 8 0 z" fill="#16a34a"/>
+  <text x="250" y="296" class="st" fill="#16a34a">next mmap = warm</text>
+</svg>
+<div class="cap">The warm-hit path has no RPC: the client finds the cached file by computing its path, then maps it directly.</div>
+</div>
+
+<p><strong>Why map a local file instead of fetching the bytes over the network?</strong> Our first design fetched the data
+over Mercury RPC at <code>mmap</code> time. It was the slowest option &mdash; so the read path now touches no network at all.</p>
+
+<div class="fig">
+<svg viewBox="0 0 720 185" role="img" aria-label="bandwidth comparison">
+  <!-- gridlines 0,1,2 GB/s : x=250,422,594 ; scale 172 px / (GB/s) -->
+  <g stroke="#e6e9ee"><line x1="250" y1="22" x2="250" y2="150"/><line x1="422" y1="22" x2="422" y2="150"/><line x1="594" y1="22" x2="594" y2="150"/></g>
+  <g class="st" fill="#5f6368" text-anchor="middle"><text x="250" y="168">0</text><text x="422" y="168">1</text><text x="594" y="168">2 GB/s</text></g>
+  <!-- old: Mercury RPC 0.9 -> w154.8 -->
+  <rect x="250" y="30" width="154.8" height="30" rx="3" fill="#b0b6bd"/>
+  <text x="244" y="50" text-anchor="end" class="st">old: fetch over RPC</text>
+  <text x="412" y="50" class="stb" fill="#5f6368">≈0.9</text>
+  <!-- Lustre 2.0 -> w344 -->
+  <rect x="250" y="72" width="344" height="30" rx="3" fill="#cbd5e1"/>
+  <text x="244" y="92" text-anchor="end" class="st">Lustre PFS (baseline)</text>
+  <text x="601" y="92" class="stb" fill="#5f6368">≈2.0</text>
+  <!-- local NVMe 2.3 -> w395.6 -->
+  <rect x="250" y="114" width="395.6" height="30" rx="3" fill="#2563eb"/>
+  <text x="244" y="134" text-anchor="end" class="st">direct local-NVMe mmap</text>
+  <text x="653" y="134" class="stb" fill="#2563eb">&gt;2 *</text>
+</svg>
+<div class="cap">Single-stream bandwidth. The RPC fetch (≈0.9) and Lustre (≈2.0 GB/s) are from our design notes; the local-tier bar (*) is an estimate showing it is faster than Lustre. The point is the <em>ordering</em> — the old RPC fetch was slower than Lustre itself, so we dropped it.</div>
+</div>
+
+<!-- ===================== MECHANISM 2 ===================== -->
+<h2>What we do — 2 / 3</h2>
+<div class="mech">Access-aware placement</div>
+<p>A warm hit needs the file on the <em>same node</em> as the rank reading it. Default hashing scatters a node's files
+across the cluster, so it misses about half of its own data. We route each file's cached copy to its own node.</p>
+
+<div class="fig">
+<svg viewBox="0 0 720 200" role="img" aria-label="hash scatter vs node-local">
+  <!-- left card: hash -->
+  <rect x="20" y="22" width="320" height="150" rx="11" fill="#fff" stroke="#cbd5e1"/>
+  <text x="180" y="46" text-anchor="middle" class="stb">Default hash — node 0's 40 files</text>
+  <!-- bar -->
+  <rect x="45" y="64" width="270" height="34" rx="4" fill="#fee2e2"/>
+  <rect x="45" y="64" width="121.5" height="34" rx="4" fill="#16a34a"/>
+  <text x="105" y="86" text-anchor="middle" class="stb" fill="#fff">18</text>
+  <text x="240" y="86" text-anchor="middle" class="stb" fill="#b91c1c">22</text>
+  <text x="180" y="124" text-anchor="middle" class="st" fill="#475569">18 on this node · 22 scattered to other nodes</text>
+  <text x="180" y="146" text-anchor="middle" class="stb" fill="#b91c1c">→ 22 fall back to Lustre</text>
+  <!-- right card: node-local -->
+  <rect x="380" y="22" width="320" height="150" rx="11" fill="#fff" stroke="#cbd5e1"/>
+  <text x="540" y="46" text-anchor="middle" class="stb">Node-local — node 0's 40 files</text>
+  <rect x="405" y="64" width="270" height="34" rx="4" fill="#16a34a"/>
+  <text x="540" y="86" text-anchor="middle" class="stb" fill="#fff">40</text>
+  <text x="540" y="124" text-anchor="middle" class="st" fill="#475569">40 on this node · 0 remote</text>
+  <text x="540" y="146" text-anchor="middle" class="stb" fill="#15803d">→ every read is a warm hit</text>
+</svg>
+<div class="cap">Same data, two placements. Node-local routing turns 22 cross-node misses into 0 (measured: Megatron, N=2).</div>
+</div>
+
+<p>For workloads where each node reads a <em>disjoint</em> slice, the same routing stores the corpus <strong>once</strong>
+instead of replicating it on every node:</p>
+
+<div class="grid2">
+  <div class="fig">
+    <h3 style="margin:0 0 .3em;font-size:1rem">Cross-node misses per node</h3>
+    <svg viewBox="0 0 360 210" role="img" aria-label="fallback hash vs node-local">
+      <line x1="60" y1="180" x2="340" y2="180" stroke="#d0d7de"/>
+      <g class="st" fill="#5f6368" text-anchor="end"><text x="52" y="184">0</text><text x="52" y="130">11</text><text x="52" y="76">22</text></g>
+      <line x1="60" y1="126" x2="340" y2="126" stroke="#eef1f4"/><line x1="60" y1="72" x2="340" y2="72" stroke="#eef1f4"/>
+      <rect x="110" y="72" width="70" height="108" rx="3" fill="#dc2626"/>
+      <text x="145" y="64" text-anchor="middle" class="stb" fill="#dc2626">22</text>
+      <text x="145" y="200" text-anchor="middle" class="st">hash</text>
+      <rect x="240" y="176" width="70" height="4" rx="2" fill="#16a34a"/>
+      <text x="275" y="168" text-anchor="middle" class="stb" fill="#16a34a">0</text>
+      <text x="275" y="200" text-anchor="middle" class="st">node-local</text>
+    </svg>
+  </div>
+  <div class="fig">
+    <h3 style="margin:0 0 .3em;font-size:1rem">Copies of the corpus stored</h3>
+    <svg viewBox="0 0 360 210" role="img" aria-label="duplication shared vs partitioned">
+      <line x1="60" y1="180" x2="340" y2="180" stroke="#d0d7de"/>
+      <g class="st" fill="#5f6368" text-anchor="end"><text x="52" y="184">0</text><text x="52" y="126">1×</text><text x="52" y="72">2×</text></g>
+      <line x1="60" y1="126" x2="340" y2="126" stroke="#eef1f4"/><line x1="60" y1="72" x2="340" y2="72" stroke="#eef1f4"/>
+      <rect x="110" y="72" width="70" height="108" rx="3" fill="#d97706"/>
+      <text x="145" y="64" text-anchor="middle" class="stb" fill="#d97706">2.0×</text>
+      <text x="145" y="200" text-anchor="middle" class="st">shared access</text>
+      <rect x="240" y="126" width="70" height="54" rx="3" fill="#16a34a"/>
+      <text x="275" y="118" text-anchor="middle" class="stb" fill="#16a34a">1.0×</text>
+      <text x="275" y="200" text-anchor="middle" class="st">partitioned access</text>
+    </svg>
+  </div>
+</div>
+<div class="takeaway">Both get full local hits (0 misses). Partitioned placement gives the same speed at half the disk &mdash; at 16 nodes, the difference between 1 copy of the dataset and 16.</div>
+
+<!-- ===================== MECHANISM 3 ===================== -->
+<h2>What we do — 3 / 3</h2>
+<div class="mech">Sidecar recovery</div>
+<p>Each cached file gets a tiny <code>.meta</code> sidecar. When the cache service restarts, it rebuilds its state from
+those sidecars in seconds &mdash; the cache survives the restart instead of re-fetching everything from the filesystem.</p>
+
+<div class="fig">
+<svg viewBox="0 0 720 130" role="img" aria-label="sidecar restart flow">
+  <rect x="15" y="44" width="170" height="44" rx="8" fill="#eef2ff" stroke="#c7d2fe"/>
+  <text x="100" y="64" text-anchor="middle" class="st">promote file →</text>
+  <text x="100" y="80" text-anchor="middle" class="st">write .meta sidecar</text>
+  <line x1="185" y1="66" x2="212" y2="66" stroke="#94a3b8" stroke-width="2"/><path d="M218 66 l-9 -4.5 v9 z" fill="#94a3b8"/>
+  <rect x="220" y="44" width="140" height="44" rx="8" fill="#fef3c7" stroke="#fcd34d"/>
+  <text x="290" y="70" text-anchor="middle" class="stb" fill="#b45309">server restart</text>
+  <line x1="360" y1="66" x2="387" y2="66" stroke="#94a3b8" stroke-width="2"/><path d="M393 66 l-9 -4.5 v9 z" fill="#94a3b8"/>
+  <rect x="395" y="44" width="190" height="44" rx="8" fill="#eef2ff" stroke="#c7d2fe"/>
+  <text x="490" y="64" text-anchor="middle" class="st">scan tiers, rebuild</text>
+  <text x="490" y="80" text-anchor="middle" class="st">cache map  (~5 s)</text>
+  <line x1="585" y1="66" x2="612" y2="66" stroke="#16a34a" stroke-width="2"/><path d="M618 66 l-9 -4.5 v9 z" fill="#16a34a"/>
+  <rect x="620" y="44" width="90" height="44" rx="8" fill="#dcfce7" stroke="#86efac"/>
+  <text x="665" y="70" text-anchor="middle" class="stb" fill="#15803d">warm</text>
+</svg>
+</div>
+
+<div class="fig">
+<svg viewBox="0 0 720 210" role="img" aria-label="restore time vs object count">
+  <line x1="80" y1="175" x2="680" y2="175" stroke="#d0d7de"/><line x1="80" y1="35" x2="80" y2="175" stroke="#d0d7de"/>
+  <g class="st" fill="#5f6368" text-anchor="end"><text x="70" y="179">0</text><text x="70" y="140">2</text><text x="70" y="105">4</text><text x="70" y="70">6</text><text x="70" y="40">8 s</text></g>
+  <g class="st" fill="#5f6368" text-anchor="middle"><text x="200" y="196">32 objects</text><text x="380" y="196">256 objects</text><text x="560" y="196">996 objects</text></g>
+  <!-- y(v)=175-(v/8)*140 ; 6->70, 5->87.5 -->
+  <polyline fill="none" stroke="#2563eb" stroke-width="2.5" points="200,70 380,87.5 560,87.5"/>
+  <g fill="#2563eb"><circle cx="200" cy="70" r="5"/><circle cx="380" cy="87.5" r="5"/><circle cx="560" cy="87.5" r="5"/></g>
+  <g class="stb" fill="#1b1f24" text-anchor="middle"><text x="200" y="60">6 s</text><text x="380" y="78">5 s</text><text x="560" y="78">5 s</text></g>
+  <text x="560" y="125" text-anchor="middle" class="stb" fill="#16a34a">flat → scales to 1000s of objects</text>
+</svg>
+<div class="cap">Metadata-restore-only sweep: restore time is independent of how many objects are cached (~1 KB each). (A full DINOv2 recovery, which also re-checks the data files, takes ~8 s — a different, heavier path.)</div>
+</div>
+
+<!-- ===================== RESULTS ===================== -->
+<h2>How much faster</h2>
+<p>Warm-hit speedup of the local-cache mmap vs the native parallel-filesystem mmap. Magnitude is reported
+<strong>per regime</strong>: dense-sequential workloads win modestly; the sparse-random GNN win depends on the Lustre
+baseline condition. Every number passed a bit-for-bit checksum-equality check.</p>
+
+<div class="fig">
+<svg viewBox="0 0 720 165" role="img" aria-label="warm-hit speedup dense-sequential">
+  <!-- linear 1..2.5x ; x(v)=140+(v-1)/1.5*540 ; grid 1,1.5,2,2.5 at 140,320,500,680 -->
+  <g stroke="#e6e9ee" stroke-width="1">
+    <line x1="140" y1="22" x2="140" y2="118"/><line x1="320" y1="22" x2="320" y2="118"/>
+    <line x1="500" y1="22" x2="500" y2="118"/><line x1="680" y1="22" x2="680" y2="118"/>
+  </g>
+  <g class="st" fill="#5f6368" text-anchor="middle">
+    <text x="140" y="136">1×</text><text x="320" y="136">1.5×</text><text x="500" y="136">2×</text><text x="680" y="136">2.5×</text>
+  </g>
+  <!-- Megatron 1.2-1.6 -> bar to 1.6 (x356) -->
+  <rect x="140" y="34" width="216" height="32" rx="3" fill="#2563eb"/>
+  <text x="132" y="55" class="st" text-anchor="end">Megatron (LLM)</text>
+  <text x="362" y="55" class="st">1.2–1.6×  <tspan fill="#5f6368">dense-sequential</tspan></text>
+  <!-- DINOv2 1.6-1.95 -> bar to 1.95 (x482) -->
+  <rect x="140" y="76" width="342" height="32" rx="3" fill="#16a34a"/>
+  <text x="132" y="97" class="st" text-anchor="end">DINOv2 (vision)</text>
+  <text x="488" y="97" class="st">1.6–1.95×  <tspan fill="#5f6368">sequential tar</tspan></text>
+</svg>
+<div class="cap">Dense-sequential workloads: a modest but <strong>stable</strong> warm-hit win, flat across N=1–16, because Frontier's Lustre is already fast at streaming. The sparse-random GNN workload is a different story &mdash; next.</div>
+</div>
+
+<div class="fig">
+<h3 style="margin:0 0 .3em;font-size:1rem">GNN sparse-random: the win depends on the baseline regime</h3>
+<svg viewBox="0 0 720 210" role="img" aria-label="GNN epoch time by regime, log scale">
+  <g stroke="#e6e9ee"><line x1="310.9" y1="28" x2="310.9" y2="168"/><line x1="451.8" y1="28" x2="451.8" y2="168"/><line x1="592.8" y1="28" x2="592.8" y2="168"/></g>
+  <g class="st" fill="#5f6368" text-anchor="middle"><text x="310.9" y="186">10</text><text x="451.8" y="186">100</text><text x="592.8" y="186">1000 s</text></g>
+  <!-- page-cache best case ~5s -->
+  <rect x="170" y="38" width="98.5" height="30" rx="3" fill="#86efac"/>
+  <text x="164" y="58" text-anchor="end" class="st">page-cache (best case)</text>
+  <text x="274" y="58" class="st" fill="#15803d">~5 s</text>
+  <!-- NVMe-bound warm 82.7s (the claim) -->
+  <rect x="170" y="80" width="270.2" height="30" rx="3" fill="#2563eb"/>
+  <text x="164" y="100" text-anchor="end" class="st">NVMe-bound warm</text>
+  <text x="446" y="100" class="stb" fill="#2563eb">82.7 s ← the claim</text>
+  <!-- cold Lustre native 1870-2457 -->
+  <rect x="170" y="122" width="461.1" height="30" rx="3" fill="#b0b6bd"/>
+  <rect x="631.1" y="122" width="16.7" height="30" rx="2" fill="#b0b6bd" opacity="0.5"/>
+  <text x="164" y="142" text-anchor="end" class="st">cold Lustre native</text>
+  <text x="400" y="142" text-anchor="middle" class="stb" fill="#fff">1870–2457 s</text>
+  <!-- favorable native 510s tick -->
+  <line x1="551.5" y1="32" x2="551.5" y2="158" stroke="#d97706" stroke-width="1.6" stroke-dasharray="5 3"/>
+  <text x="551.5" y="26" text-anchor="middle" class="st" fill="#d97706">favorable native 510 s</text>
+</svg>
+<div class="cap"><strong>2026-06-14 regime-pinned restatement</strong> (replaces the earlier 18–33×, which was regime-contaminated). The warm-hit number we claim is the <strong>NVMe-bound 82.7 s</strong>: that is <strong>~6× faster than the most favorable Lustre native (510 s)</strong> and <strong>22–30× faster than cold Lustre (1870–2457 s)</strong>. Lower (further left) is faster. Source <code>gnn_regime_pinned/</code>, checksum-gated.</div>
+</div>
+
+<div class="fig">
+<h3 style="margin:0 0 .3em;font-size:1rem">Warm stays flat as the job scales (Megatron, 32–128 nodes)</h3>
+<div class="legend">
+  <span><span class="sw" style="background:#2563eb"></span>FitCachePP warm epoch</span>
+  <span><span class="sw" style="background:#b0b6bd"></span>Native cold epoch (Lustre)</span>
+</div>
+<svg viewBox="0 0 720 290" role="img" aria-label="Megatron warm-flat scale ladder">
+  <g stroke="#e6e9ee"><line x1="70" y1="250" x2="700" y2="250"/><line x1="70" y1="175.9" x2="700" y2="175.9"/><line x1="70" y1="101.9" x2="700" y2="101.9"/></g>
+  <g class="st" fill="#5f6368" text-anchor="end"><text x="62" y="254">0</text><text x="62" y="180">1000</text><text x="62" y="106">2000 s</text></g>
+  <line x1="70" y1="237" x2="700" y2="237" stroke="#2563eb" stroke-width="1" stroke-dasharray="4 4" opacity="0.6"/>
+  <text x="700" y="231" text-anchor="end" class="st" fill="#2563eb">warm flat 175–178 s</text>
+  <!-- 32 nodes: warm 176, native 2567.7, 14.7x -->
+  <rect x="124" y="237" width="50" height="13" fill="#2563eb"/>
+  <rect x="186" y="59.8" width="50" height="190.2" fill="#b0b6bd"/>
+  <text x="211" y="53" text-anchor="middle" class="st" fill="#5f6368">2568</text>
+  <text x="180" y="268" text-anchor="middle" class="st">32 nodes</text>
+  <text x="180" y="283" text-anchor="middle" class="stb" fill="#16a34a">14.7×</text>
+  <!-- 64 nodes: warm 176, native 943.8, 5.3x -->
+  <rect x="344" y="237" width="50" height="13" fill="#2563eb"/>
+  <rect x="406" y="180.1" width="50" height="69.9" fill="#b0b6bd"/>
+  <text x="431" y="173" text-anchor="middle" class="st" fill="#5f6368">944</text>
+  <text x="400" y="268" text-anchor="middle" class="st">64 nodes</text>
+  <text x="400" y="283" text-anchor="middle" class="stb" fill="#16a34a">5.3×</text>
+  <!-- 128 nodes: warm 176, native 1065.9, 6.0x -->
+  <rect x="564" y="237" width="50" height="13" fill="#2563eb"/>
+  <rect x="626" y="171" width="50" height="79" fill="#b0b6bd"/>
+  <text x="651" y="164" text-anchor="middle" class="st" fill="#5f6368">1066</text>
+  <text x="620" y="268" text-anchor="middle" class="st">128 nodes</text>
+  <text x="620" y="283" text-anchor="middle" class="stb" fill="#16a34a">6.0×</text>
+</svg>
+<div class="cap">The warm epoch is <strong>flat at 175–178 s across 32/64/128 nodes</strong> (the client-local resolver adds no coordination cost at scale). The speedup (14.7× / 5.3× / 6.0×) varies only because the <em>native</em> baseline swings with Lustre's time-of-day contention &mdash; warm is the stable quantity. (256-node native hit 5890 s ≈ 98 min; warm pending.)</div>
+</div>
+
+<div class="takeaway"><strong>The warm path is multi-tier, not NVMe-only.</strong> A controlled run served <strong>48 warm hits from the DRAM (<code>/tmp</code> tmpfs) tier</strong>, bit-identical and at parity with NVMe &mdash; the resolver maps whichever local tier holds the file (DRAM → NVMe).</div>
+
+<!-- ===================== HONEST FRAMING ===================== -->
+<h2>Honest framing</h2>
+<div class="caveat">
+<ul style="margin:.2em 0">
+<li><strong>This accelerates data <em>loading</em>, not GPU compute</strong> &mdash; we speed up the I/O the loader does.</li>
+<li><strong>Warm-hit runs use a pre-staged cache;</strong> we also report the amortized view including that staging cost (break-even 1–4 epochs).</li>
+<li><strong>Magnitude is reported per regime</strong> &mdash; the GNN win is ~6× vs the most favorable Lustre native and 22–30× vs cold Lustre; dense-sequential wins are a modest ~1.2–1.95×. The big wins come from access patterns Lustre handles poorly (sparse random).</li>
+<li><strong>Tier-general, served from NVMe here</strong> &mdash; the path also warm-hits the DRAM/tmpfs tier (48 hits, bit-identical); on Frontier the working sets (640 GiB–902 GB/node) exceed node RAM, so they land on the NVMe burst buffer, which also keeps the baseline from cheating via the page cache.</li>
+</ul>
+</div>
+
+<!-- ===================== STATUS + NEXT ===================== -->
+<h2>Status &amp; next steps</h2>
+<table>
+<tr><th>Component</th><th>State</th><th>Evidence</th></tr>
+<tr><td>Transparent mmap cache path</td><td>&#9989; Done</td><td>3 workload classes, N=1–16; GNN regime-pinned (~6× / 22–30×); checksum-gated</td></tr>
+<tr><td>Multi-tier warm hit (DRAM + NVMe)</td><td>&#9989; Done</td><td>48 tmpfs hits, bit-identical, at parity with NVMe</td></tr>
+<tr><td>Warm-flat at scale (Megatron)</td><td>&#9989; 32–128N (256N pending)</td><td>warm flat 175–178 s; native swings with Lustre contention</td></tr>
+<tr><td>Access-aware placement</td><td>&#9989; Done</td><td>0 cross-node misses; partitioned = 1× storage</td></tr>
+<tr><td>Sidecar recovery</td><td>&#9989; Done</td><td>flat ~5 s restore to ~1000 objects</td></tr>
+<tr><td>Cross-job sharing</td><td>&#9203; Future work</td><td>preliminary; known correctness defect; not a claim</td></tr>
+</table>
+<p style="margin-top:.6em"><strong>Next:</strong> an organic-promotion run (no manual pre-stage) + a manual-staging baseline; a contended-filesystem scenario where the win grows; a hash-vs-node-local timing number; and one end-to-end training number tying loader speedup to job wall-clock.</p>
+
+<p style="margin-top:1.4em">
+Detail pages: <a href="design.html">design</a> &middot; <a href="experiments.html">experiments</a> &middot;
+<a href="paper.html">paper plan</a> &middot; <a href="implementation_walkthrough.html">line-by-line code walkthrough</a> &middot;
+<a href="../EXPERIMENTS_STATUS.html">full status</a>.
+</p>
+
+<footer>
+Last updated: 2026-06-14 &middot; Numbers from the checksum-gated warm-hit sweeps + the 2026-06-14 TPDS revision (GNN regime-pinned, DRAM-tier proof, 32–128-node scale ladder). All charts are inline SVG (no external libraries). Generated for an advisor walkthrough.
+</footer>
+
+</body>
+</html>
