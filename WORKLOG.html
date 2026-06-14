@@ -41,6 +41,43 @@
 <a href="tpds_extension/paper.html">paper.html</a>.</p>
 
 <div class="entry">
+<h2>2026-06-14 — TPDS major-revision campaign: 5-reviewer panel, claim recalibration, regime-pinned reruns, DRAM-tier proof, 32&ndash;256-node scale ladder</h2>
+<p>Response to a simulated TPDS peer-review panel (5 reviewers + editorial synthesis;
+decision <strong>Major Revision</strong>; full report in the paper repo as <code>PanelReview_2026-06-11.md</code>).
+Paper edits live in the paper repo and are tracked separately &mdash; this entry records only the
+experiment + harness work in this code repo. The panel's four CRITICAL claim-vs-evidence issues
+(GNN &ldquo;~20&times;&rdquo; regime mislabel; staging-script differentiators unmeasured; title &ldquo;multi-tier&rdquo; vs
+single-tier mmap path; I/O-only epochs sold as end-to-end) drove the experiments below. All cells checksum-gated;
+see <code>benchmarks/results/frontier/</code> and <code>EXPERIMENTS_STATUS.html</code> for full tables.</p>
+<ul>
+<li><strong>Megatron warm-flat scale ladder</strong> (regime-pinned, 640&nbsp;GiB/node, page cache evicted per rep):
+warm epoch <strong>flat at 175&ndash;178&nbsp;s across 32/64/128 nodes</strong> (&lt;2% drift) while native cold swings
+2567 / 944 / 1066&nbsp;s &rarr; speedup 14.7 / 5.3 / 6.0&times;; at 256 nodes native epoch0 hit <strong>5890&nbsp;s</strong>
+(&asymp;98&nbsp;min, catastrophic PFS contention). Warm is the stable quantity; speedup varies only with the native
+baseline. Corpus checksum identical across all rungs. N256 warm pending (job 4808363, 8&nbsp;h walltime).</li>
+<li><strong>DRAM-tier (tmpfs) proof</strong> (answers the single-tier concern): the mmap warm-hit resolver served
+<strong>48 hits from the <code>/tmp</code> tmpfs tier</strong>, bit-identical, populate 0.24&nbsp;s, epoch 29&ndash;30&nbsp;s &mdash;
+at parity with the NVMe arm (same checksum). A 4-arm probe (tmpfs-native 39.3&nbsp;s &asymp; nvme-native 39.4&nbsp;s &asymp;
+fitcache-dram 40.0&nbsp;s) confirms the path is tier-agnostic; they tie only because the cov-bench is compute-bound
+(~4.4&nbsp;GB/s). The &sect;4.1 &ldquo;single-tier&rdquo; scoping note can be deleted.</li>
+<li><strong>GNN restated by regime</strong> (answers the &ldquo;~20&times; mislabel&rdquo;): NVMe-bound warm <strong>82.7&nbsp;s</strong>,
+page-cache resident 3.9&ndash;5.8&nbsp;s, cold native 2195 / 1870 / 2457&nbsp;s &rarr; <strong>~6&times; vs favorable Lustre,
+22&ndash;30&times; vs cold Lustre</strong>. The old &ldquo;18&ndash;33&times; vs cold native pass&rdquo; pairing was
+regime-contaminated and is retired.</li>
+<li><strong>Harness fixes</strong> (FitCache source untouched, data cross-comparable): <code>srun --overlap</code>;
+convergent <code>mem_hog</code> eviction; server-readiness via the port-cfg file; removed a <code>… | head -8</code>
+SIGPIPE footgun that killed the bench mid-run (three spurious N64 failures). Walltime bins learned: 184&ndash;1,881 nodes
+= 12&nbsp;h max (N256 was wrongly capped at 3&nbsp;h &rarr; timeout; resubmitted at 8&nbsp;h).</li>
+<li><strong>Fault-tolerance datum (for reviewer R3):</strong> servers down &rarr; warm hits still resolve bit-identically,
+only <code>open</code> latency rises (the client resolver is server-map-independent). Logged but not &ldquo;fixed&rdquo; mid-campaign.</li>
+</ul>
+<p><strong>Next:</strong> land N256 warm &rarr; complete the 32&ndash;256-node figure; apply verified numbers to the paper
+(delete single-tier note, rebuild GNN Table&nbsp;2 by regime, add scale-ladder figure + 256-node contention story + the
+fault-tolerance datum). Deferred experiments the panel would reward: GNN/DINOv2 scale ladders, end-to-end / I/O-fraction
+per workload class, over-capacity eviction, mid-epoch fault injection, sidecar restore at &ge;100&nbsp;K entries.</p>
+</div>
+
+<div class="entry">
 <h2>2026-05-19 — TPDS contribution pivot: mmap interceptor + sidecar warm-restart land as the two new mechanisms; cross-job becomes future work</h2>
 <p>After the cross-job campaign concluded with weak wall-time savings + recurring <code>DataLossError</code> flakiness (see 2026-05-17 / 2026-05-18 entries below), the TPDS contribution shape was revised. <strong>Two new mechanisms now anchor the paper, with cross-job sharing demoted to secondary / future work:</strong></p>
 <ol>

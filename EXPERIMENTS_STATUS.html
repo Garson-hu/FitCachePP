@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FitCachePP TPDS Extension — Final Experiment Status</title>
+<title>FitCachePP TPDS Extension — Experiment Status (rev. 2026-06-14)</title>
 <style>
   :root { --fg:#1b1f24; --muted:#57606a; --border:#d0d7de; --bg:#ffffff;
           --code-bg:#f6f8fa; --accent:#0969da; --th-bg:#f6f8fa; }
@@ -47,7 +47,13 @@
 <tr><th>Contribution</th><th>Status</th><th>One-line result</th></tr>
 <tr><td><strong>1. Transparent mmap Cache Path</strong></td>
     <td><span class="badge done">DONE</span></td>
-    <td>Warm-hit local-NVMe mmap beats <code>Native_mmap_PFS</code> across three workload classes; magnitude tracks PFS access pattern (1.2&times;&ndash;33&times;).</td></tr>
+    <td>Warm-hit node-local-tier mmap beats <code>Native_mmap_PFS</code> across three workload classes; magnitude tracks the PFS access pattern and is reported <em>per regime</em> (~1.2&ndash;1.6&times; dense-sequential; ~6&times; vs favorable Lustre / 22&ndash;30&times; vs cold Lustre for sparse-random GNN).</td></tr>
+<tr><td><strong>1b. mmap path is multi-tier (DRAM + NVMe)</strong></td>
+    <td><span class="badge done">DONE</span></td>
+    <td>Warm-hit resolver served 48 hits from the DRAM (<code>/tmp</code> tmpfs) tier, bit-identical, at parity with the NVMe tier &mdash; the path is tier-agnostic, not single-tier NVMe-only.</td></tr>
+<tr><td><strong>1c. Warm-flat scale ladder, 32&ndash;256 nodes</strong></td>
+    <td><span class="badge done">DONE (256N warm pending)</span></td>
+    <td>Megatron warm epoch is flat at 175&ndash;178&nbsp;s across 32/64/128 nodes (&lt;2% drift); speedup 5.3&ndash;14.7&times; varies only with the native baseline's Lustre contention.</td></tr>
 <tr><td><strong>2. Access-Aware mmap Cache Placement</strong></td>
     <td><span class="badge done">DONE</span></td>
     <td>Node-local placement removes hash scatter (fallback 0, remote 0); partitioned access caches disjoint sets at 1.0&times; duplication.</td></tr>
@@ -56,31 +62,97 @@
     <td>Sidecar metadata restores server cache-state after a metadata-service restart; not the bandwidth source.</td></tr>
 <tr><td>Cross-job cache sharing</td>
     <td><span class="badge supp">Future work</span></td>
-    <td>Deferred; no new compute. Not a claim in this paper.</td></tr>
+    <td>Deferred; preliminary mechanism with a known correctness defect. Not a claim in this paper.</td></tr>
 </table>
 
 <hr>
 
+<h2>TPDS Revision Campaign (2026-06-14) <span class="badge done">in progress</span></h2>
+<p>Response to a simulated 5-reviewer TPDS panel (decision: <strong>Major Revision</strong>;
+full report in the paper repo <code>PanelReview_2026-06-11.md</code>). The panel's four
+CRITICAL claim-vs-evidence issues drove the experiments below; all cells are
+checksum-gated. Paper edits live in the paper repo and are tracked separately; this
+page records the experiment evidence.</p>
+
+<h3>1c. Megatron warm-flat scale ladder (regime-pinned, 640&nbsp;GiB/node, page cache evicted per rep)</h3>
+<table>
+<tr><th>Nodes</th><th>GPU-equiv</th><th>warm epoch0</th><th>native cold epoch0</th><th>Speedup</th><th>Checksum (all ranks+arms)</th><th>Gate</th></tr>
+<tr><td>32</td><td>256</td><td>175.6 / 176.6 s</td><td>2567.7 s</td><td>14.7&times;</td><td>17267459847735986</td><td>PASS</td></tr>
+<tr><td>64</td><td>512</td><td>176.8 / 176.2 s</td><td>943.8 s</td><td>5.3&times;</td><td>17267459847735986</td><td>PASS</td></tr>
+<tr><td>128</td><td>1024</td><td>177.9 / 175.1 s</td><td>1065.9 s</td><td>6.0&times;</td><td>17267459847735986</td><td>PASS</td></tr>
+<tr><td>256</td><td>2048</td><td><em>pending (job 4808363, 8h walltime)</em></td><td>5890 s (epoch0, all 256 ranks)</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
+</table>
+<p class="note"><strong>Headline:</strong> the warm side is flat at 175&ndash;178&nbsp;s across 32&ndash;128 nodes (the client-local
+resolver adds no coordination cost at scale); the speedup varies only because the native baseline swings 944&ndash;2567&nbsp;s
+with Lustre time-of-day contention, hitting <strong>5890&nbsp;s</strong> (&asymp;98&nbsp;min) at 256 nodes &mdash; catastrophic PFS
+degradation under 256-node concurrent reads. Warm is the stable quantity; native is condition-dependent.
+Result base: <code>benchmarks/results/frontier/megatron_scale_ladder/</code>.</p>
+
+<h3>1b. DRAM-tier (tmpfs) warm-hit proof (answers the &ldquo;single-tier&rdquo; review concern)</h3>
+<table>
+<tr><th>Arm</th><th>Working set</th><th>epoch</th><th>populate</th><th>Warm hits to tier</th><th>Checksum</th></tr>
+<tr><td>FitCachePP warm &mdash; DRAM (<code>/tmp</code> tmpfs)</td><td>128 GiB (8 shards)</td><td>29.3&ndash;30.5 s</td><td>0.24 s</td><td>48 &rarr; tmpfs</td><td>3453497658530916</td></tr>
+<tr><td>FitCachePP warm &mdash; NVMe</td><td>128 GiB (8 shards)</td><td>28.5&ndash;31.0 s</td><td>&mdash;</td><td>&rarr; NVMe</td><td>3453497658530916</td></tr>
+<tr><td>Probe: tmpfs-native / nvme-native / fitcache-dram</td><td>32 GiB (2 shards)</td><td>39.3 / 39.4 / 40.0 s</td><td>&mdash;</td><td>&mdash;</td><td>863370099612894</td></tr>
+</table>
+<p class="note">The mmap warm-hit path resolves to the DRAM tier as readily as NVMe, bit-identical and at parity.
+DRAM and NVMe tie here because the cov-bench is compute-bound (~4.4&nbsp;GB/s), but the point holds: the path is
+<strong>multi-tier</strong>, not single-tier NVMe-only. Result base:
+<code>benchmarks/results/frontier/mmap_dram_tier/</code>.</p>
+
+<h3>1a. GNN warm-hit speedup, restated by regime (answers the &ldquo;~20&times; mislabel&rdquo; concern)</h3>
+<table>
+<tr><th>Regime</th><th>Epoch</th><th>Source</th></tr>
+<tr><td>NVMe-bound warm hit</td><td>82.7 s (cleanest eviction)</td><td><code>gnn_warm3</code></td></tr>
+<tr><td>page-cache resident</td><td>3.9&ndash;5.8 s</td><td><code>gnn_warm3</code></td></tr>
+<tr><td>cold native (Lustre)</td><td>2195 / 1870 / 2457 s</td><td>3 independent single-rep jobs</td></tr>
+</table>
+<p class="note">Restated as <strong>~6&times; vs the most favorable Lustre native (510&nbsp;s), 22&ndash;30&times; vs cold Lustre</strong>.
+The earlier &ldquo;18&ndash;33&times; vs cold native pass&rdquo; pairing was regime-contaminated (warm cell partly page-cache served,
+baseline mislabeled) and is retired. Checksum 1390926382383426708 across warm + all 3 natives.
+Result base: <code>benchmarks/results/frontier/gnn_regime_pinned/</code>.</p>
+
+<h3>Harness fixes + a fault-tolerance datum</h3>
+<p class="note">Experiment-script fixes only (FitCache C/C++ source untouched, so all data stays cross-comparable):
+<code>srun --overlap</code> for post-server steps; convergent <code>mem_hog</code> eviction loop; server-readiness via the
+port-cfg file (not the stdout log); and removal of a <code>… | head -8</code> SIGPIPE footgun that was killing the bench
+mid-run (caused three spurious N64 failures). Walltime bins learned: 184&ndash;1,881 nodes = 12&nbsp;h max (256N was wrongly
+capped at 3&nbsp;h, causing a timeout). <strong>Fault-tolerance datum (for reviewer R3):</strong> when the servers are down, warm
+hits still resolve bit-identically &mdash; only <code>open</code> latency rises &mdash; because the client resolver is
+server-map-independent.</p>
+
+<hr>
+
 <h2>Contribution 1 — Transparent mmap Cache Path <span class="badge done">DONE</span></h2>
-<p>An LD_PRELOAD client transparently redirects <code>mmap</code> to a local-NVMe cached copy on a warm hit
+<p>An LD_PRELOAD client transparently redirects <code>mmap</code> to a node-local cached copy on a warm hit
 (<code>fitcache_resolve_cached_path()</code>: client-side, deterministic hash-bin, size-match completeness gate, no RPC),
-and falls back to native PFS mmap on a cold miss while promoting the file for next time. Two views are reported for every
-result: warm-hit-only (mechanism) and amortized including pre-stage cost. Every cell passes a hard FitCachePP-vs-Native
+and falls back to native PFS mmap on a cold miss while promoting the file for next time. The cache is tier-general &mdash; the
+data mover places a promoted file DRAM (tmpfs) first, then PMem, then NVMe, by capacity, and the resolver probes the tiers in
+that order and maps whichever holds the file. On <strong>Frontier</strong> the warm tier was the per-node NVMe burst buffer
+(<code>/mnt/bb</code>). What matters is the <em>per-node</em> working set: these sweeps keep it &gt; the 512&nbsp;GiB node RAM on
+purpose by <strong>replicating</strong> it on every node (Megatron all 40 shards = 640&nbsp;GiB/node; GNN whole feature files
+~902&nbsp;GB/node; DINOv2 full-corpus shared, 541&nbsp;GB/node), so aggregate DRAM across nodes does not shrink it and per-node
+tmpfs cannot hold it (PMem unset). A <em>partitioned</em> pattern (DINOv2 disjoint = the Access-Aware placement) is the exception
+&mdash; ~34&nbsp;GB/node at 16 nodes fits tmpfs &mdash; but then the <code>Native_mmap_PFS</code> baseline page-caches it too and
+the sustained gap washes out, so NVMe is the right tier for the sustained claim. Two views are reported for every result:
+warm-hit-only (mechanism) and amortized including pre-stage cost. Every cell passes a hard FitCachePP-vs-Native
 checksum-equality gate plus a decode gate where applicable.</p>
 
 <table>
 <tr><th>Workload class</th><th>Scale</th><th>Warm-hit speedup</th><th>Amortized break-even</th><th>Gate</th></tr>
 <tr><td>Megatron IndexedDataset (dense-sequential LLM)</td><td>N=1,2,4,8,16; 640 GiB/node, 40 shards</td><td>1.22&times;&ndash;1.60&times;</td><td>3&ndash;4 epochs</td><td>PASS</td></tr>
-<tr><td>GNN feature gather, IGB-large (sparse-random)</td><td>N=1,2,4,8,16; 902 GB feature+CSR</td><td>18&times;&ndash;33&times;</td><td>1 epoch</td><td>PASS (per-rank)</td></tr>
+<tr><td>GNN feature gather, IGB-large (sparse-random)</td><td>N=1,2,4,8,16; 902 GB feature+CSR</td><td>~6&times; vs favorable / 22&ndash;30&times; vs cold Lustre <span class="note">(regime-pinned; see TPDS Revision &sect;1a)</span></td><td>1 epoch</td><td>PASS (per-rank)</td></tr>
 <tr><td>DINOv2 / CC12M tar-shard load (sequential vision)</td><td>N=1,2,4,8,16; full corpus 996/996 shards, 541 GB/node &gt; RAM</td><td>1.63&times;&ndash;1.95&times;</td><td>2&ndash;3 passes</td><td>PASS + decode 10956</td></tr>
 </table>
 
-<p class="note"><strong>Mechanism / honesty.</strong> Magnitude is bounded by the PFS access pattern. Random small reads
-on Lustre (GNN ~3&ndash;4 MB/s per faulted page) are where local-NVMe direct mmap wins biggest (18&ndash;33&times;);
-dense-sequential reads (Megatron, DINOv2) win modestly (~1.3&ndash;1.6&times;) because Frontier Lustre sequential bandwidth is
-already high. The full-corpus DINOv2 run uses a working set &gt; node RAM, ruling out a page-cache artifact. Claims are scoped
-to mmap-backed data <em>loading</em>, not end-to-end model training.
-Result base: <code>benchmarks/results/frontier/{megatron,gnn,dinov2}_warmhit_sweep/</code>.</p>
+<p class="note"><strong>Mechanism / honesty.</strong> Magnitude is bounded by the PFS access pattern and is now reported
+<em>per regime</em> (see TPDS Revision &sect;1a). Random small reads on Lustre are where local-NVMe direct mmap wins biggest
+(sparse-random GNN: ~6&times; vs the most favorable Lustre native, 22&ndash;30&times; vs cold Lustre); dense-sequential reads
+(Megatron, DINOv2) win modestly (~1.3&ndash;1.6&times;) because Frontier Lustre sequential bandwidth is already high. The
+full-corpus DINOv2 run uses a working set &gt; node RAM, ruling out a page-cache artifact. Claims are scoped to mmap-backed
+data <em>loading</em>, not end-to-end model training.
+Result base: <code>benchmarks/results/frontier/{megatron,gnn,dinov2}_warmhit_sweep/</code>,
+<code>{megatron_scale_ladder,mmap_dram_tier,gnn_regime_pinned}/</code>.</p>
 
 <hr>
 
@@ -158,7 +230,7 @@ tiny (~1 KB/entry; 996 objects = ~1 MB).</p>
 
 <h2>Superseded / Do Not Cite <span class="badge bad">Superseded</span></h2>
 <ul>
-<li><strong>Eager-populate mmap (server + Mercury anon-mmap) path</strong> — replaced by the warm-hit direct-NVMe redesign. It
+<li><strong>Eager-populate mmap (server + Mercury anon-mmap) path</strong> — replaced by the warm-hit direct local-tier redesign. It
 added a PFS&rarr;server&rarr;client hop and could not beat <code>Native_mmap_PFS</code> in any single-pass regime.</li>
 <li><strong>1 TB sharded Megatron sweep (16 GiB shards)</strong> — <span class="badge bad">INVALID</span>. Hit the ~2 GiB read-truncation
 bug; FitCachePP read only ~1/8 of each shard and zero-filled the tail. The "order-of-magnitude speedup" was an artifact.
@@ -171,8 +243,8 @@ reported one.</li>
 </ul>
 
 <footer>
-Last updated: 2026-05-24<br>
-Generated from markdown source, but updated to reflect latest final results. Markdown source was not modified.
+Last updated: 2026-06-14 (TPDS revision campaign: panel review + regime-pinned reruns, DRAM-tier proof, 32&ndash;256-node scale ladder).<br>
+Earlier sections (Contributions 1/2, sidecar, superseded) retain their 2026-05-24 content; the TPDS Revision section supersedes the stale GNN magnitude.
 </footer>
 
 </body>
