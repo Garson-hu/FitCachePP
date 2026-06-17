@@ -57,9 +57,9 @@
 <tr><td><strong>2. Access-Aware mmap Cache Placement</strong></td>
     <td><span class="badge done">DONE</span></td>
     <td>Node-local placement removes hash scatter (fallback 0, remote 0); partitioned access caches disjoint sets at 1.0&times; duplication.</td></tr>
-<tr><td>Sidecar-Based Cache-State Recovery</td>
+<tr><td>Recoverable cache state with .meta files</td>
     <td><span class="badge supp">Supporting</span></td>
-    <td>Sidecar metadata restores server cache-state after a metadata-service restart; not the bandwidth source.</td></tr>
+    <td>the .meta files restore server cache state after a metadata-service restart; not the bandwidth source.</td></tr>
 <tr><td>Cross-job cache sharing</td>
     <td><span class="badge supp">Future work</span></td>
     <td>Deferred; preliminary mechanism with a known correctness defect. Not a claim in this paper.</td></tr>
@@ -186,13 +186,13 @@ replicates locally) and <strong>partitioned</strong> (nodes read disjoint sets, 
 the data is actually node-local. Placement eliminates hash scatter (per-node fallback 0, remote 0) while avoiding unnecessary
 replication for partitioned access: partitioned DINOv2 N=2 gives full local mmap hits at duplicate factor <strong>1.0&times;</strong>
 (global unique 996 = node0 [0,497] + node1 [498,995]), versus shared mode's 2.0&times;. Shared local replication is a deliberate
-tradeoff; partitioned avoids full replication. Placement only; the sidecar and organic-promote path are unchanged.
+tradeoff; partitioned avoids full replication. Placement only; the .meta file and organic-promote path are unchanged.
 Result base: <code>benchmarks/results/frontier/sidecar_recovery/*_{nodelocal,partitioned}/</code>.</p>
 
 <hr>
 
-<h2>Supporting Mechanism — Sidecar-Based Cache-State Recovery <span class="badge supp">Supporting</span></h2>
-<p>A <code>.meta</code> sidecar is written per cached file by the data mover on organic promotion. After a FitCachePP
+<h2>Supporting Mechanism — Recoverable cache state with .meta files <span class="badge supp">Supporting</span></h2>
+<p>A <code>.meta</code> file is written per cached file by the data mover on organic promotion. After a FitCachePP
 metadata-service restart, <code>restore_from_sidecars</code> rebuilds the server-side cache-state map so original PFS paths warm-hit
 local NVMe again. This restores reusable cache <em>state</em> and reduces cold metadata recovery; it is <strong>not</strong> the source
 of the warm-hit bandwidth and does not improve every epoch. The client warm-hit resolver is server-map-independent.
@@ -201,29 +201,29 @@ Harness: <code>scripts/frontier/frontier_sidecar_recovery.sh</code>. Result base
 
 <h3>Recovery (N=1, all gates PASS)</h3>
 <table>
-<tr><th>Bench</th><th>Sidecars</th><th>Restore</th><th>Restored/missing</th><th>Fallback</th><th>Checksum/decode</th></tr>
+<tr><th>Bench</th><th>.meta files</th><th>Restore</th><th>Restored/missing</th><th>Fallback</th><th>Checksum/decode</th></tr>
 <tr><td>Megatron</td><td>40</td><td>fast</td><td>40 / 0</td><td>0</td><td>PASS</td></tr>
 <tr><td>GNN</td><td>6</td><td>6 s</td><td>6 / 0</td><td>0</td><td>PASS</td></tr>
 <tr><td>DINOv2</td><td>996</td><td>8 s</td><td>996 / 0</td><td>0</td><td>PASS + decode 10956</td></tr>
 </table>
 
-<h3>With-sidecar vs no-sidecar ablation (DINOv2 full corpus, N=1)</h3>
+<h3>With-.meta file vs no-.meta file ablation (DINOv2 full corpus, N=1)</h3>
 <table>
 <tr><th>Arm</th><th>Server restored</th><th>Restore time</th><th>Cache_hit / fallback</th><th>Finding</th></tr>
-<tr><td>with sidecar</td><td>996 / 996</td><td>5 s</td><td>996 / 0</td><td>Server restores authoritative cache-state map; no re-promotion churn.</td></tr>
-<tr><td>no sidecar</td><td>0 / 996</td><td>n/a</td><td>996 / 0</td><td>Client still warm-hits (resolver is server-map-independent); server starts empty and must rediscover.</td></tr>
+<tr><td>with .meta file</td><td>996 / 996</td><td>5 s</td><td>996 / 0</td><td>Server restores authoritative cache-state map; no re-promotion churn.</td></tr>
+<tr><td>no .meta file</td><td>0 / 996</td><td>n/a</td><td>996 / 0</td><td>Client still warm-hits (resolver is server-map-independent); server starts empty and must rediscover.</td></tr>
 </table>
-<p class="note">Both arms raw-checksum correct and decode 10956. The sidecar buys server-side cache-state recovery, not the
+<p class="note">Both arms raw-checksum correct and decode 10956. The .meta file buys server-side cache-state recovery, not the
 client bandwidth.</p>
 
 <h3>Restore scaling (DINOv2, metadata-restore only)</h3>
 <table>
-<tr><th>Shards</th><th>Sidecar entries</th><th>Meta bytes</th><th>Restore time</th><th>Entries/sec</th></tr>
+<tr><th>Shards</th><th>.meta file entries</th><th>Meta bytes</th><th>Restore time</th><th>Entries/sec</th></tr>
 <tr><td>32</td><td>32</td><td>34,304</td><td>6 s</td><td>5.3</td></tr>
 <tr><td>256</td><td>256</td><td>274,432</td><td>5 s</td><td>51.2</td></tr>
 <tr><td>996</td><td>996</td><td>1,067,712</td><td>5 s</td><td>199.2</td></tr>
 </table>
-<p class="note">Restore time is ~flat (5&ndash;6 s) and startup/scan-dominated, independent of object count. Sidecar metadata is
+<p class="note">Restore time is ~flat (5&ndash;6 s) and startup/scan-dominated, independent of object count. the .meta files is
 tiny (~1 KB/entry; 996 objects = ~1 MB).</p>
 
 <hr>
@@ -244,7 +244,7 @@ reported one.</li>
 
 <footer>
 Last updated: 2026-06-14 (TPDS revision campaign: panel review + regime-pinned reruns, DRAM-tier proof, 32&ndash;256-node scale ladder).<br>
-Earlier sections (Contributions 1/2, sidecar, superseded) retain their 2026-05-24 content; the TPDS Revision section supersedes the stale GNN magnitude.
+Earlier sections (Contributions 1/2, .meta file, superseded) retain their 2026-05-24 content; the TPDS Revision section supersedes the stale GNN magnitude.
 </footer>
 
 </body>

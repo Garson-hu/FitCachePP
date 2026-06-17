@@ -80,10 +80,10 @@
     <li><a href="#m2-modulo"><code>modulo_select()</code> + the partitioned-access story</a></li>
     <li><a href="#m2-epoch">Cross-epoch consistency — why the same node keeps warm-hitting</a></li>
   </ol></li>
-<li><a href="#m3">Supporting — Sidecar cache-state recovery <span class="badge supp">Supporting</span></a>
+<li><a href="#m3">Supporting — .meta file cache-state recovery <span class="badge supp">Supporting</span></a>
   <ol type="a">
-    <li><a href="#m3-write">Writing a sidecar on promotion</a></li>
-    <li><a href="#m3-format">The sidecar format + atomic write</a></li>
+    <li><a href="#m3-write">Writing a .meta file on promotion</a></li>
+    <li><a href="#m3-format">The .meta file format + atomic write</a></li>
     <li><a href="#m3-restore"><code>restore_from_sidecars()</code> on server startup</a></li>
     <li><a href="#m3-gate">The <code>persist_meta_enabled()</code> gate</a></li>
   </ol></li>
@@ -98,8 +98,15 @@
 <tr><th>#</th><th>What we want</th><th>Why it was needed</th><th>Status</th></tr>
 <tr><td>1</td><td><strong>Transparent mmap cache path.</strong> Make <code>mmap()</code>-based loaders (numpy.memmap → Megatron IndexedDataset, DINOv2 tar slices, GNN feature gather) benefit from the node-local cache, with the warm read served by a <em>direct mmap of the cached file from whichever local tier holds it</em> (DRAM/tmpfs → PMem → NVMe; no RPC).</td><td>Page-fault reads on an mmap never call <code>read()</code>, so the old client missed them entirely — those workloads measured "0 Open RPC". The data flowed straight from the PFS.</td><td><span class="badge done">DONE</span></td></tr>
 <tr><td>2</td><td><strong>Access-aware mmap cache placement.</strong> Make the cached file land on the <em>same node</em> as the rank that needs it, and support disjoint (partitioned) access without full replication.</td><td>A warm mmap hit needs the file in a local cache tier (DRAM/PMem/NVMe) on the same node. Default hash placement scatters a node's working set across the cluster, so at N≥2 a node misses half its own set.</td><td><span class="badge done">DONE</span></td></tr>
-<tr><td>3</td><td><strong>Sidecar cache-state recovery</strong> (supporting). Persist a <code>.meta</code> sidecar per cached file so a restarted metadata service can rebuild its cache map.</td><td>Lets the cache survive a server restart without re-promoting from PFS. It restores server-side <em>state</em>; it is not the bandwidth source.</td><td><span class="badge supp">Supporting</span></td></tr>
+<tr><td>3</td><td><strong>.meta file cache-state recovery</strong> (supporting). Persist a <code>.meta</code> file per cached file so a restarted metadata service can rebuild its cache map.</td><td>Lets the cache survive a server restart without re-promoting from PFS. It restores server-side <em>state</em>; it is not the bandwidth source.</td><td><span class="badge supp">Supporting</span></td></tr>
 </table>
+<p class="note">These are not three separable features — they are <strong>one system</strong>. Mechanism 1 only delivers the warm-hit
+speedup if the cached copy is node-local (Mechanism 2), and that node-local cache only survives a job requeue or service crash if the
+server can rebuild its state (Mechanism 3). They are therefore validated <em>together</em> first: a single integrated Megatron N=16
+run drives organic promotion &rarr; node-local placement (<code>local=160, remote=0</code>) &rarr; a live server restart
+(<code>restore_from_sidecars</code> rebuilds 40/40 in 5 s) &rarr; warm hit (<code>fallback=0</code>), with no manual staging and all
+gates passing. This walkthrough then explains each mechanism's code in turn. See
+<a href="experiments.html">experiments.html §1.1</a> and <a href="experiments_methodology.html">experiments_methodology.html §8b</a>.</p>
 
 <h2 id="arch">2. Architecture at a glance</h2>
 <p>An application links the LD_PRELOAD client (<code>libfitcache_client.so</code>); Mercury-RPC servers run alongside (default 4/node). The path through the system for an mmap-based loader:</p>
@@ -127,7 +134,7 @@ server restart ──► restore_from_sidecars() rebuilds path_cache_map</code><
 <tr><th>Mechanism</th><th>Primary files</th></tr>
 <tr><td>1 — mmap path</td><td><code>src/client/wrappers.c</code>, <code>src/client/fitcache_multi_source_read.cpp</code>, <code>src/client/fitcache_mmap_tracker.cpp</code>, <code>src/comm/fitcache_comm_server.cpp</code></td></tr>
 <tr><td>2 — placement</td><td><code>src/cross_job/fitcache_cross_job.cpp</code></td></tr>
-<tr><td>3 — sidecar</td><td><code>src/cross_job/fitcache_persistent_meta.cpp</code>, <code>src/server/fitcache_data_mover.cpp</code>, <code>src/server/fitcache_server.cpp</code></td></tr>
+<tr><td>3 — .meta file</td><td><code>src/cross_job/fitcache_persistent_meta.cpp</code>, <code>src/server/fitcache_data_mover.cpp</code>, <code>src/server/fitcache_server.cpp</code></td></tr>
 </table>
 
 <hr>
@@ -255,7 +262,7 @@ server restart ──► restore_from_sidecars() rebuilds path_cache_map</code><
 <li><strong>Same hash as the server.</strong> <code>std::hash&lt;std::string&gt;</code> of the original path, then a two-level bucket <code>&lt;(h&gt;&gt;8)&amp;0xFF&gt;/&lt;h&amp;0xFF&gt;</code>. The server's data mover computes the identical bucket (section 3d, <a href="../src/server/fitcache_data_mover.cpp#L482">data_mover.cpp:482-484</a>). Client and server link the same libstdc++, so the hash value matches bit for bit — this is what lets the client reconstruct the path with no RPC.</li>
 <li><strong>The completeness gate</strong> is <code>cst.st_size == orig_size</code>. The data mover does a full <code>fs::copy</code> before a file is usable; if a partial copy is on disk its size won't match, and we correctly treat it as a miss and fall through to the PFS. This is what makes the warm hit safe to take without asking the server.</li>
 <li><strong>Tier-general, DRAM-first.</strong> The probe order is <code>tier_env[3] = {DRAM_PATH, PMEM_PATH, NVME_PATH}</code> and the warm hit maps <em>whichever tier matched</em> — the returned <code>cand</code> path is tier-agnostic. This mirrors the server data mover, which places a promoted file <strong>DRAM (tmpfs) first, then PMem, then NVMe</strong> by remaining capacity (<a href="../src/server/fitcache_data_mover.cpp#L443">data_mover.cpp:443-466</a>: <code>target_tier = CACHE_TIER_DRAM</code> unless DRAM is full). So the mechanism is a tiered node-local cache, not an NVMe-only cache.</li>
-<li><strong>Server-map independent.</strong> Notice it only <code>stat()</code>s the filesystem; it never consults a server. This is why the with/no-sidecar ablation (section 5) shows the client warm-hits in <em>both</em> arms — the resolver needs only the files on disk, not the server's in-memory map.</li>
+<li><strong>Server-map independent.</strong> Notice it only <code>stat()</code>s the filesystem; it never consults a server. This is why the with/no-.meta file ablation (section 5) shows the client warm-hits in <em>both</em> arms — the resolver needs only the files on disk, not the server's in-memory map.</li>
 </ul>
 <div class="callout warn">
 <strong>Mechanism vs. what the Frontier experiments used — and why not tmpfs.</strong> The cache is tier-general (DRAM/tmpfs → PMem → NVMe, DRAM-first by capacity), but the reported warm-hit numbers were served from <strong>NVMe</strong>, not DRAM. What decides tmpfs feasibility is the <em>per-node</em> working set, which depends on the <em>access pattern</em>, not on the total dataset size. These sweeps keep the per-node set <strong>larger than the 512&nbsp;GiB node RAM</strong> on purpose, by <strong>replicating</strong> it on every node: the Megatron stage loop copies all 40 shards (640&nbsp;GiB) to every node, the GNN stage loop copies the whole feature files (~902&nbsp;GB) to every node (it must — the random row-gather can touch any row, and the resolver requires a complete file), and DINOv2 full-corpus runs in shared mode (all 996 shards, 541&nbsp;GB, per node). Because the per-node set is replicated, <strong>aggregating DRAM across N nodes does not shrink it</strong> — each node still needs the whole set locally, which a per-node tmpfs (<code>/tmp</code> <em>is</em> tmpfs on Frontier, but RAM-sized) cannot hold. NVMe (<code>/mnt/bb</code> burst buffer, ~2&nbsp;TB/node) is the only local tier large enough. (The warm hit lands on NVMe because that is where the pre-stage <code>cp</code> wrote it; the client resolver does no RPC and never reads <code>FitCache_DRAM_CAPACITY</code> — a server-only knob, 256&nbsp;MiB for DINOv2/GNN, 40&nbsp;GiB for Megatron.)</p>
@@ -304,7 +311,7 @@ void   fitcache_mmap_tracker_drop(void *addr);                   // erase on mun
 <div class="callout warn">
 <strong>Why open-time, not close-time.</strong> numpy.memmap reuses the same fd per shard. Under that access pattern the client's <code>open_cb</code> response is sometimes dropped as stale by the epoch guard, leaving <code>fd_redir_map[fd]==0</code>, which makes the client skip the close RPC — so close-time promotion never fired and the cache stayed empty (exactly the cache the warm-hit path needs). Enqueuing at open time guarantees promotion regardless of the close RPC. The data mover dedups against <code>path_cache_map</code>, so a double enqueue is harmless.
 </div>
-<p>The data mover thread then does the physical copy and computes the cached path — covered in section 3 of Mechanism 3 below, because the same code also writes the sidecar.</p>
+<p>The data mover thread then does the physical copy and computes the cached path — covered in section 3 of Mechanism 3 below, because the same code also writes the .meta file.</p>
 
 <hr>
 
@@ -433,11 +440,11 @@ EPOCH 2     resolver stat /mnt/bb(node0)/[hash]/     resolver stat /mnt/bb(node2
 
 <hr>
 
-<h2 id="m3">5. Supporting — Sidecar cache-state recovery <span class="badge supp">Supporting</span></h2>
-<p>A <code>.meta</code> sidecar is written next to each cached file so a restarted server can rebuild its cache map. It restores server-side <em>state</em>; the client warm-hit (Mechanism 1) is already server-map-independent, so the sidecar is not the bandwidth source.</p>
+<h2 id="m3">5. Supporting — .meta file cache-state recovery <span class="badge supp">Supporting</span></h2>
+<p>A <code>.meta</code> file is written next to each cached file so a restarted server can rebuild its cache map. It restores server-side <em>state</em>; the client warm-hit (Mechanism 1) is already server-map-independent, so the .meta file is not the bandwidth source.</p>
 
-<h3 id="m3-write">5a. Writing a sidecar on promotion</h3>
-<p>The data mover thread does the physical copy and writes the sidecar in one place, at <a href="../src/server/fitcache_data_mover.cpp#L482">fitcache_data_mover.cpp:482</a>:</p>
+<h3 id="m3-write">5a. Writing a .meta file on promotion</h3>
+<p>The data mover thread does the physical copy and writes the .meta file in one place, at <a href="../src/server/fitcache_data_mover.cpp#L482">fitcache_data_mover.cpp:482</a>:</p>
 <span class="filetag">src/server/fitcache_data_mover.cpp:482</span>
 <pre><code>            size_t h = std::hash&lt;std::string&gt;{}(original_path);
             char subdir[8];
@@ -460,7 +467,7 @@ EPOCH 2     resolver stat /mnt/bb(node0)/[hash]/     resolver stat /mnt/bb(node2
                 }</code></pre>
 <p>The line that ties Mechanism 1 and 3 together is <code>sprintf(subdir, "%02zx/%02zx", (h&gt;&gt;8)&amp;0xFF, h&amp;0xFF)</code> — byte-for-byte the same bucket computation the client resolver uses at <a href="../src/client/fitcache_multi_source_read.cpp#L302">multi_source_read.cpp:302</a>. That shared formula is the contract: the server writes here, the client looks here, no message is exchanged.</p>
 
-<h3 id="m3-format">5b. The sidecar format + atomic write</h3>
+<h3 id="m3-format">5b. The .meta file format + atomic write</h3>
 <p><code>meta_make_initial</code> at <a href="../src/cross_job/fitcache_persistent_meta.cpp#L64">persistent_meta.cpp:64</a> builds a fixed-size record:</p>
 <span class="filetag">src/cross_job/fitcache_persistent_meta.cpp:64 (fields)</span>
 <pre><code>m.magic            = FITCACHE_META_MAGIC;     // sanity tag
@@ -479,7 +486,7 @@ int fd = open(tmp_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
 fdatasync(fd);
 close(fd);
 rename(tmp_path.c_str(), final_path.c_str());   // POSIX-atomic publish</code></pre>
-<p>A reader therefore sees either the old sidecar or the new one, never a torn one. The per-pid temp suffix avoids collisions between concurrent server processes on the same node. On read, <code>meta_read_sidecar</code> validates <code>magic</code> + <code>version</code> and the scan helper quarantines anything that fails to <code>&lt;path&gt;.broken</code> rather than deleting it.</p>
+<p>A reader therefore sees either the old .meta file or the new one, never a torn one. The per-pid temp suffix avoids collisions between concurrent server processes on the same node. On read, <code>meta_read_sidecar</code> validates <code>magic</code> + <code>version</code> and the scan helper quarantines anything that fails to <code>&lt;path&gt;.broken</code> rather than deleting it.</p>
 
 <h3 id="m3-restore">5c. <code>restore_from_sidecars()</code> on startup</h3>
 <p>At <a href="../src/server/fitcache_data_mover.cpp#L208">fitcache_data_mover.cpp:208</a>. On boot the server scans each tier directory and rebuilds the in-memory map:</p>
@@ -498,7 +505,7 @@ rename(tmp_path.c_str(), final_path.c_str());   // POSIX-atomic publish</code></
     // ... same for PMem, NVMe; sum into total_restored ...
     return total_restored;
 }</code></pre>
-<p>The <code>meta_scan_tier_dir</code> walker (at <a href="../src/cross_job/fitcache_persistent_meta.cpp#L247">persistent_meta.cpp:247</a>) recursively finds every <code>*.meta</code>, strips the suffix to get the cached path, skips orphaned sidecars whose data file is gone, validates each, and calls the visitor. The visitor above re-inserts <code>original_path → cached_path</code> and adds back the bytes. After this, the server's eviction/promotion accounting is correct again and it won't re-promote files it already has. This is the measured "restored 996/996 in 5 s, missing 0" result.</p>
+<p>The <code>meta_scan_tier_dir</code> walker (at <a href="../src/cross_job/fitcache_persistent_meta.cpp#L247">persistent_meta.cpp:247</a>) recursively finds every <code>*.meta</code>, strips the suffix to get the cached path, skips orphaned .meta files whose data file is gone, validates each, and calls the visitor. The visitor above re-inserts <code>original_path → cached_path</code> and adds back the bytes. After this, the server's eviction/promotion accounting is correct again and it won't re-promote files it already has. This is the measured "restored 996/996 in 5 s, missing 0" result.</p>
 <p>The call is wired into server startup at <a href="../src/server/fitcache_server.cpp#L210">fitcache_server.cpp:210</a>, also behind the gate:</p>
 <span class="filetag">src/server/fitcache_server.cpp:210</span>
 <pre><code>if (fitcache::persist_meta_enabled()) {
@@ -507,7 +514,7 @@ rename(tmp_path.c_str(), final_path.c_str());   // POSIX-atomic publish</code></
 }</code></pre>
 
 <h3 id="m3-gate">5d. The <code>persist_meta_enabled()</code> gate</h3>
-<p>Sidecar write + restore is decoupled from the heavyweight cross-job machinery, at <a href="../src/cross_job/fitcache_cross_job.cpp#L171">cross_job.cpp:171</a>:</p>
+<p>.meta file write + restore is decoupled from the heavyweight cross-job machinery, at <a href="../src/cross_job/fitcache_cross_job.cpp#L171">cross_job.cpp:171</a>:</p>
 <span class="filetag">src/cross_job/fitcache_cross_job.cpp:171</span>
 <pre><code>bool persist_meta_enabled() {
     static int cached = -1;
@@ -518,7 +525,7 @@ rename(tmp_path.c_str(), final_path.c_str());   // POSIX-atomic publish</code></
     }
     return cached != 0;
 }</code></pre>
-<p>Why this exists: the original gate ran the full cross-job stack (registry init + heartbeat + sibling-refresh threads) for any test that merely wanted sidecar persistence, and those background threads skewed Horovod ranks at n=32768/1N. <code>FitCache_PERSIST_META=1</code> turns on just the sidecar write + restore — no registry, no peer-lookup, no extra threads — so a single-job run can get cache durability across restart without the latency tax. It is auto-on under cross-job (which needs the sidecars for peer discovery anyway).</p>
+<p>Why this exists: the original gate ran the full cross-job stack (registry init + heartbeat + sibling-refresh threads) for any test that merely wanted .meta file persistence, and those background threads skewed Horovod ranks at n=32768/1N. <code>FitCache_PERSIST_META=1</code> turns on just the .meta file write + restore — no registry, no peer-lookup, no extra threads — so a single-job run can get cache durability across restart without the latency tax. It is auto-on under cross-job (which needs the .meta files for peer discovery anyway).</p>
 
 <hr>
 
@@ -526,9 +533,9 @@ rename(tmp_path.c_str(), final_path.c_str());   // POSIX-atomic publish</code></
 <p>Every performance cell passes a hard FitCachePP-vs-<code>Native_mmap_PFS</code> checksum-equality gate (per-rank for multi-seed benches) plus a decode gate where applicable. Full tables on <a href="experiments.html">experiments.html</a>; the headline shape:</p>
 <table>
 <tr><th>Contribution</th><th>Workload / cells</th><th>Result</th><th>Harness</th></tr>
-<tr><td>1 — mmap path</td><td>Megatron N=1–16 (+ scale ladder 32–256); GNN IGB-large N=1–16; DINOv2 CC12M 996/996 N=1–16</td><td>warm-hit 1.2–1.6&times; (Megatron); GNN ~6&times; vs favorable / 22–30&times; vs cold Lustre (regime-pinned, supersedes 18–33&times;); 1.6–1.95&times; (DINOv2); warm flat 175–178&nbsp;s across 32–128 nodes</td><td><code>benchmarks/{megatron,gnn,dinov2}/*</code> + <code>results/frontier/{*_warmhit_sweep,megatron_scale_ladder,mmap_dram_tier,gnn_regime_pinned}/</code></td></tr>
+<tr><td>1 — mmap path</td><td>All three workloads N=1–16 <em>and</em> a 32–256-node scale ladder (Megatron 40-shard, GNN IGB-large, DINOv2 CC12M 996 shared)</td><td>warm-hit 1.2–1.6&times; (Megatron); GNN ~6&times; vs favorable / 22–30&times; vs cold Lustre (regime-pinned, supersedes 18–33&times;); 1.6–1.95&times; (DINOv2). <strong>Warm-flat to 256 nodes (2048-GPU scale):</strong> Megatron 175–177&nbsp;s, GNN 75–87&nbsp;s, DINOv2 200–203&nbsp;s; speedup grows with the native baseline (Megatron 16.5&times;, GNN 13.0&times; @256)</td><td><code>benchmarks/{megatron,gnn,dinov2}/*</code> + <code>results/frontier/{*_warmhit_sweep,*_scale_ladder,mmap_dram_tier,gnn_regime_pinned}/</code></td></tr>
 <tr><td>2 — placement</td><td>Megatron N=2/4, GNN N=2, DINOv2 N=2 shared + partitioned, vs hash baseline</td><td>fallback 0, remote 0; partitioned dup 1.0&times; vs shared 2.0&times;</td><td><code>frontier_sidecar_recovery.sh</code> with <code>PLACEMENT=node_local</code> / <code>DINO_SHARD_MODE</code></td></tr>
-<tr><td>3 — sidecar</td><td>recovery N=1; with/no-sidecar ablation; restore scaling 32→996</td><td>restore ~flat 5–6 s; client warm-hits in both ablation arms</td><td><code>frontier_sidecar_recovery.sh</code></td></tr>
+<tr><td>3 — .meta file</td><td>recovery N=1; with/no-.meta file ablation; restore scaling 32→996</td><td>restore ~flat 5–6 s; client warm-hits in both ablation arms</td><td><code>frontier_sidecar_recovery.sh</code></td></tr>
 </table>
 <p>The harness wires the placement env at <a href="../scripts/frontier/frontier_sidecar_recovery.sh#L122">frontier_sidecar_recovery.sh:122</a> (<code>export FITCACHE_MMAP_PLACEMENT=$PLACEMENT</code>) and selects shared/partitioned at line 77 (<code>SHARED_ARG="--shared"; [ "$DINO_SHARD_MODE" = "partitioned" ] &amp;&amp; SHARED_ARG=""</code>).</p>
 
@@ -539,7 +546,7 @@ rename(tmp_path.c_str(), final_path.c_str());   // POSIX-atomic publish</code></
 <tr><td>Client-side resolver with completeness gate (no RPC)</td><td><span class="badge done">DONE</span></td></tr>
 <tr><td>Open-time promotion (fixes the empty-cache-under-fd-reuse bug)</td><td><span class="badge done">DONE</span></td></tr>
 <tr><td>Node-local placement + partitioned access (1.0&times; dup)</td><td><span class="badge done">DONE</span> — fallback 0 / remote 0 in all cells</td></tr>
-<tr><td>Sidecar write + atomic publish + restore-on-startup + gate</td><td><span class="badge done">DONE</span> — recovery, ablation, scaling all measured</td></tr>
+<tr><td>.meta file write + atomic publish + restore-on-startup + gate</td><td><span class="badge done">DONE</span> — recovery, ablation, scaling all measured</td></tr>
 <tr><td>&gt;2 GiB read-truncation fix (server short-read loop + ≤1 GiB chunked populate)</td><td><span class="badge done">DONE</span> — was the bug that invalidated the old 1 TB sweep</td></tr>
 <tr><td>Cross-job HRW sharing path</td><td><span class="badge supp">Future work</span> — code present, not a paper claim; concurrent-mode <code>DataLossError</code> un-root-caused</td></tr>
 <tr><td>Node-local placement at N=8/16</td><td><span class="badge supp">Not required</span> to demonstrate the policy; N=2/4 suffice</td></tr>
@@ -548,7 +555,7 @@ rename(tmp_path.c_str(), final_path.c_str());   // POSIX-atomic publish</code></
 <p><strong>Bottom line:</strong> both contributions and the supporting mechanism are implemented and gated. Nothing is missing for the current claims (C1–C4 on <a href="paper.html">paper.html</a>); the only open items are explicitly scoped as future work.</p>
 
 <footer>
-Last updated: 2026-05-24<br>
+Last updated: 2026-06-16 (added "one system, validated together" framing + integrated-run pointer at §1).<br>
 Generated from the source tree (line numbers verified against the working copy at write time). No markdown source was modified.
 </footer>
 

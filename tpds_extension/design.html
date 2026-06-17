@@ -58,7 +58,7 @@ next time.</p>
                 │              enqueue promotion (open-time)
    __real_mmap of cached file   ──►  data mover copies to a local
    (page-fault from local tier)      tier (DRAM-first → PMem → NVMe)
-                                     + writes .meta sidecar</code></pre>
+                                     + writes .meta file</code></pre>
 <p class="note">The cache is tier-general: the data mover places a promoted file <strong>DRAM (tmpfs) first, then PMem, then
 NVMe</strong> by remaining capacity, and the resolver probes the tiers in the same order and maps whichever holds the file. On
 <strong>Frontier</strong> the warm-hit experiments were served from the <strong>NVMe</strong> tier (per-node burst buffer
@@ -69,6 +69,28 @@ nodes does not shrink it and a per-node tmpfs cannot hold it. PMem is unset (Fro
 pattern (DINOv2 disjoint = the Mechanism-2 placement) is the exception — at 16 nodes each holds ~34&nbsp;GB, which fits tmpfs — but
 then the <code>Native_mmap_PFS</code> baseline page-caches it too, washing out the sustained warm-hit gap. So NVMe is the correct
 tier for the sustained claim; a DRAM datapoint would be a different (cold-start) experiment.</p>
+
+<h2>One system, three dependent mechanisms</h2>
+<p>FitCachePP is <strong>one system</strong>. The three mechanisms below are not independent features that happen to ship
+together &mdash; they are causally chained, and the headline warm-hit result only holds when all three are in place:</p>
+<ol>
+<li><strong>Mechanism 1 (mmap cache path)</strong> delivers the speedup, but only if the cached copy is on the requester's
+<em>own</em> node &mdash; the win comes from page-faulting directly out of local storage with no network hop.</li>
+<li>Keeping each node's copy local is what <strong>Mechanism 2 (node-local placement)</strong> guarantees. Without it the default
+hash scatters a node's mmap set across the cluster, turning warm reads into remote/fallback misses at N&ge;2 &mdash; so Mechanism 1
+depends on Mechanism 2 at any multi-node scale.</li>
+<li>The cache only stays useful across a job requeue or a service crash if the server can rebuild its state, which is what
+<strong>Mechanism 3 (.meta-file recovery)</strong> provides. Without it a restart makes the server-side map look empty and the
+promotion/eviction accounting is lost &mdash; so Mechanism 2's placement survives a restart only because Mechanism 3 restores it.</li>
+</ol>
+<p>This dependency is why the system is validated <em>together</em> first. The integrated end-to-end run
+(<code>20260616_153421_sidecar_recovery_megatron_N16_integrated_e2e</code>, job 4819857) exercises all three in one Megatron N=16
+job with <strong>no manual staging</strong>: the cache fills organically from Lustre (populate 346.5&nbsp;s), node-local placement
+keeps <code>local=160, remote=0</code>, a metadata server is killed and restarted mid-run, <code>restore_from_sidecars</code>
+rebuilds 40/40 entries in 5&nbsp;s, and the post-restart resolver probe warm-hits all 40 objects (<code>fallback=0</code>) at
+185&ndash;210&nbsp;s with a checksum identical to populate. All three gates (CHECKSUM/RESTORE/RECOVERY) pass. The per-mechanism
+sections below are the ablations that attribute this integrated result to each mechanism; see
+<a href="experiments.html">experiments.html &sect;1.1</a>.</p>
 
 <h2>Mechanism 1 — Transparent mmap cache path <span class="badge done">DONE</span></h2>
 <p>The warm-hit path resolves the cached copy with <code>fitcache_resolve_cached_path()</code>: client-side, deterministic
@@ -93,12 +115,14 @@ Default <code>hash</code> path is unchanged.</li>
 locally) and <strong>partitioned</strong> (nodes read disjoint sets via the cc12m bench's disjoint mode, so each node caches only
 its own shards at ~1&times; global copies).</p>
 
-<h2>Mechanism 3 — Sidecar cache-state recovery <span class="badge supp">Supporting</span></h2>
-<p>The data mover writes a <code>.meta</code> sidecar per cached file on organic promotion. After a metadata-service restart,
+<h2>Mechanism 3 — .meta file cache-state recovery <span class="badge supp">Supporting</span></h2>
+<p>The data mover writes a <code>.meta</code> file per cached file on organic promotion. After a metadata-service restart,
 <code>restore_from_sidecars</code> rebuilds the server-side cache-state map (eviction/promotion accounting). The client warm-hit
 resolver is independent of the server map: it recomputes the deterministic cached path and <code>stat</code>s the local cache tier, so as
-long as the cached files persist on local storage (the burst buffer in the Frontier runs) the client warm-hits in both the with- and without-sidecar arms. The sidecar
-therefore restores reusable cache <em>state</em> and reduces cold metadata recovery; it is not the bandwidth source.</p>
+long as the cached files persist on local storage (the burst buffer in the Frontier runs) the client warm-hits in both the with- and without-.meta file arms. The .meta file
+therefore restores reusable cache <em>state</em> and reduces cold metadata recovery; it is not the bandwidth source. In the
+integrated N=16 run this mechanism rebuilt 40/40 entries in 5&nbsp;s after a live server restart, after which the resolver
+warm-hit all 40 objects with <code>fallback=0</code>.</p>
 
 <h2>Future work — cross-job cache sharing <span class="badge supp">Future work</span></h2>
 <p>Cross-job sharing (<code>FitCache_CROSS_JOB=1</code>, HRW/peer-read path) remains future work only; no new compute is spent on
@@ -115,7 +139,7 @@ Fixed with the server short-read loop and &le;1 GiB chunked populate.</li>
 </ul>
 
 <footer>
-Last updated: 2026-05-24<br>
+Last updated: 2026-06-16 (added "one system, three dependent mechanisms" framing + integrated end-to-end run).<br>
 Generated from markdown source, but updated to reflect latest final results. Markdown source was not modified.
 </footer>
 
