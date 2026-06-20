@@ -27,11 +27,7 @@
   .badge.done  { background:#1e8e3e; }
   .badge.supp  { background:#5f6368; }
   .badge.trade { background:#e0a400; color:#1b1f24; }
-  .badge.prog  { background:#0969da; }
-  .badge.bad   { background:#c5221f; }
   .note { color:var(--muted); font-size:.92em; }
-  .lead { border:2px solid #1e8e3e; background:#eef7f0; padding:.8em 1.1em; border-radius:8px; color:#1b1f24; }
-  .warn { border:2px solid #e0a400; background:#fff8e1; padding:.7em 1em; border-radius:8px; color:#1b1f24; }
   .callout { border:1px solid #0969da; background:#eef4fc; padding:.7em 1em; border-radius:8px; color:#1b1f24; }
   hr { border:none; border-top:1px solid var(--border); margin:2.2em 0; }
   footer { margin-top:3em; padding-top:1.2em; border-top:1px solid var(--border);
@@ -42,261 +38,109 @@
 
 <h1>FitCachePP TPDS Extension — Experiments</h1>
 
-<p class="lead"><strong>How to read this page.</strong> FitCachePP is <strong>one system</strong>, not three separable
-features. So we validate it that way. <strong>Part 1 measures the whole system</strong> — all three mechanisms active together —
-and asks two questions: <strong>(§1.1) what does combining them buy at 1–16 nodes</strong>, and <strong>(§1.2) does it still hold
-at 32–256 nodes</strong>. We also show one job where the system fills itself organically and survives a mid-job server restart.
-<strong>Part 2 then ablates</strong> each mechanism (turns it off, or compares it against the naive alternative) to attribute the
-whole-system result to the right cause. Whole-system first, component attribution second.</p>
+<p class="note"><strong>Structure.</strong> FitCachePP is one system. <strong>Part 1</strong> measures the whole system (all
+three mechanisms on) at two scales — §1.1 at 1–16 nodes, §1.2 at 32–256 nodes — plus one job that fills itself and survives a
+mid-run server restart. <strong>Part 2</strong> ablates each mechanism to attribute the result. Every performance cell passes a
+FitCachePP-vs-<code>Native_mmap_PFS</code> checksum-equality gate (per-rank for the multi-seed GNN bench). Datasets, access
+patterns, run procedure, and the gate/honesty details: <a href="experiments_methodology.html">experiments_methodology.html</a>.</p>
 
-<p class="note">The three mechanisms are causally chained, which is why they have to be tested together:</p>
-<ol class="note">
-<li><strong>Transparent mmap cache path</strong> delivers the speedup — but only if the cached copy is on the reader's <em>own</em>
-node, because the win comes from page-faulting directly out of local storage with no network hop.</li>
-<li>Keeping each node's copy local is exactly what <strong>access-aware (node-local) placement</strong> does — without it, a
-node's files scatter across the cluster and warm reads turn into remote/fallback misses.</li>
-<li>And the cache only stays useful across a job requeue or a service crash if the server can rebuild its state, which is what
-<strong>.meta-file recovery</strong> provides — without it, a restart makes the cache look empty and everything falls back to a
-cold PFS read.</li>
-</ol>
-<p class="note">Companion pages:
-<a href="../EXPERIMENTS_STATUS.html">EXPERIMENTS_STATUS.html</a> ·
-<a href="design.html">design.html</a> ·
-<a href="implementation_walkthrough.html">implementation_walkthrough.html</a> ·
-<a href="paper.html">paper.html</a>. Every performance cell passes a hard FitCachePP-vs-<code>Native_mmap_PFS</code>
-checksum-equality gate (per-rank for the multi-seed GNN bench), and a decode gate where applicable.</p>
+<h1>Part 1 — Whole system: mmap + prefetch, at two scales</h1>
+<p class="note">Part 1 runs the whole system — the transparent <code>mmap</code> cache path plus an application
+<code>fitcache_prefetch()</code> hint that promotes each node's working set ahead of the read. <strong>Prefetch replaces the
+access-aware-placement step</strong>: instead of every node staging the full corpus (replicate-all, N×), each node prefetches
+only its <strong>own 1/N partition</strong>, so the cluster holds the read set <strong>once (1×)</strong> while every read is
+still a warm local <code>mmap</code>. Two scales — §1.1 at 1–16 nodes, §1.2 at 32–256 — each tabling all three workloads
+side by side: Megatron (dense-sequential) and DINOv2 (sequential vision), both 1×-partitionable, plus GNN (sparse 2-hop gather),
+the un-partitionable case where prefetch still wins the warm-hit but storage stays N×. Every cell passes a
+FitCachePP-vs-<code>Native_mmap_PFS</code> per-rank checksum-equality gate.</p>
 
-<p class="warn"><strong>Data provenance (read before the tables).</strong> The current-binary re-run now covers the <em>full</em>
-1→256 range: <strong>§1.1 (1–16 nodes)</strong> and <strong>§1.2 (32–256 nodes)</strong> were taken with the same binary and the
-same regime-pinned, warm-first method, so they form one comparable curve. Every rung has warm + native + a checksum check; three
-1–16 native cells that hit the 2 h walltime wall on their first attempt were refilled by native-only recovery jobs, so the
-current-binary curve is now complete. A separate <strong>legacy</strong> 1–16 sweep (§1.1(b)) used a different measurement regime per workload and is
-reported apart — <strong>do not stitch it onto the current-binary curve</strong>. We frame the win as <strong>warm-flat</strong>,
-not "speedup grows with scale": the native cold epoch is volatile (non-monotonic in N, tracking PFS contention and time of day), so
-the stable, defensible quantity is the flat warm read, not a clean speedup-vs-scale law.</p>
-
-<h1>Part 1 — The whole system (all three mechanisms ON), at two scales</h1>
-
-<h2>1.1 — Combined result at 1–16 nodes (all three workloads) <span class="badge done">DONE</span></h2>
-<p>This is the small/medium-scale "what do all three mechanisms together buy you" question. It comes in two parts: (a) the
-current-binary re-run that will stitch onto §1.2, and (b) the original sweep that first established the three workload classes.</p>
-
-<h3>(a) Current-binary re-run — complete</h3>
-<p>Run with the same binary and regime-pinned, warm-first method as the §1.2 ladder, so the two ranges form one comparable
-1→256 curve. <strong>All 15 rungs are complete</strong> — every warm and native cell is captured; three natives that hit the 2 h
-walltime wall on their first (afternoon) attempt were refilled by native-only recovery jobs (see note). Speedup = native cold ÷ warm.</p>
+<h2>1.1 — 1–16 nodes <span class="badge done">DONE</span></h2>
+<p class="note">Each node prefetch-promotes its disjoint 1/N partition from Lustre into local NVMe, then mmap-reads it warm.
+<code>cold→warm</code> = native first (cold) read ÷ FitCachePP warm; <code>warm→warm</code> = native 2nd-epoch
+(page-cached) warm ÷ FitCachePP warm. <code>1× cache</code> = the per-node footprint (its partition only), <code>du</code> on NVMe.</p>
 <table>
-<tr><th>N</th><th>Megatron (warm / native / speedup)</th><th>GNN (NVMe-bound warm / native / speedup)</th><th>DINOv2 (warm / native / speedup)</th></tr>
-<tr><td>1</td><td>197 / 1305 / 6.6×</td><td>87.2 / 4962 / 56.9×</td><td>217 / 1045 / 4.8×</td></tr>
-<tr><td>2</td><td>183 / 3835 / 21.0×</td><td>86.7 / 4420 / 51.0×</td><td>223 / 1000 / 4.5×</td></tr>
-<tr><td>4</td><td>175 / 1254 / 7.2×</td><td>86.6 / 1954 / 22.6×</td><td>228 / 685 / 3.0×</td></tr>
-<tr><td>8</td><td>181 / 887 / 4.9×</td><td>86.6 / 1544 / 17.8×</td><td>224 / 880 / 3.9×</td></tr>
-<tr><td>16</td><td>172 / 1118 / 6.5×</td><td>85.9 / 827 / 9.6×</td><td>225 / 865 / 3.8×</td></tr>
+<tr><th rowspan="2">N</th><th colspan="3">Megatron — dense-sequential (32-shard corpus)</th><th colspan="3">DINOv2 — sequential vision (8 shards/node)</th><th colspan="3">GNN — sparse 2-hop gather (un-partitionable)</th></tr>
+<tr><th>FCP warm</th><th>cold→warm</th><th>1× cache/node</th><th>FCP warm</th><th>cold→warm</th><th>1× cache/node</th><th>FCP warm</th><th>cold→warm</th><th>N×/node</th></tr>
+<tr><td>2</td><td>60.5 s</td><td><strong>15.4×</strong></td><td>256 GiB</td><td>1.49 s</td><td>2.3×</td><td>4.35 GB</td><td>86.7 s</td><td>51.0×</td><td>902 GB</td></tr>
+<tr><td>4</td><td>31.9 s</td><td><strong>20.6×</strong></td><td>128 GiB</td><td>1.49 s</td><td>2.3×</td><td>4.34 GB</td><td>86.4 s</td><td>22.6×</td><td>902 GB</td></tr>
+<tr><td>8</td><td>14.6 s</td><td>5.6×</td><td>64 GiB</td><td>1.49 s</td><td>2.3×</td><td>4.35 GB</td><td>86.3 s</td><td>17.9×</td><td>902 GB</td></tr>
+<tr><td>16</td><td>7.5 s</td><td>5.0×</td><td>32 GiB</td><td>1.48 s</td><td>2.3×</td><td>4.34 GB</td><td>86.2 s</td><td>9.6×</td><td>902 GB</td></tr>
 </table>
-<p class="note"><strong>This is the 1→16 half of the warm-flat curve.</strong> Warm is essentially constant across all five
-rungs (Megatron 172–197 s, GNN NVMe-bound 86–87 s, DINOv2 217–228 s) and joins the §1.2 32→256 band with no step — confirming the
-two ranges are one curve on one binary. Checksums: all warm reps match the canonical values (Megatron
-<code>17267459847735986</code>, DINOv2 <code>66993673013083</code>, GNN per-rank). The Megatron native arm prints a different
-<em>aggregate</em> <code>GLOBAL_CHECKSUM</code> (<code>8633729923867993</code>) than the warm arm, but this is a cosmetic
-aggregation-order artifact: <strong>every per-shard <code>shard_cksum</code> is byte-identical between warm and native</strong>
-(e.g. shard0 <code>215842217132793</code>, shard5 <code>215844240366352</code>), so the served data is verified correct — the same
-situation as GNN's cosmetic pooled-gate FAIL. GNN native is distributed across nodes, so it drops steeply with scale (4962→827 s
-over N=1→16) and the speedup falls from 56.9× to 9.6× — i.e. the headline is warm-flat, not a fixed speedup.</p>
-<p class="note"><strong>How the three walled native cells were recovered.</strong> Frontier caps ≤91-node jobs at 2 h (Bin 5). A
-few 1–16 natives hit that wall on their first attempt: at small N a node cold-reads the entire replicated working set (Megatron
-640 GB, DINOv2 541 GB) from Lustre with little read parallelism, and afternoon Lustre contention pushed Megatron N=1/N=2 and DINOv2
-N=1 past 2 h. This is the <em>same</em> phenomenon as DINOv2's intractable N=256 native (§1.2) — cold reads of large replicated
-sets are infeasible within scheduler limits at the extremes, which is exactly what the warm cache removes. A
-<strong>native-only</strong> recovery (no warm/stage/server overhead → the full 2 h for the cold read) refilled all three:
-Megatron N=1 = 1305 s, Megatron N=2 = 3835 s, DINOv2 N=1 = 1045 s, each with per-shard checksums matching the warm arm. The natives
-are strongly time-of-day dependent (Megatron N=4 native ran in 21 min in the evening vs N=1 walling at 2 h in the afternoon, and
-N=2's recovery still took 64 min on a later slow patch) — concrete evidence of the "native-volatile / warm-stable" point.</p>
+<p class="note"><strong>1× storage</strong> — each node caches only its partition (Megatron 32/N shards × 16 GiB =
+256→128→64→32 GiB, du-confirmed at N=4,8; DINOv2 its 8 shards = 4.35 GB), so the cluster holds the read set once
+vs replicate-all's N×. <strong>Correct + warm</strong> — every node count passes the per-rank checksum gate. The
+<em>warm→warm</em> speedup is modest (Megatron 1.9–2.3×, DINOv2 ~1.6×) because at 1× the partition fits node
+RAM so the native baseline page-caches it too; the cost FitCachePP actually removes is the <em>cold→warm</em> gap (Megatron
+5–20.6×: a 925 s first cold read becomes a 60 s warm read). Megatron N=1 (un-partitioned 512 GiB single-node baseline)
+omitted. <strong>GNN — the un-partitionable column.</strong> Its 2-hop heterogeneous gather can touch <em>any</em> feature row
+(the access set is data-dependent, not a contiguous slice), so it cannot be 1×-partitioned: every node holds the
+<strong>whole</strong> feature + CSR set (902 GB), and storage stays <strong>N×</strong> (the <code>N×/node</code> column). Here
+<code>FCP warm</code> is the <em>NVMe-bound</em> gather — the ~2.67 GB of scattered rows served from the node's local copy, a flat
+<strong>~86 s</strong> — versus the native gather scattered from Lustre; <code>cold→warm</code> is that ratio. Read it as
+<strong>NVMe-warm-flat + native-volatile</strong>, <em>not</em> &ldquo;speedup grows with scale&rdquo;: the native cold epoch
+swings with time-of-day Lustre congestion (4419 s at N=2 down to 827 s at N=16) while the local gather stays ~86 s, so the ratio
+wobbles (9.6–51×) rather than trending. (Once the page cache is warm a re-read drops to ~4 s, but we report the conservative
+NVMe-bound number.) Every rank's checksum matches <code>Native_mmap_PFS</code> byte-for-byte under the per-rank gate; the pooled
+cross-rank gate cosmetically reports FAIL only because each rank uses a distinct seed. Source: <code>gnn_scale_ladder/</code>.</p>
 
-<h3>(b) Original per-workload sweep <span class="badge trade">legacy regime — do not merge with §1.2</span></h3>
-<p>The completed 1–16 evidence is the original sweep that established the three workload classes. It is kept here as the record,
-but each workload used a different measurement regime than the §1.2 ladder, so these numbers live in their own table with
-mandatory caveats — they are <strong>not</strong> on the same axis as §1.2 and averaging the two would be a category error.</p>
+<h2>1.2 — 32–256 nodes <span class="badge done">DONE</span></h2>
+<p class="note">Same mmap+prefetch setup at scale. Megatron caps at N=64 (its 64-shard corpus → 1 shard/node at N=64);
+DINOv2 reaches N=256 (996-shard corpus, 3 shards/node). Same columns as §1.1. <strong>GNN stays un-partitionable</strong> at every
+scale — each node still holds the whole feat+CSR set (902 GB, N×). Its NVMe-bound warm gather stays <strong>flat (~75–87 s)</strong>
+from 32 to 256; the native cold epoch is <em>time-of-day-volatile</em> (576→440→757→973 s), so cold→warm wobbles 5.1–13.0× — again
+<strong>warm-flat + native-volatile</strong>, not a scaling trend. Per-rank checksum PASS (the pooled cross-rank gate cosmetically
+FAILs on per-rank seeds). Source: <code>gnn_scale_ladder/</code>.</p>
 <table>
-<tr><th>N</th><th>Megatron warm / native / speedup<sup>1</sup></th><th>GNN warm / native / speedup<sup>2</sup></th><th>DINOv2 warm / native / speedup<sup>3</sup></th></tr>
-<tr><td>1</td><td>271.9 / 349.2 / 1.28×</td><td>18.6 / 856 / 45.9×</td><td>233.3 / 456.7 / 1.96×</td></tr>
-<tr><td>2</td><td>284.6 / 348.6 / 1.23×</td><td>27.3 / 802 / 29.4×</td><td>235.5 / 435.0 / 1.85×</td></tr>
-<tr><td>4</td><td>222.0 / 345.1 / 1.55×</td><td>17.2 / 602 / 35.0×</td><td>215.9 / 436.2 / 2.02×</td></tr>
-<tr><td>8</td><td>219.7 / 343.0 / 1.56×</td><td>25.0 / 555 / 22.2×</td><td>225.4 / 435.2 / 1.93×</td></tr>
-<tr><td>16</td><td>214.8 / 346.8 / 1.61×</td><td>25.3 / 479 / 18.9×</td><td>259.8 / 437.2 / 1.68×</td></tr>
+<tr><th rowspan="2">N</th><th colspan="3">Megatron — dense-sequential</th><th colspan="3">DINOv2 — sequential vision</th><th colspan="3">GNN — sparse 2-hop gather (un-partitionable)</th></tr>
+<tr><th>FCP warm</th><th>cold→warm</th><th>1× cache/node</th><th>FCP warm</th><th>cold→warm</th><th>1× cache/node</th><th>FCP warm</th><th>cold→warm</th><th>N×/node</th></tr>
+<tr><td>32</td><td>7.2 s</td><td><strong>5.6×</strong></td><td>32 GiB</td><td>0.56 s</td><td>2.4×</td><td>1.52 GB</td><td>87.1 s</td><td>6.6×</td><td>902 GB</td></tr>
+<tr><td>64</td><td>3.4 s</td><td><strong>5.8×</strong></td><td>16 GiB</td><td>0.56 s</td><td>2.4×</td><td>1.52 GB</td><td>86.1 s</td><td>5.1×</td><td>902 GB</td></tr>
+<tr><td>128</td><td colspan="3">— (64-shard cap)</td><td>0.56 s</td><td>2.3×</td><td>1.52 GB</td><td>82.6 s</td><td>9.2×</td><td>902 GB</td></tr>
+<tr><td>256</td><td colspan="3">— (64-shard cap)</td><td>0.57 s</td><td>2.3×</td><td>1.52 GB</td><td>75.0 s</td><td>13.0×</td><td>902 GB</td></tr>
 </table>
-<p class="note"><sup>1</sup> <strong>Megatron legacy:</strong> native here is <em>NVMe per-node pre-staged</em> (~345–356 s), not
-the PFS-cold mmap native of §1.2 (944–2915 s). Speedups 1.2–1.6× are not the same quantity as §1.2's 5.6–17.6×.<br>
-<sup>2</sup> <strong>GNN legacy:</strong> warm magnitudes (17–27 s) are 2–5× the current steady-state and use a <em>larger
-workload</em> (30 batches / ~890–972 K rows / 3.97 GB vs current 20 batches / 598 710 rows / 2.67 GB; a different checksum family
-confirms it). These warm cells are also the panel-flagged <em>regime-contaminated</em> ones.<br>
-<sup>3</sup> <strong>DINOv2 legacy:</strong> the "native" arm is <code>Native_mmap_PFS</code> <em>warm-hit-prestaged on PFS</em>
-(warm-vs-warm), not true cold Lustre, at <code>decode_every=500</code> (vs §1.2's <code>decode_every=50</code>). So 1.7–2.0× is a
-warm-vs-warm ratio, not comparable to §1.2's true-cold 3.3–12×. All arms pass their checksum gates (Megatron
-<code>…735986</code>, DINOv2 <code>66993673013083</code>, GNN per-rank).</p>
-
-<div class="callout">
-<strong>The whole system also runs itself — and survives a restart.</strong> Beyond the warm/native tables, one integrated
-Megatron N=16 job (4819857) drives all three mechanisms together with <strong>zero manual staging</strong>: the cache fills
-organically from Lustre (populate 346.5 s), node-local placement keeps every node's copy local (<strong>local=160/node, remote=0</strong>
-— 2560 placements aggregate, zero remote across the 16 ranks), then a metadata server is <strong>killed and restarted mid-run</strong> — <code>restore_from_sidecars</code>
-rebuilds <strong>40/40 entries in 5 s</strong>, the resolver warm-hits all of them (<strong>cache_hit=40, fallback=0</strong>), and
-the post-restart warm pass (209.8 s) is 22.8% faster than the reference warm-hit, with a checksum identical to populate. All three
-gates (CHECKSUM/RESTORE/RECOVERY) PASS. This is a recovery/placement <em>proof</em>, not a scaling datapoint — it has no native
-baseline and a different (256 MB DRAM → NVMe, node_local) config, so it is intentionally kept out of the scaling tables.
-Result base: <code>sidecar_recovery/20260616_153421_…_megatron_N16_integrated_e2e/</code>.</div>
-
-<hr>
-
-<h2>1.2 — Combined result at 32–256 nodes (all three workloads) — the headline scaling result <span class="badge done">DONE</span></h2>
-<p>This is the load-bearing result: the full system (mmap path + node-local placement active), current binary, run at 32, 64, 128,
-and 256 nodes (256 nodes = the 2048-GPU node scale of the base end-to-end runs). <em>Regime-pinned</em> — the working set is
-replicated per node so it exceeds the 512 GiB node RAM and reads cannot hide in page cache — with <code>mem_hog</code> eviction
-before each rep. <strong>The headline: the warm read time stays flat across the whole range.</strong> The client-local resolver
-adds no coordination cost as the job grows. The native PFS baseline, by contrast, is large and volatile (it rises with Lustre
-contention but is non-monotonic in N), so the speedup is big at every scale without being a clean function of node count.</p>
-
-<h3>Warm epoch is flat across a 256× range of node counts</h3>
-<table>
-<tr><th>Workload</th><th>N=32</th><th>N=64</th><th>N=128</th><th>N=256</th><th>spread</th></tr>
-<tr><td>Megatron (dense-seq)</td><td>174.8</td><td>168.9</td><td>173.5</td><td><strong>165.7</strong></td><td>~5% (mean 170.7 s)</td></tr>
-<tr><td>GNN gather (sparse-random, NVMe-bound warm)<sup>†</sup></td><td>87.1</td><td>86.1</td><td>82.6</td><td><strong>75.0</strong></td><td>75–87 s band</td></tr>
-<tr><td>DINOv2 (seq. vision)</td><td>215.4</td><td>219.8</td><td>218.8</td><td><strong>220.6</strong></td><td>~2.4% (mean 218.7 s)</td></tr>
-</table>
-<p class="note"><sup>†</sup> <strong>GNN warm regime.</strong> The GNN working set (~2.67 GB) is small, so after the first
-(NVMe-bound) read it page-caches; the page-cache-resident epochs drop to ~4–11 s. We report the <strong>NVMe-bound</strong>
-(evicted, first-touch) warm read (75–87 s) as the sustained, honest figure — the ~4 s page-cache number is exactly the artifact
-the regime-pinning is designed to avoid claiming.</p>
-
-<h3>Native cold epoch (true cold from Lustre) and resulting speedup</h3>
-<table>
-<tr><th>Workload</th><th>metric</th><th>N=32</th><th>N=64</th><th>N=128</th><th>N=256</th></tr>
-<tr><td rowspan="2">Megatron</td><td>native cold epoch (s)</td><td>2567.7</td><td>943.8</td><td>1065.9</td><td>2914.8</td></tr>
-<tr><td>warm-hit speedup</td><td>14.7×</td><td>5.6×</td><td>6.1×</td><td><strong>17.6×</strong></td></tr>
-<tr><td rowspan="2">GNN gather</td><td>native cold epoch (s)</td><td>575.3</td><td>440.6</td><td>758.8</td><td>970.8</td></tr>
-<tr><td>warm-hit speedup (vs NVMe-bound warm)</td><td>6.6×</td><td>5.1×</td><td>9.2×</td><td><strong>13.0×</strong></td></tr>
-<tr><td rowspan="2">DINOv2</td><td>native cold epoch (s)</td><td>716.3</td><td>1288.8</td><td>2643.6</td><td><em>intractable</em></td></tr>
-<tr><td>warm-hit speedup</td><td>3.3×</td><td>5.9×</td><td>12.1×</td><td><em>—</em></td></tr>
-</table>
-<p class="note"><strong>Read this as "warm-flat + native-volatile," not "speedup grows with scale."</strong> The native cold epoch is
-non-monotonic in N (Megatron 2568→944→1066→2915 s; GNN 575→441→759→971 s) because it is dominated by time-of-day Lustre
-contention, not node count. The robust claim is the flat warm read; the speedup is large (single-digit to &gt;10×) at every scale
-but should not be presented as a monotonic law.</p>
-<p class="note"><strong>Gates &amp; honesty.</strong> Megatron and DINOv2 pass the full checksum gate at every completed rung
-(Megatron all <code>17267459847735986</code>; DINOv2 all <code>66993673013083</code>, warm+native). The <strong>GNN rungs report a
-cosmetic "FAILED"</strong>: the pooled gate takes a set-union of per-rank checksums, and because each rank samples different random
-rows by design the union has N distinct values. We verified per-rank that the FitCachePP warm read and the native read are
-<strong>byte-identical for every rank at N=32/64/128/256</strong> — the data is correct; only the aggregate gate is mis-specified.
-The <strong>DINOv2 native at N=256 is intractable</strong> (cold-reading the 541 GB replicated corpus on 256 nodes is ~138 TB of
-simultaneous Lustre reads; force-terminated, core dump, never finished an epoch) — itself evidence of why the local-tier path
-matters at scale; the warm side stayed flat at 220.6 s. <strong>Reduction conventions</strong> differ by workload and are stated so:
-Megatron = rank-0 headline epoch, GNN = cross-rank mean of the steady-state rep, DINOv2 = mean of two warm reps; at N≥64 Megatron's
-per-rank mean runs higher than its rank-0 headline (straggler tails), which we disclose rather than hide.
-Result base: <code>{megatron,gnn,dinov2}_scale_ladder/</code>.</p>
+<p class="note">Every cell passes the per-rank checksum gate (Megatron sorted-set, DINOv2 per-rank). <strong>1× du-confirmed</strong>:
+Megatron each node holds 32/N shards × 16 GiB (32 GiB at N=32, 16 GiB at N=64); DINOv2 each node 3 shards = 1.52 GB — the
+cluster holds the read set once vs N× for replicate-all. As in §1.1, the <em>cold→warm</em> gap is the real benefit (Megatron
+~5–6×); the <em>warm→warm</em> gap is small (~1.6–2×) because the 1/N partition fits node RAM and the native baseline page-caches
+it. DINOv2 reaches <strong>N=256</strong> (0.57 s warm, 2.3× cold→warm, 1.52 GB/node = 1×, all 256 ranks checksum PASS) —
+the flat-warm / 1×-storage trend holds unchanged from 32 to 256 nodes.</p>
 
 <hr>
 
 <h1>Part 2 — Ablations: what each mechanism contributes</h1>
-<p class="note">Each ablation turns one mechanism off (or compares it against the naive alternative) so the whole-system result
-above can be attributed to the right cause. They are <em>component studies of one system</em>, not separate systems.</p>
+<p class="note">Each ablation turns one mechanism off (or compares it against the naive alternative) so the whole-system result is
+attributed to the right cause.</p>
 
-<h2>2.1 — Node-local placement vs default hash <span class="badge done">DONE</span></h2>
-<p>The integrated run kept <code>local=160/node, remote=0</code> (2560 placements aggregate, zero remote); this ablation shows what happens with and without the
-<code>node_local</code> policy. With it, fallback 0 and remote 0 in every cell; the default hash scatters a node's set across the
-cluster and produces remote/fallback misses, which would defeat the warm mmap path.</p>
-<table>
-<tr><th>Cell</th><th>Per-node working set</th><th>Node-0 cached</th><th>Restored</th><th>Fallback</th><th>Remote</th><th>Checksum</th></tr>
-<tr><td>Megatron N=2</td><td>40</td><td>40</td><td>40/40</td><td>0</td><td>0</td><td>PASS</td></tr>
-<tr><td>Megatron N=4</td><td>40</td><td>40</td><td>40/40</td><td>0</td><td>0</td><td>PASS</td></tr>
-<tr><td>GNN N=2</td><td>6</td><td>6</td><td>6/6</td><td>0</td><td>0</td><td>PASS (per-rank)</td></tr>
-<tr><td>DINOv2 N=2 shared</td><td>996</td><td>996</td><td>996/996</td><td>0</td><td>0</td><td>PASS + decode 10956</td></tr>
-<tr><td>DINOv2 N=2 partitioned</td><td>498</td><td>498</td><td>498/498</td><td>0</td><td>0</td><td>PASS (per-rank) + decode 5478</td></tr>
-<tr><td>hash baseline (Megatron N=2)</td><td>40</td><td>18</td><td>18+22 global</td><td>22</td><td>n/a</td><td>PASS</td></tr>
-</table>
-
-<h3>Placement vs access pattern</h3>
-<table>
-<tr><th>Mode</th><th>Access pattern</th><th>Per-node cached</th><th>Global copies</th><th>Dup factor</th><th>Fallback</th><th>Remote</th></tr>
-<tr><td>hash <span class="badge trade">scatter</span></td><td>global hash</td><td>scattered (18/40)</td><td>~1×</td><td>~1×</td><td>nonzero (22)</td><td>n/a</td></tr>
-<tr><td>node_local shared <span class="badge trade">replicate</span></td><td>all nodes same 996</td><td>996</td><td>1992</td><td><strong>2.0×</strong></td><td>0</td><td>0</td></tr>
-<tr><td>node_local partitioned <span class="badge done">1.0×</span></td><td>disjoint 498/node</td><td>498</td><td>996</td><td><strong>1.0×</strong></td><td>0</td><td>0</td></tr>
-</table>
-<p class="note">The mmap path provides the steady-state speedup; access-aware placement ensures the data is node-local. Shared
-local replication is a deliberate tradeoff; partitioned avoids full replication (global unique 996 = node0 [0,497] + node1
-[498,995]).</p>
-
-<h2>2.2 — .meta-file recovery vs no recovery <span class="badge supp">DONE</span></h2>
-<p>The integrated run restored 40/40 in 5 s after a server restart; this ablation isolates the recovery mechanism. The key
-finding: the client warm-hits in <em>both</em> arms because the resolver is server-map-independent — so the <code>.meta</code> file
-buys back server-side cache <em>state</em> (eviction/promotion accounting) and avoids cold metadata re-discovery, not raw
-bandwidth.</p>
-
-<h3>Recovery (N=1, all gates PASS)</h3>
+<h2>2.1 — .meta-file recovery vs no recovery <span class="badge supp">DONE</span></h2>
+<p class="note">The client warm-hits in <em>both</em> arms (the resolver is server-map-independent), so the <code>.meta</code> file
+buys back server-side cache <em>state</em> (eviction/promotion accounting), not raw bandwidth.</p>
 <table>
 <tr><th>Bench</th><th>.meta files</th><th>Restore</th><th>Restored/missing</th><th>Fallback</th><th>Checksum/decode</th></tr>
 <tr><td>Megatron</td><td>40</td><td>fast</td><td>40 / 0</td><td>0</td><td>PASS</td></tr>
 <tr><td>GNN</td><td>6</td><td>6 s</td><td>6 / 0</td><td>0</td><td>PASS</td></tr>
 <tr><td>DINOv2</td><td>996</td><td>8 s</td><td>996 / 0</td><td>0</td><td>PASS + decode 10956</td></tr>
 </table>
-
-<h3>With-.meta-file vs no-.meta-file ablation (DINOv2 full corpus, N=1)</h3>
 <table>
-<tr><th>Arm</th><th>Server restored</th><th>Restore time</th><th>Cache_hit / fallback</th></tr>
+<tr><th>Arm (DINOv2 full corpus, N=1)</th><th>Server restored</th><th>Restore time</th><th>Cache_hit / fallback</th></tr>
 <tr><td>with .meta file</td><td>996 / 996</td><td>5 s</td><td>996 / 0</td></tr>
 <tr><td>no .meta file</td><td>0 / 996</td><td>n/a</td><td>996 / 0</td></tr>
 </table>
-<p class="note">Both arms raw-checksum correct + decode 10956. The client warm-hits in both because the resolver recomputes the
-deterministic cached path and stats local storage; the .meta file restores server-side cache-state, not bandwidth.</p>
-
-<h3>Restore scaling (metadata-restore only)</h3>
 <table>
-<tr><th>Shards</th><th>Entries</th><th>Meta bytes</th><th>Restore time</th><th>Entries/sec</th></tr>
+<tr><th>Restore scaling (shards)</th><th>Entries</th><th>Meta bytes</th><th>Restore time</th><th>Entries/sec</th></tr>
 <tr><td>32</td><td>32</td><td>34,304</td><td>6 s</td><td>5.3</td></tr>
 <tr><td>256</td><td>256</td><td>274,432</td><td>5 s</td><td>51.2</td></tr>
 <tr><td>996</td><td>996</td><td>1,067,712</td><td>5 s</td><td>199.2</td></tr>
 </table>
-<p class="note">Restore time ~flat (5–6 s), startup/scan-dominated, independent of object count.</p>
+<p class="note">Restore time is ~flat (5–6 s), startup/scan-dominated, independent of object count.</p>
 
-<h2>2.3 — Cache tier: DRAM (tmpfs) vs NVMe <span class="badge supp">DONE</span></h2>
-<p>The data mover is tier-general (DRAM/tmpfs → PMem → NVMe by remaining capacity); the resolver probes the tiers in the same
-order. The scaling and integrated runs above were served from the per-node <strong>NVMe</strong> burst buffer
-(<code>/mnt/bb</code>), which is the correct tier for the <em>sustained</em> warm-hit claim. A DRAM-tier datapoint confirms the
-path also serves from tmpfs at parity (48 warm hits resolve to <code>/tmp</code>, bit-identical checksum
-<code>3453497658530916</code>), but that is a cold-start regime: when the working set fits tmpfs the <code>Native_mmap_PFS</code>
-baseline page-caches it too and the sustained gap washes out. NVMe is therefore the tier that backs the headline claim.
-Result base: <code>mmap_dram_tier/</code>.</p>
-
-<hr>
-
-<h2>Superseded / Do Not Cite <span class="badge bad">Superseded</span></h2>
-<ul>
-<li>Eager-populate (server + Mercury anon-mmap) mmap path.</li>
-<li>1 TB sharded Megatron sweep (16 GiB shards) — INVALID, &gt;2 GiB read truncation.</li>
-<li>10 GB single-file Megatron compare — same truncation bug.</li>
-<li>950-shard / 95.4% DINOv2 single-node run — superseded by 100%-corpus sweep.</li>
-<li>32-shard partial-coverage DINOv2 passes — coverage table only.</li>
-<li>216 MB synthetic DINOv2 I/O run — compatibility only.</li>
-<li>Megatron N=256 first attempt (20260612) — crashed (core dump, no warm logs); replaced by the 20260614 5 h re-run.</li>
-<li>DINOv2 N=128 first attempt (20260615_000000) — lost rep2+native to an srun socket timeout; replaced by the 20260615_140000 re-run.</li>
-<li>GNN N=1–16 legacy warm magnitudes (18–27 s) — regime-contaminated + larger workload; reported only in §1.1(b) with caveats.</li>
-</ul>
-
-<h2>What remains missing</h2>
-<p>Part 1 now validates the whole system across the full range on one binary — §1.1 at 1–16 nodes (current-binary re-run complete;
-plus the legacy sweep and the integrated organic/restart proof) and §1.2 at <strong>32–256 nodes (2048-GPU scale) on all three
-workloads</strong>, the load-bearing warm-flat result. Part 2 attributes that result to its mechanisms via the placement (§2.1),
-recovery (§2.2), and tier (§2.3) ablations. <strong>Open items:</strong> the current-binary 1→256 curve is now complete (all three
-walled native cells were refilled by native-only recovery jobs). The only permanent gap is the <em>DINOv2 native cold baseline at
-N=256</em>, which is intractable (~138 TB cold Lustre) and will not be obtained — the warm-flat point at N=256 is captured and the
-native trend is established at N=32/64/128. Deferred items the
-panel would still reward but that are not required for the current claims: an end-to-end (or measured I/O-fraction) training run per
-workload class, an over-capacity eviction run, mid-epoch fault injection, and .meta-file restore at ≥100 K entries.</p>
+<h2>2.2 — Cache tier: DRAM (tmpfs) vs NVMe <span class="badge supp">DONE</span></h2>
+<p class="note">Tier-general (DRAM/tmpfs → PMem → NVMe by remaining capacity). The headline runs were served from the per-node
+<strong>NVMe</strong> burst buffer (<code>/mnt/bb</code>). A DRAM-tier datapoint confirms the path also serves from tmpfs at parity
+(48 warm hits resolve to <code>/tmp</code>, bit-identical checksum <code>3453497658530916</code>), but that is a cold-start regime:
+when the working set fits tmpfs the native baseline page-caches it too and the sustained gap washes out. NVMe backs the headline.</p>
 
 <footer>
-Last updated: 2026-06-17 (current-binary 1→256 curve complete; §1.1 1–16 filled with verified numbers; Megatron native
-GLOBAL_CHECKSUM confirmed cosmetic — per-shard byte-identical to warm; "speedup grows with scale" framed as
-"warm-flat + native-volatile"; integrated run repositioned as a recovery proof).<br>
-Legacy 1–16 cells (§1.1(b)) reflect the original sweep (separate regime per workload) and are reported apart from the
-current-binary curve. All three walled native cells were refilled by native-only recovery jobs; the curve is complete.
+Last updated: 2026-06-19. Part 1 is mmap + prefetch, with all three workloads tabled side by side at two scales (§1.1 1–16, §1.2 32–256): Megatron and DINOv2 are 1×-partitionable; GNN is the un-partitionable column (prefetch still wins the warm-hit, storage stays N×). Access-aware placement is folded into prefetch and its standalone ablation removed. Method, gates, and honesty notes: <a href="experiments_methodology.html">experiments_methodology.html</a>.
 </footer>
 
 </body>

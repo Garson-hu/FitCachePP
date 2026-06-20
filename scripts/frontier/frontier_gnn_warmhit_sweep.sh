@@ -34,6 +34,18 @@ FANOUT_PP2="${FANOUT_PP2:-8}"
 BLOCK_BYTES="${BLOCK_BYTES:-$((12 * 1024 * 1024 * 1024))}"
 EPOCHS="${EPOCHS:-2}"
 SEED="${SEED:-0}"
+# PREFETCH_1X=1: replace cp-prestaging with the application prefetch() hint.
+# GNN is un-partitionable (the 2-hop gather can touch any feature row), so each
+# node still prefetch-promotes the WHOLE feat+CSR set -> stays N x (1x N/A); but
+# this exercises the same mmap+prefetch path as Megatron/DINOv2 and the resolver
+# only warm-hits a file once it is fully local, fixing the partial-stage checksum
+# mismatch the cp path showed at some N. Feature files are 889 GB -> long wait.
+PREFETCH_1X="${PREFETCH_1X:-0}"
+if [ "$PREFETCH_1X" = "1" ]; then
+  PREFETCH_ENV="FITCACHE_PREFETCH=1 FITCACHE_PREFETCH_WAIT_SEC=${PREFETCH_WAIT_SEC:-1800} "
+else
+  PREFETCH_ENV=""
+fi
 QOS="${QOS:-debug}"
 # Partition override: e.g. PARTITION=g1 to use the g1 partition (full compute
 # nodes w/ NVMe, AllowQos=ALL, often many idle nodes -> skips the batch queue).
@@ -84,12 +96,14 @@ export FitCache_LOG_LEVEL=600
 export FitCache_PORTS_CFG_DIR="\$RESULTS_DIR"
 export FitCache_SERVER_COUNT=$TOTAL_SERVERS
 export FitCache_CROSS_JOB=0
+export PREFETCH_1X=$PREFETCH_1X
 
 # Files to pre-stage to node-local NVMe at the resolver hash-bin path. Feature
 # files give warm-hit feature gather; CSR files keep the sampler reads local
 # and fast (and identical on both sides). Resolver gate = full-size match, so
 # whole files must be staged. Paths baked at generation; staged on every node.
 export STAGE_FILES="$DATA_DIR/paper_node_feat.npy $DATA_DIR/author_node_feat.npy $DATA_DIR/paper_cites_paper.csr_indptr.npy $DATA_DIR/paper_cites_paper.csr_indices.npy $DATA_DIR/paper_written_by_author.csr_indptr.npy $DATA_DIR/paper_written_by_author.csr_indices.npy"
+if [ "\$PREFETCH_1X" != "1" ]; then
 echo "=== PRE-STAGE on all $N_NODES nodes (paper+author feat + CSR) ==="
 STAGE_START=\$SECONDS
 srun -N $N_NODES -n $N_NODES --ntasks-per-node=1 --cpu-bind=cores bash -c '
@@ -104,6 +118,10 @@ srun -N $N_NODES -n $N_NODES --ntasks-per-node=1 --cpu-bind=cores bash -c '
   echo "[stage] \$(hostname): \$(du -sb "\$FitCache_NVME_PATH" | cut -f1) bytes staged"
 '
 echo "stage wall=\$((SECONDS - STAGE_START))s"
+else
+  echo "=== PREFETCH_1X: skip cp-prestage; FitCachePP arm prefetch-promotes the whole feat+CSR set (un-partitionable -> N x) ==="
+  srun -N $N_NODES -n $N_NODES --ntasks-per-node=1 --cpu-bind=cores bash -c 'mkdir -p "\$FitCache_NVME_PATH"'
+fi
 
 mkdir -p "\$FitCache_DRAM_PATH"
 srun -N $N_NODES -n $TOTAL_SERVERS --ntasks-per-node=$SERVERS_PER_NODE --cpus-per-task=1 --cpu-bind=cores \\
@@ -115,7 +133,7 @@ run () { # label preload logf
   echo "=== \$1 (N=$N_NODES, $NUM_BATCHES batches, $EPOCHS ep) ==="
   if [ -n "\$2" ]; then
     srun -N $N_NODES -n $N_NODES --ntasks-per-node=1 --cpus-per-task=8 --cpu-bind=cores bash -c \\
-      "LD_PRELOAD=\"\$2\" \"\$PY\" \"\$BENCH\" --data-dir \"$DATA_DIR\" --num-batches $NUM_BATCHES --batch-size $BATCH_SIZE --fanout-pp $FANOUT_PP --fanout-pa $FANOUT_PA --fanout-pp2 $FANOUT_PP2 --block-bytes $BLOCK_BYTES --epochs $EPOCHS --seed $SEED --label \"\$1\"" \\
+      "${PREFETCH_ENV}LD_PRELOAD=\"\$2\" \"\$PY\" \"\$BENCH\" --data-dir \"$DATA_DIR\" --num-batches $NUM_BATCHES --batch-size $BATCH_SIZE --fanout-pp $FANOUT_PP --fanout-pa $FANOUT_PA --fanout-pp2 $FANOUT_PP2 --block-bytes $BLOCK_BYTES --epochs $EPOCHS --seed $SEED --label \"\$1\"" \\
       2>&1 | tee "\$RESULTS_DIR/\$3"
   else
     srun -N $N_NODES -n $N_NODES --ntasks-per-node=1 --cpus-per-task=8 --cpu-bind=cores bash -c \\
@@ -126,6 +144,10 @@ run () { # label preload logf
 
 run "Native_mmap_PFS"  ""                   "native.log"
 run "FitCachePP"       "\$FITPP_CLIENT_LIB"  "fitcachepp.log"
+
+echo "=== per-node cache footprint (GNN is un-partitionable: each node holds the whole feat+CSR set = N x) ==="
+srun --overlap -N $N_NODES -n $N_NODES --ntasks-per-node=1 --cpu-bind=cores \\
+  bash -c 'echo "[cache] node=\$SLURM_NODEID host=\$(hostname) bytes=\$(du -sb "\$FitCache_NVME_PATH" 2>/dev/null | cut -f1)"' 2>&1 | sort
 
 kill -TERM \$SPID 2>/dev/null || true; sleep 3
 

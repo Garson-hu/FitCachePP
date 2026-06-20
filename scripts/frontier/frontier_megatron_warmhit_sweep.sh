@@ -27,6 +27,19 @@ NUM_SHARDS="${NUM_SHARDS:-40}"
 EPOCHS="${EPOCHS:-2}"
 N_CHUNKS="${N_CHUNKS:-4000}"
 SEED="${SEED:-0}"
+# PREFETCH_1X=1: replace cp-prestaging + access-aware placement with prefetch.
+# Each node prefetches its own 1/N shard partition (FITCACHE_PART_WORLD slices the
+# corpus; node_local routing promotes it from the PFS) -> warm-hit at ~1x storage.
+PREFETCH_1X="${PREFETCH_1X:-0}"
+if [ "$PREFETCH_1X" = "1" ]; then
+  PLACEMENT_LINE="export FITCACHE_MMAP_PLACEMENT=node_local
+export FITCACHE_PART_WORLD=$N_NODES
+export FitCache_DRAM_CAPACITY=268435456"
+  PREFETCH_ENV="FITCACHE_PREFETCH=1 FITCACHE_PREFETCH_WAIT_SEC=600 "
+else
+  PLACEMENT_LINE="# cp-prestage mode (no prefetch)"
+  PREFETCH_ENV=""
+fi
 QOS="${QOS:-normal}"
 WALLTIME="${WALLTIME:-01:30:00}"
 PFS_DIR="${PFS_DIR:-/lustre/orion/gen008/proj-shared/ghu4/data/megatron/synth_1tb_64x16gb}"
@@ -69,6 +82,8 @@ export FitCache_LOG_LEVEL=600
 export FitCache_PORTS_CFG_DIR="\$RESULTS_DIR"
 export FitCache_SERVER_COUNT=$TOTAL_SERVERS
 export FitCache_CROSS_JOB=0
+export PREFETCH_1X=$PREFETCH_1X
+$PLACEMENT_LINE
 
 # --- per-node pre-stage: every node copies the NUM_SHARDS shards to its own
 #     node-local NVMe at the resolver hash-bin path. Run on every node. ---
@@ -86,10 +101,15 @@ done
 echo "[stage] \$(hostname): staged $NUM_SHARDS shards, \$(du -sb "\$FitCache_NVME_PATH"|awk '{print \$1}') bytes"
 SEOF
 chmod +x "\$RESULTS_DIR/stage.sh"
+if [ "\$PREFETCH_1X" != "1" ]; then
 echo "=== PRE-STAGE on all $N_NODES nodes ==="
 STAGE_START=\$SECONDS
 srun -N $N_NODES -n $N_NODES --ntasks-per-node=1 --cpu-bind=cores "\$RESULTS_DIR/stage.sh"
 echo "stage wall=\$((SECONDS - STAGE_START))s"
+else
+  echo "=== PREFETCH_1X: skip cp-prestage; each node prefetches its 1/N partition ==="
+  mkdir -p "\$FitCache_NVME_PATH"
+fi
 
 # --- servers (one set across the allocation; warm-hit doesn't need them but
 #     keeps the open RPC path realistic) ---
@@ -103,7 +123,7 @@ run () { # label preload logf
   echo "=== \$1 (N=$N_NODES, $NUM_SHARDS shards, $EPOCHS ep) ==="
   if [ -n "\$2" ]; then
     srun -N $N_NODES -n $N_NODES --ntasks-per-node=1 --cpus-per-task=8 --cpu-bind=cores bash -c \\
-      "LD_PRELOAD=\"\$2\" \"\$PY\" \"\$BENCH\" --data-dir \"$PFS_DIR\" --num-shards $NUM_SHARDS --coverage 1.0 --n-chunks $N_CHUNKS --epochs $EPOCHS --seed $SEED --label \"\$1\"" \\
+      "${PREFETCH_ENV}LD_PRELOAD=\"\$2\" \"\$PY\" \"\$BENCH\" --data-dir \"$PFS_DIR\" --num-shards $NUM_SHARDS --coverage 1.0 --n-chunks $N_CHUNKS --epochs $EPOCHS --seed $SEED --label \"\$1\"" \\
       2>&1 | tee "\$RESULTS_DIR/\$3"
   else
     srun -N $N_NODES -n $N_NODES --ntasks-per-node=1 --cpus-per-task=8 --cpu-bind=cores bash -c \\
@@ -115,6 +135,10 @@ run () { # label preload logf
 run "Native_mmap_PFS"          ""                    "native.log"
 run "FitCachePP_warmhit_mmap"  "\$FITPP_CLIENT_LIB"  "fitcachepp.log"
 
+echo "=== aggregate cache used per node (1x check: each node should hold ~its 1/N) ==="
+srun --overlap -N $N_NODES -n $N_NODES --ntasks-per-node=1 --cpu-bind=cores \\
+  bash -c 'echo "[cache] node=\$SLURM_NODEID host=\$(hostname) bytes=\$(du -sb "\$FitCache_NVME_PATH" 2>/dev/null | cut -f1)"' 2>&1 | sort
+
 kill -TERM \$SPID 2>/dev/null || true; sleep 3
 
 echo ""
@@ -124,12 +148,15 @@ NCOLD=\$(grep "EPOCH 0" "\$RESULTS_DIR/native.log" 2>/dev/null | head -1 | grep 
 NWARM=\$(grep "EPOCH 1" "\$RESULTS_DIR/native.log" 2>/dev/null | head -1 | grep -oE 'wall=[0-9.]+' | head -1 | cut -d= -f2)
 FCOLD=\$(grep "EPOCH 0" "\$RESULTS_DIR/fitcachepp.log" 2>/dev/null | head -1 | grep -oE 'wall=[0-9.]+' | head -1 | cut -d= -f2)
 FWARM=\$(grep "EPOCH 1" "\$RESULTS_DIR/fitcachepp.log" 2>/dev/null | head -1 | grep -oE 'wall=[0-9.]+' | head -1 | cut -d= -f2)
-NC=\$(grep SUMMARY "\$RESULTS_DIR/native.log" 2>/dev/null | head -1 | grep -oE 'GLOBAL_CHECKSUM=[0-9]+' | cut -d= -f2)
-FC=\$(grep SUMMARY "\$RESULTS_DIR/fitcachepp.log" 2>/dev/null | head -1 | grep -oE 'GLOBAL_CHECKSUM=[0-9]+' | cut -d= -f2)
-echo "  N=$N_NODES shards=$NUM_SHARDS (per node) epochs=$EPOCHS"
-echo "  Native_mmap_PFS         epoch0=\${NCOLD}s epoch1=\${NWARM}s checksum=\$NC"
-echo "  FitCachePP_warmhit_mmap epoch0=\${FCOLD}s epoch1=\${FWARM}s checksum=\$FC"
-if [ "\$NC" = "\$FC" ] && [ -n "\$NC" ]; then echo "  CHECKSUM_GATE: PASS"; else echo "  CHECKSUM_GATE: FAIL (\$NC / \$FC)"; fi
+NCS=\$(grep SUMMARY "\$RESULTS_DIR/native.log" 2>/dev/null | grep -oE 'GLOBAL_CHECKSUM=[0-9]+' | sort)
+FCS=\$(grep SUMMARY "\$RESULTS_DIR/fitcachepp.log" 2>/dev/null | grep -oE 'GLOBAL_CHECKSUM=[0-9]+' | sort)
+NR=\$(echo "\$NCS" | grep -c '=')
+echo "  N=$N_NODES shards=$NUM_SHARDS (total, partitioned 1/N per node) epochs=$EPOCHS"
+echo "  Native_mmap_PFS         epoch0=\${NCOLD}s epoch1=\${NWARM}s"
+echo "  FitCachePP_warmhit_mmap epoch0=\${FCOLD}s epoch1=\${FWARM}s"
+# Partitioned: each rank reads a different 1/N slice, so compare the SORTED SET of
+# per-rank checksums (the old head-1 gate falsely failed by pairing different ranks).
+if [ -n "\$NCS" ] && [ "\$NCS" = "\$FCS" ]; then echo "  CHECKSUM_GATE: PASS (all \$NR partitions byte-identical Native==FitCachePP)"; else echo "  CHECKSUM_GATE: FAIL"; fi
 awk -v n="\$NWARM" -v f="\$FWARM" 'BEGIN{ if (f>0) printf "  warm-epoch speedup (Native/FitCachePP) = %.2fx\n", n/f }'
 echo "  cache tier: NVMe (/mnt/bb/\$USER, per-node pre-staged); DRAM tier /tmp"
 echo "  result path: \$RESULTS_DIR"

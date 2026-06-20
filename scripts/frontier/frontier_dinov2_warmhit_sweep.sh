@@ -26,6 +26,17 @@ NUM_SHARDS="${NUM_SHARDS:-8}"
 # (shared full-corpus mode). Default 0 = disjoint per-rank ranges.
 SHARED="${SHARED:-0}"
 if [ "$SHARED" = "1" ]; then SHARED_FLAG="--shared"; STAGE_MODE="shared full-corpus"; else SHARED_FLAG=""; STAGE_MODE="disjoint/node"; fi
+# PREFETCH_1X=1: replace cp-prestaging + access-aware placement with prefetch.
+# Each node prefetches its own disjoint 1/N partition (node_local routing promotes
+# it from the PFS into the local tier) -> warm-hit at ~1x cluster storage.
+PREFETCH_1X="${PREFETCH_1X:-0}"
+if [ "$PREFETCH_1X" = "1" ]; then
+  PLACEMENT_LINE="export FITCACHE_MMAP_PLACEMENT=node_local"
+  PREFETCH_ENV="FITCACHE_PREFETCH=1 FITCACHE_PREFETCH_WAIT_SEC=600 "
+else
+  PLACEMENT_LINE="# cp-prestage mode (no prefetch)"
+  PREFETCH_ENV=""
+fi
 EPOCHS="${EPOCHS:-2}"
 DECODE_EVERY="${DECODE_EVERY:-50}"
 QOS="${QOS:-debug}"
@@ -71,9 +82,12 @@ export FitCache_PORTS_CFG_DIR="\$RESULTS_DIR"
 export FitCache_SERVER_COUNT=$TOTAL_SERVERS
 export FitCache_CROSS_JOB=0
 export SHARED=$SHARED
+export PREFETCH_1X=$PREFETCH_1X
+$PLACEMENT_LINE
 
-# Pre-stage: SHARED=1 -> every node stages the SAME [0,NUM_SHARDS) shards (full
-# corpus on every node); else node r stages disjoint [r*NUM_SHARDS,(r+1)*NUM_SHARDS).
+# Pre-stage (cp). SKIPPED in PREFETCH_1X mode, where each node prefetches its own
+# disjoint 1/N partition instead (prefetch promotes it from the PFS).
+if [ "\$PREFETCH_1X" != "1" ]; then
 echo "=== PRE-STAGE on all $N_NODES nodes ($STAGE_MODE, $NUM_SHARDS shards) ==="
 STAGE_START=\$SECONDS
 srun -N $N_NODES -n $N_NODES --ntasks-per-node=1 --cpu-bind=cores bash -c '
@@ -91,6 +105,10 @@ srun -N $N_NODES -n $N_NODES --ntasks-per-node=1 --cpu-bind=cores bash -c '
   echo "[stage] \$(hostname) procid \$SLURM_PROCID: shards \$base..\$((base+$NUM_SHARDS-1)), \$(du -sb "\$FitCache_NVME_PATH" | cut -f1) bytes"
 '
 echo "stage wall=\$((SECONDS - STAGE_START))s"
+else
+  echo "=== PREFETCH_1X: skip cp-prestage; each node prefetches its disjoint 1/N ==="
+  mkdir -p "\$FitCache_NVME_PATH"
+fi
 
 mkdir -p "\$FitCache_DRAM_PATH"
 srun -N $N_NODES -n $TOTAL_SERVERS --ntasks-per-node=$SERVERS_PER_NODE --cpus-per-task=1 --cpu-bind=cores \\
@@ -102,7 +120,7 @@ run () { # label preload logf
   echo "=== \$1 (N=$N_NODES, $NUM_SHARDS shards/node, $EPOCHS ep) ==="
   if [ -n "\$2" ]; then
     srun -N $N_NODES -n $N_NODES --ntasks-per-node=1 --cpus-per-task=8 --cpu-bind=cores bash -c \\
-      "LD_PRELOAD=\"\$2\" \"\$PY\" \"\$BENCH\" --data-dir \"$DATA_DIR\" --num-shards $NUM_SHARDS --epochs $EPOCHS --decode-every $DECODE_EVERY $SHARED_FLAG --label \"\$1\"" \\
+      "${PREFETCH_ENV}LD_PRELOAD=\"\$2\" \"\$PY\" \"\$BENCH\" --data-dir \"$DATA_DIR\" --num-shards $NUM_SHARDS --epochs $EPOCHS --decode-every $DECODE_EVERY $SHARED_FLAG --label \"\$1\"" \\
       2>&1 | tee "\$RESULTS_DIR/\$3"
   else
     srun -N $N_NODES -n $N_NODES --ntasks-per-node=1 --cpus-per-task=8 --cpu-bind=cores bash -c \\
@@ -113,6 +131,10 @@ run () { # label preload logf
 
 run "Native_mmap_PFS"  ""                   "native.log"
 run "FitCachePP"       "\$FITPP_CLIENT_LIB"  "fitcachepp.log"
+
+echo "=== aggregate cache used per node (1x check: each node should hold ~its 1/N) ==="
+srun --overlap -N $N_NODES -n $N_NODES --ntasks-per-node=1 --cpu-bind=cores \\
+  bash -c 'echo "[cache] node=\$SLURM_NODEID host=\$(hostname) bytes=\$(du -sb "\$FitCache_NVME_PATH" 2>/dev/null | cut -f1)"' 2>&1 | sort
 
 kill -TERM \$SPID 2>/dev/null || true; sleep 3
 
