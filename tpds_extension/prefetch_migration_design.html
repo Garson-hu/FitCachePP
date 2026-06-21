@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FitCachePP — Prefetch-Informed Migration + Limited Replication (design)</title>
+<style>
+  :root { --fg:#1b1f24; --muted:#57606a; --border:#d0d7de; --bg:#ffffff; --code-bg:#f6f8fa;
+          --accent:#0969da; --th-bg:#f6f8fa; --warn:#9a6700; }
+  * { box-sizing:border-box; }
+  body { color:var(--fg); background:var(--bg);
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+         line-height:1.6; max-width:1040px; margin:0 auto; padding:2.5rem 1.5rem 6rem; }
+  h1,h2,h3 { line-height:1.25; margin-top:1.6em; margin-bottom:.5em; font-weight:600; }
+  h1 { font-size:1.8rem; border-bottom:1px solid var(--border); padding-bottom:.3em; }
+  h2 { font-size:1.32rem; border-bottom:1px solid var(--border); padding-bottom:.2em; margin-top:2em; }
+  h3 { font-size:1.08rem; }
+  a { color:var(--accent); text-decoration:none; }
+  code { background:var(--code-bg); padding:.12em .35em; border-radius:6px;
+         font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:.85em; }
+  pre { background:var(--code-bg); padding:.9rem 1rem; border-radius:8px; overflow:auto;
+        font-size:.8rem; line-height:1.5; border:1px solid var(--border); }
+  pre code { background:none; padding:0; font-size:inherit; }
+  table { border-collapse:collapse; width:100%; margin:1em 0; font-size:.86rem; display:block; overflow-x:auto; }
+  th,td { border:1px solid var(--border); padding:.42em .6em; text-align:left; vertical-align:top; }
+  th { background:var(--th-bg); font-weight:600; }
+  tr:nth-child(even) td { background:var(--code-bg); }
+  .src { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:.78rem; color:var(--muted); }
+  .callout { border-left:4px solid var(--accent); background:var(--code-bg); padding:.6em 1em;
+             border-radius:0 8px 8px 0; margin:1em 0; }
+  .callout.warn { border-left-color:var(--warn); }
+  .note { color:var(--muted); font-size:.92em; }
+  .new { color:#1e8e3e; font-weight:600; } .reuse { color:#5f6368; }
+  hr { border:none; border-top:1px solid var(--border); margin:2.2em 0; }
+  footer { margin-top:3em; padding-top:1.2em; border-top:1px solid var(--border); color:var(--muted); font-size:.84rem; }
+</style>
+</head>
+<body>
+
+<h1>Prefetch-Informed Migration + Limited Replication — design</h1>
+<p class="note"><strong>Status: implemented</strong> in <code>src/comm</code> and <code>src/server</code>
+(<code>fitcache_prefetch_rpc_handler</code>, <code>fitcache_server_migrate_file</code>, the <code>replication_mode</code>
+sidecar field), driven from the benchmarks through <code>fitcache_prefetch_shim.py</code>. Realizes the advisor direction
+(prefetch-informed migration via a new app interface + limited replication) so the cache is not fully replicated. Companion:
+<a href="implementation_walkthrough.html">implementation_walkthrough.html</a> · <a href="experiments.html">experiments.html</a>.</p>
+
+<h2>1. Goal &amp; the one constraint that shapes it</h2>
+<p>Today every node caches its whole working set (N× replication). The goal is to keep the warm-hit speedup while storing each
+file <strong>once</strong> cluster-wide (1×), or a small bounded number of copies (k×) when needed. Two mechanisms:</p>
+<ul>
+<li><strong>Prefetch-informed migration</strong> — the app declares the files it is about to <code>mmap</code>; the system migrates
+the single cached copy to that node before the read.</li>
+<li><strong>Limited replication</strong> — a bounded copy count for hot / concurrently-read files (and for the un-partitionable GNN
+feature file).</li>
+</ul>
+<div class="callout warn"><strong>The constraint:</strong> Frontier has no NVMe-oF / remote DAX, so a node cannot
+<code>mmap</code> a peer's NVMe directly. "Migration" = a network transfer of the file to the local tier. It is only worth it if it
+is <strong>prefetched and overlapped with compute</strong>; done lazily at <code>mmap</code> time it is no better than the existing
+per-read RPC fallback. This is why the prefetch interface is load-bearing, not cosmetic.</div>
+
+<h2>2. Flow</h2>
+<pre><code>[dataloader] next epoch needs a,b → fitcache_prefetch(a,b)          (A) new API
+       │ (overlapped with this epoch's compute)
+       ▼
+[server] prefetch RPC → remote_presence_map: a is on node X         (B) new RPC
+       → peer-migrate RPC: pull whole file a from X to local NVMe    (C) NEW primitive
+       → register path_cache_map + write sidecar(replication_mode)   (reuse)
+       → source copy evictable (SINGLE_COPY) / kept (BOUNDED_k)      (E) new policy
+       ▼
+[client] mmap(a) → resolver stats local tier → local zero-copy mmap  (reuse, auto)</code></pre>
+
+<h2>3. Components, with insertion points</h2>
+
+<h3>A. <code>fitcache_prefetch()</code> client API <span class="new">new</span></h3>
+<p>App-facing entry point; mirrors the existing <code>ms_read</code> export and the client→server RPC stub pattern.</p>
+<pre><code>// src/client/fitcache_multi_source_read.h  (declare, extern "C")
+// src/client/fitcache_multi_source_read.cpp (implement); wrappers.c thin LD_PRELOAD symbol
+extern "C" int fitcache_prefetch(const char *path, int replication_mode);
+// → compute target slot via fitcache::select_server_for_path(path, server_count)
+// → fire fitcache_prefetch_rpc to that server; return 0 on enqueue, &lt;0 on error</code></pre>
+<p class="src">mirror: fitcache_multi_source_read.h:17 (ms_read export) · fitcache_comm_client.cpp (RPC stub pattern)</p>
+
+<h3>B. <code>fitcache_prefetch_rpc</code> + handler <span class="new">new</span></h3>
+<pre><code>// src/comm/fitcache_comm.h — mirror fitcache_open_in_t/out_t
+MERCURY_GEN_PROC(fitcache_prefetch_in_t,
+  ((hg_string_t)(path)) ((int32_t)(target_slot)) ((int32_t)(replication_mode)) ((uint64_t)(dataset_hash)))
+MERCURY_GEN_PROC(fitcache_prefetch_out_t, ((int32_t)(status)) ((int32_t)(tier)))
+
+// src/comm/fitcache_comm_server.cpp — fitcache_prefetch_rpc_handler
+//   if path already in path_cache_map (local) → return early (status=HIT)
+//   else enqueue to data_queue with a PREFETCH priority tag; return immediately</code></pre>
+<p class="src">mirror enqueue: fitcache_comm_server.cpp:414-420 (open-time promote) · proc defs: fitcache_comm.h:35-44</p>
+
+<h3>C. <code>fitcache_server_migrate_file</code> — the whole-file peer primitive <span class="new">implemented (the crux)</span></h3>
+<div class="callout warn"><strong>The one genuinely new mechanism, now in the tree</strong> (<code>fitcache_data_mover.cpp:53</code>).
+Before it, a remote cache hit was served as <em>per-read</em> bytes over RPC (one Mercury bulk per <code>pread</code>); there was no
+"pull the whole file from peer X to my local NVMe" op. It reuses the bulk-transfer plumbing and is invoked from the prefetch path
+(<code>fitcache_server.cpp:237</code>) and the open-time promote path (<code>fitcache_data_mover.cpp:584</code>).</div>
+<pre><code>// src/comm/fitcache_comm.h
+MERCURY_GEN_PROC(fitcache_peer_migrate_in_t,  ((hg_string_t)(original_path)) ((int32_t)(requested_tier)))
+MERCURY_GEN_PROC(fitcache_peer_migrate_out_t, ((int32_t)(status)) ((int64_t)(bytes)))
+
+// src/comm/fitcache_comm_server.cpp — fitcache_peer_migrate_rpc_handler (runs on the SOURCE peer)
+//   cached = path_cache_map[original_path]   // miss → return error; requester falls back
+//   open(cached); single read(whole file); ONE HG_Bulk_transfer   // not the per-pread loop
+//
+// requester side: migrate_file(path, src_addr, tier)
+//   issue RPC; receive bulk into local tier hash-bin path;
+//   register path_cache_map[original_path]=local; write sidecar; broadcast presence</code></pre>
+<p class="src">reuse bulk: fitcache_comm_server.cpp:503-506 (HG_Bulk_create/transfer) · reuse landing: fitcache_data_mover.cpp:490-506 (path_cache_map + sidecar, minus the PFS read)</p>
+
+<h3>D. Priority promotion queue <span class="new">small change</span></h3>
+<p>Make prefetch migrations run before reactive open-time promotions.</p>
+<pre><code>// src/server/fitcache_data_mover.cpp:41 — data_queue is std::queue&lt;std::string&gt;
+// change entry to { std::string path; int priority; int replication_mode; }
+// (or a parallel high-priority queue drained first)</code></pre>
+<p class="src">fitcache_data_mover.cpp:41 (data_queue) · data_mover_fn loop :405-432</p>
+
+<h3>E. <code>replication_mode</code> sidecar field + eviction hook <span class="new">new field + policy</span></h3>
+<pre><code>// src/cross_job/fitcache_persistent_meta.h — fitcache_file_meta_v1 (reserve fields)
+uint32_t replication_mode;   // 0=SINGLE_COPY, 1=BOUNDED_k, 2=BROADCAST
+uint32_t replication_cap;    // k (0 = unlimited)
+// set in meta_make_initial (:64-81) from the data-mover queue entry; on-disk format stays atomic (tmp+rename)
+
+// eviction policy hook — src/cross_job/fitcache_cross_job.cpp:208-222 (meta_select_eviction_victim)
+//   SINGLE_COPY && remote_presence_lookup(path) non-empty (a copy exists elsewhere) → evictable (free the source)
+//   BOUNDED_k   && copy_count &gt;= cap                                              → do not add another copy</code></pre>
+<p class="src">persistent_meta.h:46-57,64-81 (meta struct + init) · cross_job.cpp:208-222 (victim selection) · remote_presence_lookup cross_job.cpp:500-505</p>
+
+<h3>F. Source / target discovery <span class="reuse">reuse</span></h3>
+<pre><code>// SOURCE (who holds the file now): remote_presence_map  path → addr
+// TARGET (which node should cache it): select_server_for_path / node_local_select</code></pre>
+<p class="src">remote_presence_map: fitcache_cross_job.cpp:495-522 · placement: cross_job.cpp:269-302, 121-158</p>
+
+<h2>4. Reused vs. new (effort)</h2>
+<table>
+<tr><th>Reused (already in tree)</th><th>New (to build)</th></tr>
+<tr><td>data_queue producer/consumer; path_cache_map; <code>fs::copy</code>+sidecar registration; Mercury bulk; peer_lookup; remote_presence_map; select_server_for_path; client resolver (auto-picks up the migrated file); refcount + eviction reaper</td><td><span class="new">peer-migrate RPC + handler (whole-file transfer); prefetch RPC + client API; queue priority; <code>replication_mode</code> meta field + eviction-policy hook; a dataloader prefetch-hint shim</span></td></tr>
+</table>
+<p><strong>Verdict:</strong> the whole-file peer→local migration primitive landed as a <strong>~200–300 LOC increment</strong> on
+existing infrastructure rather than a new subsystem, exactly as scoped; the experiments in
+<a href="experiments.html">experiments.html</a> run on it.</p>
+
+<h2>5. Build order (incremental)</h2>
+<ol>
+<li><strong>Peer-migrate RPC</strong> (C) — the primitive; smoke-test "pull file from peer → local → mmap" on DINOv2 N=2.</li>
+<li><strong>Prefetch API + RPC + priority queue</strong> (A,B,D) — proactive trigger.</li>
+<li><strong>replication_mode field + eviction hook</strong> (E) — single-copy / bounded-k.</li>
+<li><strong>Dataloader prefetch shim</strong> — feed per-epoch shard→node assignment.</li>
+<li><strong>Reshuffle eval driver + metrics</strong> — exercises migration; measures aggregate-cache + hit-rate + read-time.</li>
+</ol>
+
+<h2>6. Scope — deliberately left to the later CXL multi-tier work</h2>
+<p class="note">Automatic prefetch-hint inference (reuse-distance / ML); cluster-wide bounded-k census; over-capacity placement/eviction
+under pressure; multi-job sharing; preemption durability. TPDS delivers the <em>limited</em> version: an app-callable prefetch
+interface + JIT single-copy migration + a simple bounded-replication policy.</p>
+
+<footer>Implemented in <code>src/comm</code> and <code>src/server</code>; exercised by the benchmark drivers via
+<code>fitcache_prefetch_shim.py</code>. Last updated 2026-06-20.</footer>
+
+</body>
+</html>

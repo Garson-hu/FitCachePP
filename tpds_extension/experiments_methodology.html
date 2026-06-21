@@ -48,14 +48,10 @@ every claim points to a <code>file:line</code> in the repo so you can check it. 
 <a href="../EXPERIMENTS_STATUS.html">EXPERIMENTS_STATUS.html</a> ·
 <a href="experiments.html">experiments.html</a> · <a href="implementation_walkthrough.html">implementation_walkthrough.html</a>.</p>
 
-<div class="callout"><strong>The one idea behind every experiment.</strong> All of these benchmarks measure one thing:
-<em>how fast can a job read its data?</em> The same bytes can come from one of three places, fastest to slowest &mdash;
-<strong>(1) the node's RAM</strong> (the OS "page cache," nanoseconds), <strong>(2) the node's local fast disk</strong>
-(NVMe burst buffer or a RAM-backed <code>tmpfs</code>, microseconds), or <strong>(3) the shared Lustre filesystem over the
-network</strong> (milliseconds, and far worse for tiny scattered reads). FitCachePP's whole job is to quietly move a file from
-slow Lustre to a fast local copy and serve reads from there, <em>without the application noticing</em>. So every term below is
-really just answering: <em>on this particular read, which of the three layers did the bytes come from, and who paid to put
-them there?</em></div>
+<p class="note">Every benchmark measures one thing: <em>how fast can a job read its data?</em> The bytes come from one of three
+tiers, fastest to slowest — node RAM (page cache), node-local fast disk (NVMe / <code>tmpfs</code>), or the shared Lustre
+filesystem over the network. FitCachePP transparently moves a file from slow Lustre to a fast local copy and serves reads from
+there.</p>
 
 <div class="toc">
 <strong>Contents</strong>
@@ -66,22 +62,13 @@ them there?</em></div>
 <li><a href="#megatron">Workload 1 — Megatron (dense-sequential LLM)</a></li>
 <li><a href="#gnn">Workload 2 — GNN feature gather (sparse-random, IGB-large)</a></li>
 <li><a href="#dinov2">Workload 3 — DINOv2 / CC12M (sequential vision tar)</a></li>
-<li><a href="#scaleladder">Whole-system result — warm-flat scale ladder, 32–256 nodes (all three workloads)</a></li>
-<li><a href="#integrated">Whole-system result — integrated end-to-end run (promote + placement + recovery in one job)</a></li>
-<li><a href="#placement">Ablation — access-aware placement</a></li>
+<li><a href="#prefetch">Whole-system method — prefetch-informed migration &amp; 1&times; partitioning</a></li>
+<li><a href="#scaleladder">Whole-system result — prefetch 1&times; study at two scales (1–16 and 32–256 nodes)</a></li>
 <li><a href="#dramtier">Ablation — DRAM-tier (tmpfs) check</a></li>
 <li><a href="#.meta file">Ablation — recovery from .meta files (4 phases)</a></li>
 <li><a href="#honesty">Methodological honesty &amp; known limitations</a></li>
 </ol>
 </div>
-
-<p class="note" style="border:1px solid #d0d7de; background:#f6f8fa; padding:.7em 1em; border-radius:8px;">
-<strong>Validation strategy.</strong> FitCachePP is one system, so we measure it as one first and only then take it apart.
-The <strong>whole-system results</strong> run the full system end-to-end — the warm-flat scale ladder (§8) shows the warm read
-time stays flat from 1 to 256 nodes, and the integrated run (§8b) drives organic promotion, node-local placement, and a live
-server-restart recovery in a single job with no manual staging. The <strong>ablations</strong> (§7 placement, §9 tier, §10
-recovery) then turn one mechanism off, or compare it against the naive alternative, to attribute the whole-system result to the
-right cause. The section numbers keep their original order; the labels mark which kind each one is.</p>
 
 <h2 id="platform">1. Platform &amp; software stack</h2>
 <p>Everything runs on ORNL's Frontier supercomputer. The pieces that matter for these experiments are: the slow shared
@@ -110,19 +97,6 @@ here is what each recurring term means:</p>
 <tr><td><strong>amortized</strong></td><td>The honest total: time across all passes <em>including</em> the one-time cost of copying the data to local storage. We report it as "after how many passes does FitCachePP come out ahead?" (see §3.6) so the staging cost is never swept under the rug.</td></tr>
 <tr><td><strong>regime-pinned</strong></td><td>A deliberately fair setup: we make each node's data <em>bigger than the node's RAM</em> (e.g. 640 GiB of data on a 512 GiB node). Then neither side can secretly serve reads from RAM — every pass really hits a storage tier. This stops a "looks fast but it was just RAM cache" illusion.</td></tr>
 <tr><td><strong>checksum gate</strong></td><td>The correctness check. FitCachePP and the native baseline must read back the <em>exact same bytes</em> (identical checksum, on every rank), or the result is thrown out. This guarantees the speedup is real and not from reading less or wrong data.</td></tr>
-</table>
-
-<h3>2.1 A few base terms (assume nothing)</h3>
-<p>The workload sections below use a handful of words from machine learning and operating systems. If any of them are
-unfamiliar, here is the plain version:</p>
-<table>
-<tr><th>Term</th><th>Plain meaning</th></tr>
-<tr><td><strong>mmap</strong> (memory-map)</td><td>A way to read a file <em>without</em> calling <code>read()</code>. The program asks the OS to "pretend this file is an array in memory"; then, the first time it touches any part of that array, the OS quietly fetches the corresponding bytes from disk (a "page fault"). Modern data loaders use this because it is simple and avoids copying. It also matters here because those page-fault reads are invisible to a normal <code>read()</code>-based cache — which is the whole gap FitCachePP closes.</td></tr>
-<tr><td><strong>epoch</strong> / pass</td><td>One complete sweep over the dataset. Training does many epochs; here we run 2–3 so we can see the first (cold) pass and a later (warm, already-in-RAM) pass.</td></tr>
-<tr><td><strong>token / tokenize</strong></td><td>A language model does not read text; it reads integers. A "tokenizer" chops text into small pieces ("tokens") and maps each to an integer ID (e.g. <code>"cat" → 1842</code>). A training corpus is stored as one long stream of these integer IDs.</td></tr>
-<tr><td><strong>rank</strong></td><td>One worker process in a parallel job. A run on <code>N</code> nodes with 1 worker each has <code>N</code> ranks; each rank reads its own slice of the data.</td></tr>
-<tr><td><strong>shard</strong></td><td>The dataset split into many separate files so it can be read in parallel. "40 shards" = 40 files.</td></tr>
-<tr><td><strong>working set</strong></td><td>The amount of data a node actually reads in one pass. We compare it against the node's 512 GiB RAM to know whether reads can hide in the OS cache.</td></tr>
 </table>
 
 <hr>
@@ -226,14 +200,6 @@ wins overall, i.e. when <code>pre_stage + E·warm &lt; E·cold</code>. We report
 <p class="note">An LLM-training data loader. It reads large token files end to end, in order — the easy case for Lustre, so the
 expected speedup is modest.</p>
 
-<div class="callout"><strong>Background, from scratch.</strong> <em>Megatron-LM</em> is NVIDIA's framework for training large language
-models (LLMs, the technology behind ChatGPT-style systems) across many GPUs. To train an LLM you feed it a huge amount of text that has
-already been <em>tokenized</em> — converted from words into a long stream of integer IDs (see §2.1). Megatron stores that stream on disk
-in a fixed format called an <strong>IndexedDataset</strong>: a <code>.bin</code> file holding all the integer tokens back-to-back, plus a
-small <code>.idx</code> file that records where each document starts so the loader can jump to any document. This experiment reproduces
-exactly that on-disk layout and the way it is read, because reading it is what we want to speed up. We do <em>not</em> care what the text
-says — only how the bytes are laid out and accessed — so we fill the file with random tokens (see "What" below).</div>
-
 <h4>Dataset &amp; format</h4>
 <table>
 <tr><td>What</td><td>A synthetic <strong>Megatron IndexedDataset</strong> — the real on-disk format, but with random (meaningless) contents. The point is to reproduce the exact <code>numpy.memmap</code> read pattern of a tokenized corpus, not to train anything.</td></tr>
@@ -251,7 +217,7 @@ the reading — step (2) is heavy GPU compute that overlaps with I/O and would m
 real model we run a small benchmark, <code>llm_coverage_bench.py</code>, that does <em>only the reading</em>: it reproduces exactly how a
 real loader would touch the file, but skips the neural network entirely. "The driver is <code>llm_coverage_bench.py</code>" just means
 this script — not a real LLM — is what drives the experiment.</p>
-<p><strong>What it does:</strong> it <code>mmap</code>s each shard (see §2.1) and reads a <code>--coverage</code> fraction of it, spread
+<p><strong>What it does:</strong> it <code>mmap</code>s each shard and reads a <code>--coverage</code> fraction of it, spread
 evenly across the shard in <code>--n-chunks</code> contiguous pieces, adding the bytes into <code>GLOBAL_CHECKSUM</code> (the sum both
 forces the read to really happen and serves as the correctness check). On multiple nodes the shards are split round-robin (rank
 <code>R</code> of <code>N</code> reads shards <code>[R, R+N, R+2N, …]</code>) so every node does equal work. (A second driver,
@@ -277,15 +243,10 @@ the warm-hit sweep uses the coverage bench.)</p>
 
 <h2 id="gnn">5. Workload 2 — GNN feature gather (sparse-random, IGB-large)</h2>
 <p class="note">A graph-learning data loader. It reads a few thousand tiny, scattered feature rows from a huge file — the worst case
-for Lustre, so this is where FitCachePP wins biggest.</p>
-
-<div class="callout"><strong>Background, from scratch.</strong> A <em>Graph Neural Network</em> (GNN) learns from data shaped like a graph
-— things ("nodes") connected by relationships ("edges"). Here the graph is <strong>IGB-large</strong>, an academic citation graph: the
-nodes are 100 M papers and 117 M authors, and the edges are "paper cites paper" and "paper written by author." Each node carries a
-<em>feature vector</em> — a row of 1024 numbers describing it. To train, the loader repeatedly: picks some random papers, follows their
-edges a couple of hops to collect a neighbourhood, and then <strong>gathers the feature rows</strong> of all those neighbours. The catch:
-those rows are scattered all over a ~900 GB file and each is only 4 KB, so the access pattern is many tiny reads at random offsets —
-exactly what a network filesystem like Lustre is worst at. That mismatch is why caching to local storage helps so much here.</div>
+for Lustre, so this is where FitCachePP wins biggest on the warm hit. <strong>This is also the un-partitionable workload:</strong>
+the 2-hop heterogeneous gather can touch <em>any</em> feature row (the access set is data-dependent, not a contiguous slice), so
+unlike Megatron and DINOv2 it cannot prefetch only a 1/N partition — every node must hold the whole feature+CSR set (902 GB) and
+storage stays N&times;. Prefetch still earns the warm local hit; it just cannot earn the 1&times; storage win here (see §7).</p>
 
 <h4>Dataset &amp; format</h4>
 <table>
@@ -333,14 +294,6 @@ read identical bytes, so the comparison is fair even though the starting conditi
 <p class="note">A vision data loader. It streams large image tar files in order — like Megatron, a sequential pattern, so a moderate
 speedup is expected.</p>
 
-<div class="callout"><strong>Background, from scratch.</strong> <em>DINOv2</em> is a Meta method for training vision models on images.
-Its training images are packaged the way large image datasets usually are: bundled into big <code>.tar</code> archive files (here the
-<strong>CC12M</strong> dataset — ~12 M web image+caption pairs), with many images per <code>.tar</code>. This "many images in one big sequential
-file" format is called <em>WebDataset</em>. The loader reads each archive start-to-end and pulls out the images. So the access pattern is
-large, sequential reads of ~540 MB files — the same easy-for-Lustre shape as Megatron, which is why the expected speedup is moderate
-rather than huge. This workload is the third access pattern in our set: <strong>sequential vision</strong>, alongside Megatron
-(sequential text) and GNN (random gather).</div>
-
 <h4>Dataset &amp; format</h4>
 <table>
 <tr><td>What</td><td>The <strong>real CC12M-wds</strong> WebDataset (image + caption shards).</td></tr>
@@ -374,102 +327,100 @@ deterministic by construction. <span class="src">cc12m_mmap_bench.py:81-97,156-1
 
 <hr>
 
-<h2 id="placement">7. Ablation — access-aware placement</h2>
-<p>This variant tests <em>where</em> a cached copy is placed. A warm hit only works if the copy is on the node that needs it; the
-default hash placement scatters copies across the whole cluster, which breaks that. Two knobs control the experiment:</p>
-<ul>
-<li><code>FITCACHE_MMAP_PLACEMENT</code> = <code>hash</code> (default; <code>modulo_select</code>, scattered cluster-wide) or
-<code>node_local</code> (send the copy to a server on the requesting node).</li>
-<li><code>DINO_SHARD_MODE</code> = <code>shared</code> (<code>--shared</code>) or <code>partitioned</code> (drop <code>--shared</code> → disjoint
-ranges) — this drives the duplication-factor comparison (how many copies of the dataset exist cluster-wide).</li>
-</ul>
-<p>The node-local routing math (assuming servers divide evenly across nodes):</p>
-<pre><code>// src/cross_job/fitcache_cross_job.cpp:121-158
-int spn  = server_count / nnodes;          // servers per node; -1 (→ hash fallback) if not divisible
-uint64_t h = fitcache_fnv1a64(path);
-int slot = nodeid*spn + (h % spn);         // a server on THIS node (SLURM_NODEID)</code></pre>
-<p><strong>What we ran</strong> (each cell measured by a resolver probe that counts cache-hit vs. fallback vs. remote, plus the checksum
-gate): Megatron N=2 &amp; N=4, GNN N=2, DINOv2 N=2 shared, DINOv2 N=2 partitioned (498 shards/node: node 0 reads <code>[0,498)</code>, node 1
-<code>[498,996)</code>), plus a hash baseline (Megatron N=2) to show the scatter.</p>
-<p class="src">frontier_sidecar_recovery.sh:47,70-78,122 · EXPERIMENTS_STATUS.html:166-175</p>
+<h2 id="prefetch">7. Whole-system method — prefetch-informed migration &amp; 1&times; partitioning</h2>
+<p>The whole system is the transparent <code>mmap</code> cache path (§3–§6) plus one extra hint the application gives ahead of
+each read: <strong>prefetch-informed migration</strong>. Instead of every node pre-staging the entire corpus (replicate-all, which
+costs N&times; the dataset cluster-wide), the cluster keeps a file cached <strong>once</strong> and migrates that single copy to
+whichever node is about to read it, <em>ahead</em> of the read and overlapped with the current epoch's compute. Each node therefore
+prefetches only its <strong>own 1/N partition</strong>, the cluster holds the read set <strong>once (1&times;)</strong>, and every
+read is still a warm local <code>mmap</code>.</p>
 
-<h2 id="scaleladder">8. Whole-system result — warm-flat scale ladder, 32–256 nodes (all three workloads)</h2>
-<p>This variant asks one question: <em>does the warm-hit benefit hold as the job grows?</em> We run each workload at 32, 64, 128,
-and 256 nodes (256 nodes = the 2048-GPU node scale of the base end-to-end runs) and watch whether the warm epoch time stays flat.
-It should, if the client-side resolver adds no coordination cost. Originally only Megatron was laddered; the 2026-06-15 campaign
-extended the ladder to <strong>all three workloads</strong> so the scaling claim is symmetric.</p>
+<div class="callout warn"><strong>Why a hint is load-bearing on Frontier.</strong> Frontier has no NVMe-oF / remote DAX, so a node
+<em>cannot</em> <code>mmap</code> a peer's NVMe directly. "Migration" here is a whole-file network transfer that lands the copy in
+the requesting node's local tier. Done lazily at <code>mmap</code> time it is no better than the existing per-read RPC fallback —
+the read still waits on the network. It only pays off when the file is <em>prefetched</em>, so the transfer overlaps with compute
+and the data is already local when the read arrives. That is why the application declares its files up front rather than letting
+the cache fill reactively.</div>
+
+<h3>7.1 The <code>fitcache_prefetch</code> hint and the peer&rarr;local migrate</h3>
+<p>The application declares the files it is about to <code>mmap</code> through a new C API,
+<code>fitcache_prefetch(path, replication_mode)</code>. The call is exported from the client library and reachable through the
+same <code>LD_PRELOAD</code> shim as the <code>mmap</code> interceptors, so no application source change is required beyond the one
+hint. It issues a prefetch RPC to the owning server, which enqueues the work at <strong>PREFETCH priority</strong> and runs the
+crux primitive — a single bulk peer&rarr;local whole-file transfer (<em>not</em> the per-<code>pread</code> loop) that lands the
+copy exactly like a PFS promote (hash-bin path + cache map + <code>.meta</code> file + presence broadcast).</p>
+<pre><code>// client API + LD_PRELOAD symbol
+extern "C" int fitcache_prefetch(const char *original_path, int replication_mode);
+//   src/client/fitcache_multi_source_read.h:35 · .cpp impl · wrappers.c (preload symbol)
+
+// the crux: ONE bulk peer->local transfer of the whole file (not per-pread)
+int fitcache_server_migrate_file(const std::string &original_path,
+                                 const std::string &src_addr, int requested_tier);
+//   src/server/fitcache_data_mover.cpp:53
+//   invoked from the prefetch path (src/server/fitcache_server.cpp:237)
+//   and from open-time promote (src/server/fitcache_data_mover.cpp:584)</code></pre>
+<p class="src">src/comm/fitcache_comm.h (fitcache_prefetch_in_t/out_t: replication_mode, replication_cap) · src/comm/fitcache_comm_server.cpp:922 (fitcache_prefetch_rpc_handler) · src/comm/fitcache_comm_client.cpp:682 (forwards mode/cap) · benchmarks/fitcache_prefetch_shim.py (ctypes &rarr; fitcache_prefetch)</p>
+
+<h3>7.2 <code>replication_mode</code> — how many copies the cluster keeps</h3>
+<p>The second argument selects the replication policy; the chosen <code>replication_mode</code> (and a <code>replication_cap</code>
+for the bounded case) is forwarded through the RPC and recorded in each cached file's <code>.meta</code> file
+(<code>src/cross_job/fitcache_persistent_meta.h</code>), so the policy survives a server restart.</p>
+<table>
+<tr><th>Mode</th><th>Value</th><th>What it means</th></tr>
+<tr><td><code>SINGLE_COPY</code></td><td>1</td><td>One copy cluster-wide; migrate peer&rarr;local on demand. This is the 1&times; policy the partitionable workloads use.</td></tr>
+<tr><td><code>BOUNDED_K</code></td><td>2</td><td>At most <em>k</em> copies (<code>replication_cap</code>), for hot / concurrently-read files.</td></tr>
+<tr><td><code>UNBOUNDED</code></td><td>0</td><td>The old replicate-all default — every node keeps its own copy (N&times;).</td></tr>
+</table>
+
+<h3>7.3 How each node prefetches its 1/N partition, and how 1&times; is confirmed</h3>
+<p>For the two partitionable workloads each rank declares only its disjoint slice before reading it: rank <code>R</code> of
+<code>N</code> prefetches the shards it owns (Megatron round-robin <code>[R, R+N, …]</code>; DINOv2 its disjoint shard range),
+issued via the <code>fitcache_prefetch_shim.py</code> ctypes wrapper. Because no node ever fetches a peer's slice, the union of
+all per-node local copies is exactly one copy of the read set. We <strong>confirm the 1&times; footprint with <code>du</code></strong>
+on each node's NVMe tier: each node's cached bytes equal its partition (Megatron 32/N&nbsp;shards&nbsp;&times;&nbsp;16&nbsp;GiB,
+DINOv2 its shard set), so the cluster total is 1&times; the dataset rather than replicate-all's N&times;.</p>
+<p><strong>GNN stays un-partitionable.</strong> The 2-hop heterogeneous gather can touch any feature row, so its access set is not a
+contiguous slice; every node must hold the whole feature+CSR set (902 GB) and storage stays <strong>N&times;</strong>. Prefetch
+still earns the warm local hit there — it just cannot earn the 1&times; storage win.</p>
+
+<h2 id="scaleladder">8. Whole-system result — prefetch 1&times; study at two scales (1–16 and 32–256 nodes)</h2>
+<p>The whole-system study runs the <code>mmap</code> cache path + prefetch at two scales and asks two things together: <em>does the
+warm local read hold as the job grows</em>, and <em>does the cluster footprint stay at 1&times;</em>. Megatron (dense-sequential)
+and DINOv2 (sequential vision) are the 1&times;-partitionable cases; GNN is the un-partitionable column (warm hit only, storage
+N&times;). The two ranges 1–16 and 32–256 use the same binary and method so they join into one curve. <strong>Numbers are
+authoritative in <a href="experiments.html">experiments.html</a> §1.1–§1.2; this section defines how they are produced and what
+each metric means.</strong></p>
 <ul>
-<li><strong>Regime (replicated per node, &gt; 512 GiB RAM):</strong> Megatron 640 GiB/node (40 shards); GNN 902 GB/node (6 feature+CSR files); DINOv2 541 GB/node (996 shards, <code>--shared</code> so the per-node set is constant as N grows — disjoint would run out of the 996 shards beyond N=31).</li>
-<li><strong>Per rep:</strong> a <code>mem_hog</code> eviction on all nodes; <code>FITCACHE_MMAP_PLACEMENT=node_local</code>.</li>
-<li><strong>Arms (warm first):</strong> FitCachePP = 2 reps × 2 epochs (epoch 0 = the evicted NVMe-bound warm hit); Native = 1 cold epoch, run <em>last</em> so a native timeout at scale still preserves the warm-flat headline.</li>
+<li><strong>Setup per rank:</strong> the rank declares its 1/N partition via <code>fitcache_prefetch</code> (SINGLE_COPY), which
+migrates that slice peer&rarr;local overlapped with compute; the rank then <code>mmap</code>-reads it warm.</li>
+<li><strong>Per rep:</strong> a <code>mem_hog</code> eviction on all nodes before timing, so the cold-side read is genuinely cold.</li>
+<li><strong>Arms (warm first):</strong> FitCachePP warm epoch vs. <code>Native_mmap_PFS</code>; the native cold epoch is run
+<em>last</em> so a native timeout at scale still preserves the warm result.</li>
 <li><strong>Every step uses <code>srun --overlap</code></strong> to avoid a step-creation deadlock with the backgrounded server step.</li>
-<li><strong>Walltime bins (Frontier):</strong> ≤91 nodes cap 2 h (Bin 5), 92–183 nodes 6 h (Bin 4), 184–1,881 nodes 12 h (Bin 3). The native arm is 1 epoch precisely so the N=32/64 rungs fit the 2 h cap.</li>
 </ul>
-<pre><code>srun --overlap -N $N -n $N --ntasks-per-node=1 --cpus-per-task=8 --cpu-bind=cores bash -c \
+<pre><code># each rank prefetches its 1/N partition (SINGLE_COPY=1), then mmap-reads warm
+python fitcache_prefetch_shim.py &lt;rank-partition paths&gt; 1     # ctypes -> fitcache_prefetch
+srun --overlap -N $N -n $N --ntasks-per-node=1 --cpus-per-task=8 --cpu-bind=cores bash -c \
   '... <bench> ... --label "<wl>_warm"'   # then native (1 cold epoch), run last
-# warm-side gate (Megatron/DINOv2-shared: one global checksum; GNN: per-rank pairing)</code></pre>
-<p class="src">{megatron,gnn,dinov2}_scale_ladder/…/job.sh · gnn per-rank gate via diff of sorted rank=cksum pairs</p>
+# warm-side gate (Megatron/DINOv2: per-rank checksum; GNN: per-rank pairing)</code></pre>
+<p class="src">{megatron,gnn,dinov2}_scale_ladder/…/job.sh · benchmarks/fitcache_prefetch_shim.py · gnn per-rank gate via diff of sorted rank=cksum pairs</p>
 
-<h4>Results — warm is flat; native is large and volatile (32–256 nodes)</h4>
+<h4>The three metrics this study reports</h4>
+<p>Each workload column in <a href="experiments.html">experiments.html</a> reports the same three quantities. They are defined
+once here:</p>
 <table>
-<tr><th>Workload</th><th>warm @N=32 / 64 / 128 / 256 (s)</th><th>native cold @N=32 / 64 / 128 / 256 (s)</th><th>speedup @N=256</th></tr>
-<tr><td>Megatron</td><td>174.8 / 168.9 / 173.5 / 165.7</td><td>2567.7 / 943.8 / 1065.9 / 2914.8</td><td><strong>17.6&times;</strong></td></tr>
-<tr><td>GNN gather (NVMe-bound warm)</td><td>87.1 / 86.1 / 82.6 / 75.0</td><td>575.3 / 440.6 / 758.8 / 970.8</td><td><strong>13.0&times;</strong></td></tr>
-<tr><td>DINOv2</td><td>215.4 / 219.8 / 218.8 / 220.6</td><td>716.3 / 1288.8 / 2643.6 / <em>intractable</em></td><td><em>—</em></td></tr>
+<tr><th>Metric</th><th>Definition</th><th>Why it is the honest one</th></tr>
+<tr><td><strong>cold&rarr;warm</strong></td><td>native <em>first</em> (cold, from-Lustre) read time &divide; FitCachePP warm read time.</td><td>The real benefit: it is the gap FitCachePP actually removes — a slow cold Lustre read replaced by a warm local <code>mmap</code> (e.g. Megatron a ~925 s first cold read becomes a ~60 s warm read).</td></tr>
+<tr><td><strong>warm&rarr;warm</strong></td><td>native <em>second-epoch</em> (page-cache resident) read time &divide; FitCachePP warm read time.</td><td>Deliberately conservative and small (≈1.6–2.3×): at 1× the per-node partition fits node RAM, so the native baseline page-caches it after one pass too. This shows we are not over-claiming against an already-warm OS cache.</td></tr>
+<tr><td><strong>1&times; cache/node</strong></td><td>the per-node cached footprint (its partition only), measured by <code>du</code> on the local NVMe tier.</td><td>Proves the storage win: each node holds only its slice, so the cluster total is one copy of the read set (1×) instead of replicate-all's N×. For GNN this column is <code>N×/node</code> = 902 GB because it is un-partitionable.</td></tr>
 </table>
-
-<h4>Results — the 1–16 half of the curve (current binary, 2026-06-16 re-run)</h4>
-<p class="note">Re-run with the same binary and method so the two ranges join into one 1→256 curve. Warm joins the 32–256 band
-with no step; native is captured at every rung except two that hit the 2 h walltime wall on their first (afternoon) attempt and
-were refilled by native-only recovery jobs (Megatron N=1 = 1305 s recovered in 22 min on faster evening Lustre).</p>
-<table>
-<tr><th>Workload</th><th>warm @N=1 / 2 / 4 / 8 / 16 (s)</th><th>native cold @N=1 / 2 / 4 / 8 / 16 (s)</th><th>speedup range</th></tr>
-<tr><td>Megatron</td><td>197 / 183 / 175 / 181 / 172</td><td>1305 / <em>rec.</em> / 1254 / 887 / 1118</td><td>4.9&ndash;7.2&times;</td></tr>
-<tr><td>GNN gather (NVMe-bound warm)</td><td>87.2 / 86.7 / 86.6 / 86.6 / 85.9</td><td>4962 / 4420 / 1954 / 1544 / 827</td><td>9.6&ndash;56.9&times;</td></tr>
-<tr><td>DINOv2</td><td>217 / 223 / 228 / 224 / 225</td><td><em>rec.</em> / 1000 / 685 / 880 / 865</td><td>3.0&ndash;4.5&times;</td></tr>
-</table>
-<p class="note"><em>rec.</em> = native-only recovery job running (first attempt walled). GNN native falls steeply (4962&rarr;827 s) as
-more nodes parallelize the cold random gather, so its speedup is huge at N=1 (single-rank serial gather) and settles toward the
-32&ndash;256 band; this is why the headline is warm-flat, not a fixed speedup.</p>
-<p class="note"><strong>Reading the result:</strong> the warm epoch barely moves across a 8&times; range of node counts (Megatron ~5%
-spread, DINOv2 ~2.4%), which is the scaling claim. The native baseline is much larger but <em>volatile and non-monotonic</em> in N
-(Megatron 2568&rarr;944&rarr;1066&rarr;2915&nbsp;s; GNN 575&rarr;441&rarr;759&rarr;971&nbsp;s) because it tracks time-of-day Lustre
-contention, not node count &mdash; so the honest framing is <strong>warm-flat + native-volatile</strong>, not "speedup grows with
-scale." The speedup is large at every rung (Megatron 14.7&ndash;17.6&times;, GNN 5.1&ndash;13.0&times;, DINOv2 3.3&ndash;12.1&times;)
-but should not be read as a monotonic law. Three caveats are stated openly:
-(1) The GNN rungs report a spurious "FAILED" because the ladder's pooled checksum gate is wrong for GNN (each rank samples different
-rows, so per-rank checksums differ by design); manual per-rank pairing confirms warm == native byte-for-byte (256/256 ranks at N=256).
-The fix could not take effect because <em>Slurm snapshots the batch script at submit time</em>, so editing the script after
-<code>sbatch</code> does not change an already-queued job. (2) The DINOv2 native cold epoch at N=256 did not complete: cold-reading
-the 541 GB replicated corpus on 256 nodes is ~138 TB of simultaneous Lustre reads, which did not finish one epoch in ~112 min before
-the step was terminated — itself a demonstration of why the local-tier path matters at scale. (3) Two transient Slurm
-"socket-timeout / unable to confirm allocation" failures (Megatron N=64 attempt 1, DINOv2 N=128 attempt 1) cost a native arm each;
-the warm-first ordering preserved the warm data, and the affected rungs were rerun.</p>
-<p class="note">Harness fixes that made the ladder reliable (script-side only — the FitCache source was left untouched so all data
-stays comparable): <code>srun --overlap</code> on post-server steps; a bounded <code>mem_hog</code> loop that actually converges;
-checking server readiness via the port-cfg file instead of the stdout log; and removing a <code>… | head -8</code> pipe that was
-sending SIGPIPE and killing the benchmark mid-run.</p>
-
-<h2 id="integrated">8b. Whole-system result — integrated end-to-end run (promote + placement + recovery in one job)</h2>
-<p>This is the run that tests FitCachePP <em>as one system</em> rather than one mechanism at a time. One Megatron N=16 job, driven by
-<code>frontier_sidecar_recovery.sh</code> in organic mode with <code>FITCACHE_MMAP_PLACEMENT=node_local</code> and
-<strong>no manual pre-stage</strong> — the application simply runs and the cache fills itself. Partway through, a metadata server
-is killed and restarted, then the job continues. So a single execution drives the full causal chain: organic promotion &rarr;
-node-local placement &rarr; live restart recovery &rarr; warm hit.</p>
-<ul>
-<li><strong>Populate (organic):</strong> a cold epoch reads from Lustre and promotes each shard into the local NVMe tier and writes
-its <code>.meta</code> file — 346.5 s, coverage 1.0, checksum <code>17267459847735986</code>. Placement summary during populate:
-<code>local=160, remote=0</code> (the node-local policy kept every node's copy on its own node).</li>
-<li><strong>Restart:</strong> server #1 is killed; server #2 comes up and <code>restore_from_sidecars</code> rebuilds the cache map —
-<strong>40/40 entries restored, 0 missing, in 5 s</strong>.</li>
-<li><strong>Post-restart:</strong> a resolver probe confirms <strong>cache_hit=40, fallback=0</strong>; two warm passes run at 185.3 s
-(cold-from-recovered-NVMe) and 209.8 s (page-cache warm), with the checksum identical to populate. The post-restart warm pass is
-22.8% faster than the reference N=1 warm-hit, i.e. the cache is fully usable immediately after the restart with no re-promotion.</li>
-<li><strong>Gates:</strong> CHECKSUM, RESTORE, and RECOVERY all PASS.</li>
-</ul>
-<p class="note">This is the methodological answer to "you only validated the mechanisms separately": the whole system runs as a whole,
-organically, and survives a restart, in one job. The §7/§9/§10 ablations then attribute the result to each mechanism.</p>
-<p class="src">sidecar_recovery/20260616_153421_sidecar_recovery_megatron_N16_integrated_e2e/ (job 4819857) · frontier_sidecar_recovery.sh organic+node_local</p>
+<p class="note"><strong>Reading the GNN column.</strong> Its <code>FCP warm</code> is the NVMe-bound gather (~2.67 GB of scattered rows
+served from the node's local copy, a flat ~75–87 s from 1 to 256 nodes); the native cold gather swings with time-of-day Lustre
+congestion, so <code>cold&rarr;warm</code> wobbles (≈5–51×) rather than trending. Read it as
+<strong>NVMe-warm-flat + native-volatile</strong>, <em>not</em> "speedup grows with scale." Every rank's checksum matches
+<code>Native_mmap_PFS</code> byte-for-byte under the per-rank gate; the pooled cross-rank gate cosmetically reports FAIL only
+because each rank uses a distinct seed (see §11). For the exact per-rung tables and the two-scale cap notes (Megatron caps at N=64
+on its 64-shard corpus; DINOv2 reaches N=256), defer to <a href="experiments.html">experiments.html</a> §1.1–§1.2.</p>
 
 <h2 id="dramtier">9. Ablation — DRAM-tier (tmpfs) check</h2>
 <p>This variant proves the warm-hit path works on <em>any</em> local tier, not just NVMe. We stage an 8-shard Megatron subset (128 GiB)
@@ -487,8 +438,8 @@ particular benchmark is compute-bound (~4.4 GB/s) — the summing, not the disk,
 <p>This ablation isolates the recovery mechanism: does the cache survive a server restart, and what specifically does the
 <code>.meta</code> file buy? Each cached file gets a small <code>.meta</code> file recording what it is; when a server restarts, it
 reads those .meta files to rebuild its memory of what is already cached, so the next run warm-hits instead of re-fetching from
-Lustre. (The integrated run in §8b exercises this same mechanism in-context, mid-job; here we isolate it and add a no-.meta-file
-arm for comparison.) Driven by <code>frontier_sidecar_recovery.sh</code> for any of the three workloads
+Lustre. (We isolate the mechanism here and add a no-.meta-file arm for comparison.) Driven by
+<code>frontier_sidecar_recovery.sh</code> for any of the three workloads
 (<code>BENCH=megatron|gnn|dinov2</code>), in four phases:</p>
 <ol>
 <li><strong>P1 Populate:</strong> bring up server #1 and run a cold epoch — reading a file triggers a promotion that copies it to the local tier and writes its <code>.meta</code> file.</li>
@@ -509,20 +460,20 @@ the native baseline is a cold read from Lustre (separately evicted). That is the
 filesystem — and the checksum gate proves identical bytes. It is <em>not</em> a warm-vs-warm comparison, and we never present it as one.</li>
 <li><strong>Eviction is best-effort.</strong> On a 512 GiB node with a small working set (GNN ~2.67 GB), <code>mem_hog</code> cannot fully
 flush RAM, so the GNN headline uses rep 1 (cleanest eviction) as the anchor and keeps reps 2–3 only as variance context.</li>
-<li><strong>Native Lustre speed depends on cluster conditions.</strong> The same native epoch varies with time-of-day contention (e.g.
-944–2567 s at fixed N in the scale ladder). The <em>warm</em> side is the stable quantity; any reported speedup inherits the native
-variance — which is why the GNN result is given <em>per regime</em> (vs. favorable and vs. cold Lustre) instead of a single number.</li>
-<li><strong>Two checksum gates are "cosmetically" failed by design, but the data is verified correct.</strong> (a) The GNN pooled gate
-takes a set-union of per-rank checksums across ranks that each sample different random rows, so it reports N distinct values; per-rank,
-warm == native byte-for-byte at every rung. (b) In the 1–16 Megatron re-run the native arm prints a different <em>aggregate</em>
-<code>GLOBAL_CHECKSUM</code> (<code>8633729923867993</code>) than the warm arm (<code>17267459847735986</code>) because the two paths
-combine per-shard hashes in a different order; the <em>per-shard</em> <code>shard_cksum</code> values are byte-identical between warm
-and native (e.g. shard0 <code>215842217132793</code>), so the served bytes match. In both cases the per-element check is the real
+<li><strong>Native Lustre speed depends on cluster conditions.</strong> The same native cold epoch varies with time-of-day contention
+(e.g. the GNN cold gather swings from ~4419 s to ~827 s across node counts). The <em>warm</em> side is the stable quantity, so the
+honest framing for the un-partitionable GNN column is <strong>warm-flat + native-volatile</strong>, not a fixed speedup that grows
+with scale.</li>
+<li><strong>The GNN pooled checksum gate is "cosmetically" failed by design, but the data is verified correct.</strong> The pooled
+gate takes a set-union of per-rank checksums across ranks that each sample different random rows, so it reports N distinct values;
+the per-rank gate confirms warm == native byte-for-byte at every rung (256/256 ranks at N=256). The per-rank check is the real
 integrity test and it passes.</li>
 <li><strong>The staging check is size-only, not a content hash</strong> (§3.3) — integrity ultimately rests on the end-to-end checksum
 gate.</li>
-<li><strong>Working sets are bigger than node RAM on purpose</strong> (regime-pinned), so the native baseline cannot hide reads in the page
-cache; a sub-RAM layout would let both sides cache in RAM and wash the difference out.</li>
+<li><strong>At 1&times; the per-node partition fits node RAM</strong>, so the <em>warm&rarr;warm</em> number is small by construction:
+after one pass the native baseline page-caches its slice too, and the only durable benefit is the <em>cold&rarr;warm</em> gap. We
+report warm&rarr;warm anyway rather than hide it. (The un-partitionable GNN case keeps the whole 902 GB set per node, larger than
+RAM, so its native cold gather genuinely hits Lustre every time.)</li>
 <li><strong>These are data-loading I/O benchmarks.</strong> The "model" is a fixed access pattern plus a byte-touch, not a real
 forward/backward pass. All claims are scoped to mmap-backed data loading, not end-to-end training.</li>
 <li><strong>The one-time staging cost is reported separately</strong> and only folded back into the amortized (View 2) break-even — it is
@@ -531,7 +482,13 @@ never hidden inside a warm epoch.</li>
 
 <footer>
 Generated 2026-06-14 from the benchmark sources + harness scripts (mined and cross-checked; every claim cites <code>file:line</code>).
-Rewritten 2026-06-14 for plain-English readability; §8 updated 2026-06-15 with the completed 3-workload scale ladder (warm-flat to 256 nodes); 2026-06-16 reframed whole-system-first — §8/§8b are whole-system results (scale ladder + integrated run), §7/§9/§10 are ablations; 2026-06-17 added the 1–16 half of the curve and the two cosmetic-checksum disclosures (§11). Focus is methodology (how experiments are built, run, and measured).
+Rewritten 2026-06-14 for plain-English readability; 2026-06-20 rewritten for the redesign — the whole system is now the <code>mmap</code>
+cache path plus prefetch-informed migration (§7): each node prefetches only its 1/N partition via <code>fitcache_prefetch</code>, so the
+cluster holds the read set once (1×, du-confirmed) while reads stay warm local mmaps. §8 is the prefetch 1× study at two scales (1–16
+and 32–256 nodes) with cold→warm / warm→warm / 1×-cache metric definitions; GNN is the un-partitionable column (warm hit, storage N×).
+The standalone access-aware-placement ablation is folded into prefetch and the integrated end-to-end run removed; Part 2 ablations are
+.meta-file recovery (§10) and DRAM-vs-NVMe tier (§9). Numbers are authoritative in <a href="experiments.html">experiments.html</a>.
+Focus is methodology (how experiments are built, run, and measured).
 </footer>
 
 </body>

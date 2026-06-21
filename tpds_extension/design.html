@@ -46,9 +46,18 @@
 <h2>Pipeline overview</h2>
 <p>FitCachePP is an LD_PRELOAD client paired with Mercury-RPC metadata/data servers (default 4 servers/node). An application's
 file access is intercepted transparently; on a warm hit the data is served from a node-local cached copy held in a local cache
-tier (DRAM/tmpfs → PMem → NVMe), on a cold miss from the parallel filesystem (PFS) while the file is promoted to local cache for
-next time.</p>
-<pre><code>app open()/mmap()  ──►  LD_PRELOAD client
+tier (DRAM/tmpfs &rarr; PMem &rarr; NVMe), on a cold miss from the parallel filesystem (PFS) while the file is promoted to local cache for
+next time. The new piece is <strong>prefetch-informed migration</strong>: an application declares the files it is about to
+<code>mmap()</code> via <code>fitcache_prefetch(path, replication_mode)</code>, and the owning server migrates the single cached
+copy to that node ahead of the read, overlapped with the current epoch's compute. The cluster therefore stores each file
+<strong>once (1&times;)</strong> instead of N&times;, while every read is still a warm local <code>mmap</code>.</p>
+<pre><code>app fitcache_prefetch(path)   ──►  LD_PRELOAD client ──► prefetch RPC (PREFETCH priority)
+   (declared before mmap)                                    │
+                                              owning server migrates the ONE copy
+                                              peer ──► local tier (whole-file bulk xfer),
+                                              overlapped with current-epoch compute
+
+app open()/mmap()  ──►  LD_PRELOAD client
                           │
                 ┌─────────┴──────────┐
             warm hit               cold miss
@@ -62,13 +71,13 @@ next time.</p>
 <p class="note">The cache is tier-general: the data mover places a promoted file <strong>DRAM (tmpfs) first, then PMem, then
 NVMe</strong> by remaining capacity, and the resolver probes the tiers in the same order and maps whichever holds the file. On
 <strong>Frontier</strong> the warm-hit experiments were served from the <strong>NVMe</strong> tier (per-node burst buffer
-<code>/mnt/bb</code>). What matters is the <em>per-node</em> working set, not the total dataset: these sweeps keep it &gt; the
-512&nbsp;GiB node RAM on purpose by <strong>replicating</strong> the set on every node (Megatron stages all 40 shards = 640&nbsp;GiB/node;
-GNN stages the whole feature files ~902&nbsp;GB/node; DINOv2 full-corpus is shared, 541&nbsp;GB/node), so aggregate DRAM across
-nodes does not shrink it and a per-node tmpfs cannot hold it. PMem is unset (Frontier has no PMem). A <em>partitioned</em> access
-pattern (DINOv2 disjoint = the Mechanism-2 placement) is the exception — at 16 nodes each holds ~34&nbsp;GB, which fits tmpfs — but
-then the <code>Native_mmap_PFS</code> baseline page-caches it too, washing out the sustained warm-hit gap. So NVMe is the correct
-tier for the sustained claim; a DRAM datapoint would be a different (cold-start) experiment.</p>
+<code>/mnt/bb</code>); PMem is unset (Frontier has no PMem). Crucially, Frontier has <strong>no NVMe-oF / remote DAX</strong>, so a
+node cannot <code>mmap</code> a peer's NVMe directly. "Migration" is therefore a <em>whole-file network transfer</em> to the local
+tier &mdash; it only pays off when <strong>prefetched and overlapped with compute</strong>; performed lazily at <code>mmap</code>
+time it is no better than the existing per-read RPC fallback, which is exactly why the prefetch interface is load-bearing. With
+prefetch in place each node holds only its own <strong>1/N</strong> partition, so the cluster keeps the dataset at 1&times; while
+reads stay warm local <code>mmap</code>s. For experiment numbers (cold&rarr;warm, warm&rarr;warm, 1&times; <code>du</code>) defer to
+<a href="experiments.html">experiments.html</a>.</p>
 
 <h2>One system, three dependent mechanisms</h2>
 <p>FitCachePP is <strong>one system</strong>. The three mechanisms below are not independent features that happen to ship
@@ -76,21 +85,19 @@ together &mdash; they are causally chained, and the headline warm-hit result onl
 <ol>
 <li><strong>Mechanism 1 (mmap cache path)</strong> delivers the speedup, but only if the cached copy is on the requester's
 <em>own</em> node &mdash; the win comes from page-faulting directly out of local storage with no network hop.</li>
-<li>Keeping each node's copy local is what <strong>Mechanism 2 (node-local placement)</strong> guarantees. Without it the default
-hash scatters a node's mmap set across the cluster, turning warm reads into remote/fallback misses at N&ge;2 &mdash; so Mechanism 1
-depends on Mechanism 2 at any multi-node scale.</li>
+<li>Getting that single copy onto the requesting node ahead of the read is what <strong>Mechanism 2 (prefetch-informed
+migration + limited replication)</strong> provides. The application declares its files with <code>fitcache_prefetch()</code>; the
+owning server migrates the one cached copy peer&rarr;local, overlapped with compute, so the cluster stores the file
+<strong>1&times;</strong> instead of replicating it N&times; &mdash; and Mechanism 1 then warm-hits it locally.</li>
 <li>The cache only stays useful across a job requeue or a service crash if the server can rebuild its state, which is what
 <strong>Mechanism 3 (.meta-file recovery)</strong> provides. Without it a restart makes the server-side map look empty and the
-promotion/eviction accounting is lost &mdash; so Mechanism 2's placement survives a restart only because Mechanism 3 restores it.</li>
+promotion/eviction accounting is lost &mdash; so the migrated, locally-cached state survives a restart only because Mechanism 3
+restores it.</li>
 </ol>
-<p>This dependency is why the system is validated <em>together</em> first. The integrated end-to-end run
-(<code>20260616_153421_sidecar_recovery_megatron_N16_integrated_e2e</code>, job 4819857) exercises all three in one Megatron N=16
-job with <strong>no manual staging</strong>: the cache fills organically from Lustre (populate 346.5&nbsp;s), node-local placement
-keeps <code>local=160, remote=0</code>, a metadata server is killed and restarted mid-run, <code>restore_from_sidecars</code>
-rebuilds 40/40 entries in 5&nbsp;s, and the post-restart resolver probe warm-hits all 40 objects (<code>fallback=0</code>) at
-185&ndash;210&nbsp;s with a checksum identical to populate. All three gates (CHECKSUM/RESTORE/RECOVERY) pass. The per-mechanism
-sections below are the ablations that attribute this integrated result to each mechanism; see
-<a href="experiments.html">experiments.html &sect;1.1</a>.</p>
+<p>The chain reads end to end: <em>a warm <code>mmap</code> hit needs the file on the local node &rarr; prefetch migrates the
+single copy there (1&times;, not N&times; replication) &rarr; .meta recovery preserves that state across restarts.</em> The
+per-mechanism sections below are the ablations that attribute the whole-system result to each mechanism; see
+<a href="experiments.html">experiments.html</a>.</p>
 
 <h2>Mechanism 1 — Transparent mmap cache path <span class="badge done">DONE</span></h2>
 <p>The warm-hit path resolves the cached copy with <code>fitcache_resolve_cached_path()</code>: client-side, deterministic
@@ -100,29 +107,50 @@ file in whichever local tier holds it (DRAM/PMem/NVMe), so the kernel page-fault
 &le;1 GiB chunks and the server loops on short reads, so files larger than ~2 GiB are no longer truncated. Eviction safety relies
 on Linux unlink-while-mapped semantics protecting active mappings.</p>
 
-<h2>Mechanism 2 — Access-aware mmap cache placement <span class="badge done">DONE</span></h2>
-<p>A warm hit requires the cached file on the requester's own node. Placement is decided in
-<code>select_server_for_path()</code> (<code>src/cross_job/fitcache_cross_job.cpp</code>):</p>
+<h2>Mechanism 2 — Prefetch-informed migration + limited replication <span class="badge done">DONE</span></h2>
+<p>A warm hit requires the cached file on the requester's own node, but on Frontier a node cannot <code>mmap</code> a peer's NVMe
+(no NVMe-oF / remote DAX). Rather than replicate the whole working set onto every node (N&times; storage), the application declares
+the files it is about to map and the owning server <strong>migrates the single cached copy</strong> there ahead of the read.</p>
+<h3>The prefetch interface</h3>
 <ul>
-<li><strong>Default <code>hash</code></strong> — <code>modulo_select() = fnv1a64(path) % total_servers</code>. Saves space but scatters a
-node's mmap set across the cluster, producing remote/fallback misses at N&ge;2.</li>
-<li><strong><code>node_local</code> branch</strong> — gated by <code>FITCACHE_MMAP_PLACEMENT=node_local</code>. Routes promotion to the
-node's own slots <code>[nodeid&middot;spn, (nodeid+1)&middot;spn)</code>, where <code>spn = total_servers / SLURM_NNODES</code> and
-<code>nodeid = SLURM_NODEID</code>. Logs <code>placement_policy=node_local</code> and a per-node <code>local/remote</code> summary.
-Default <code>hash</code> path is unchanged.</li>
+<li><strong>C API</strong> &mdash; <code>extern "C" int fitcache_prefetch(const char *original_path, int replication_mode)</code>
+in <code>src/client/fitcache_multi_source_read.{h,cpp}</code>, exposed as an <code>LD_PRELOAD</code> symbol via
+<code>wrappers.c</code>. Benchmarks drive it through <code>benchmarks/fitcache_prefetch_shim.py</code> (ctypes &rarr;
+<code>fitcache_prefetch</code>).</li>
+<li><strong>RPC + handler</strong> &mdash; <code>fitcache_prefetch_in_t/out_t</code> (carrying <code>replication_mode</code> and
+<code>replication_cap</code>) in <code>src/comm/fitcache_comm.h</code>; <code>fitcache_prefetch_rpc_handler</code>
+(<code>src/comm/fitcache_comm_server.cpp:922</code>) enqueues the request with <strong>PREFETCH priority</strong>. The mode/cap are
+forwarded through <code>fitcache_comm_client.cpp:682</code>.</li>
+<li><strong>The migration primitive</strong> &mdash; <code>fitcache_server_migrate_file()</code>
+(<code>src/server/fitcache_data_mover.cpp:53</code>) pulls the <strong>whole file peer&rarr;local in one bulk transfer</strong>
+(not the per-<code>pread</code> loop). It is invoked from the prefetch path (<code>src/server/fitcache_server.cpp:237</code>) and
+from open-time promote (<code>fitcache_data_mover.cpp:584</code>).</li>
 </ul>
-<p>Two access patterns ride on top of <code>node_local</code>: <strong>shared</strong> (all nodes read the same set, each replicates
-locally) and <strong>partitioned</strong> (nodes read disjoint sets via the cc12m bench's disjoint mode, so each node caches only
-its own shards at ~1&times; global copies).</p>
+<h3>Replication modes</h3>
+<p>The declared <code>replication_mode</code> bounds how many copies the cluster keeps; it is recorded in the <code>.meta</code>
+file (<code>src/cross_job/fitcache_persistent_meta.h</code>) so it survives restarts:</p>
+<table>
+<tr><th>Mode</th><th>Value</th><th>Behavior</th></tr>
+<tr><td><code>SINGLE_COPY</code></td><td>1</td><td>One copy cluster-wide; migrate peer&rarr;local on demand. The 1&times; default
+for partitionable workloads.</td></tr>
+<tr><td><code>BOUNDED_K</code></td><td>2</td><td>At most <em>k</em> copies (the <code>replication_cap</code>), for hot /
+concurrently-read files.</td></tr>
+<tr><td><code>UNBOUNDED</code></td><td>0</td><td>The old replicate-all default (a copy on every reading node).</td></tr>
+</table>
+<p>Lazy migration at <code>mmap</code> time is no better than the per-read RPC fallback; the benefit comes only when the
+declaration lets the server migrate <em>ahead of the read and overlapped with the current epoch's compute</em>. Each node then
+prefetches only its own 1/N partition, so partitionable workloads keep the dataset at <strong>1&times;</strong> cluster storage
+(<code>du</code>-confirmed) while every read is a warm local <code>mmap</code>. Un-partitionable access (e.g. a sparse gather that
+can touch any row) cannot shrink to 1/N and falls back to a wider replication mode, but still wins the warm hit; see
+<a href="experiments.html">experiments.html</a> for the per-workload breakdown.</p>
 
 <h2>Mechanism 3 — .meta file cache-state recovery <span class="badge supp">Supporting</span></h2>
 <p>The data mover writes a <code>.meta</code> file per cached file on organic promotion. After a metadata-service restart,
-<code>restore_from_sidecars</code> rebuilds the server-side cache-state map (eviction/promotion accounting). The client warm-hit
+<code>restore_from_sidecars</code> rebuilds the server-side cache-state map (eviction/promotion accounting, including the recorded
+<code>replication_mode</code>). The client warm-hit
 resolver is independent of the server map: it recomputes the deterministic cached path and <code>stat</code>s the local cache tier, so as
 long as the cached files persist on local storage (the burst buffer in the Frontier runs) the client warm-hits in both the with- and without-.meta file arms. The .meta file
-therefore restores reusable cache <em>state</em> and reduces cold metadata recovery; it is not the bandwidth source. In the
-integrated N=16 run this mechanism rebuilt 40/40 entries in 5&nbsp;s after a live server restart, after which the resolver
-warm-hit all 40 objects with <code>fallback=0</code>.</p>
+therefore restores reusable cache <em>state</em> and reduces cold metadata recovery; it is not the bandwidth source.</p>
 
 <h2>Future work — cross-job cache sharing <span class="badge supp">Future work</span></h2>
 <p>Cross-job sharing (<code>FitCache_CROSS_JOB=1</code>, HRW/peer-read path) remains future work only; no new compute is spent on
@@ -131,15 +159,22 @@ reported experiments.</p>
 
 <h2>Invalid / rejected designs <span class="badge bad">Rejected</span></h2>
 <ul>
-<li><strong>Eager-populate via server + Mercury anon-mmap</strong> — rejected. It added a PFS&rarr;server&rarr;client hop and could
+<li><strong>Whole-working-set replication (replicate-all)</strong> &mdash; superseded. Caching every node's entire working set
+gives N&times; the dataset (Megatron 640&nbsp;GiB/node, GNN ~902&nbsp;GB/node, DINOv2 541&nbsp;GB/node). Replaced by
+prefetch-informed migration that keeps partitionable workloads at 1&times; while preserving the warm local <code>mmap</code>; the
+old behavior survives only as the explicit <code>UNBOUNDED</code> replication mode.</li>
+<li><strong>Lazy peer&rarr;local migration at <code>mmap</code> time</strong> &mdash; rejected as a standalone path. Without a prior
+declaration the whole-file transfer lands on the critical read path and is no better than the existing per-read RPC fallback;
+overlapping it with compute requires the <code>fitcache_prefetch()</code> interface.</li>
+<li><strong>Eager-populate via server + Mercury anon-mmap</strong> &mdash; rejected. It added a PFS&rarr;server&rarr;client hop and could
 not beat <code>Native_mmap_PFS</code> in any single-pass regime. Replaced by the client-side warm-hit direct local-tier path.</li>
-<li><strong>Single unbounded <code>read()</code>/bulk-RMA populate</strong> — invalid. The Linux kernel caps a single read near
+<li><strong>Single unbounded <code>read()</code>/bulk-RMA populate</strong> &mdash; invalid. The Linux kernel caps a single read near
 0x7ffff000 (~2 GiB) and a single Mercury/libfabric bulk RMA caps near 2 GiB; neither was looped, truncating &gt;2 GiB files.
 Fixed with the server short-read loop and &le;1 GiB chunked populate.</li>
 </ul>
 
 <footer>
-Last updated: 2026-06-16 (added "one system, three dependent mechanisms" framing + integrated end-to-end run).<br>
+Last updated: 2026-06-20 (reworked Mechanism 2 into prefetch-informed migration + limited replication; updated pipeline overview and dependency chain; removed the integrated end-to-end / replicate-all framing).<br>
 Generated from markdown source, but updated to reflect latest final results. Markdown source was not modified.
 </footer>
 
