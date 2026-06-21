@@ -93,6 +93,37 @@ MERCURY_GEN_PROC(fitcache_register_file_in_t,
 MERCURY_GEN_PROC(fitcache_register_file_out_t,
     ((int32_t)(status)))
 
+// Prefetch RPC (TPDS prefetch-informed migration). The application calls
+// fitcache_prefetch(path) to declare a file it is about to mmap; the client
+// forwards the hint to the path's owning server, which promotes the file
+// ahead of the read (a proactive analogue of the open-time promote).
+// replication_mode/cap are forwarded for the limited-replication policy
+// (0 = unbounded = today's behavior).
+MERCURY_GEN_PROC(fitcache_prefetch_in_t,
+    ((hg_string_t)(path))((int32_t)(target_slot))
+    ((int32_t)(replication_mode))((int32_t)(replication_cap))
+    ((uint64_t)(dataset_hash)))
+MERCURY_GEN_PROC(fitcache_prefetch_out_t,
+    ((int32_t)(status))((int32_t)(tier)))
+
+// fitcache_prefetch_out_t.status values.
+#define FITCACHE_PREFETCH_QUEUED 0   // not cached locally; promotion enqueued
+#define FITCACHE_PREFETCH_HIT    1   // already cached locally; nothing to do
+#define FITCACHE_PREFETCH_ERR  (-1)  // bad request (empty path, etc.)
+
+// Peer-migrate chunk RPC (TPDS, the migration primitive). A TARGET server pulls
+// one [offset, len) chunk of a cached file from a SOURCE server that holds it,
+// so the single cached copy can be moved peer->local just-in-time (Frontier has
+// no NVMe-oF, so a node cannot mmap a peer's NVMe directly). bulk_handle is the
+// TARGET's WRITE_ONLY receive buffer; the source HG_Bulk_transfer(PUSH)es into
+// it. The whole file is moved by looping this RPC in <=1 GiB chunks (a single
+// bulk RMA caps near 2 GiB). Server-to-server only; the LD_PRELOAD client never
+// issues or serves it.
+MERCURY_GEN_PROC(fitcache_migrate_chunk_in_t,
+    ((hg_string_t)(path))((int64_t)(offset))((int64_t)(len))((hg_bulk_t)(bulk_handle)))
+MERCURY_GEN_PROC(fitcache_migrate_chunk_out_t,
+    ((int64_t)(ret)))
+
 
 //General
 void fitcache_init_comm(hg_bool_t listen);
@@ -186,6 +217,29 @@ hg_id_t fitcache_register_file_get_id(void);
 // mode. Called from the data_mover thread after a successful cache copy.
 void fitcache_broadcast_register_file(const std::string &path);
 
+// Prefetch RPC registration (TPDS). Server registers the handler; client
+// registers the id for forwarding.
+hg_id_t fitcache_prefetch_rpc_register_server(void);
+hg_id_t fitcache_prefetch_rpc_register_client(void);
+hg_id_t fitcache_prefetch_get_id(void);
+
+// Client-side: forward a prefetch hint for `path` to server slot `svr_hash`.
+// Fire-and-forget; the server enqueues promotion and the call returns.
+void fitcache_client_comm_gen_prefetch_rpc(uint32_t svr_hash, const std::string &path,
+                                           int replication_mode, int replication_cap);
+
+// Peer-migrate chunk RPC registration (TPDS). Server-side only (server<->server).
+hg_id_t fitcache_migrate_chunk_rpc_register_server(void);
+hg_id_t fitcache_migrate_chunk_get_id(void);
+
+// Target-side blocking single-chunk pull: resolve `src_addr`, register `buf`
+// (capacity `buf_cap`) as a WRITE_ONLY receive bulk, ask the source to push
+// [offset, len) of `path` into it, and block until the response arrives.
+// Returns bytes received (>0), or <0 on error. Runs on the data-mover thread;
+// the response fires on the progress thread, so there is no self-deadlock.
+int64_t fitcache_comm_migrate_pull_chunk(const std::string &src_addr, const std::string &path,
+                                         int64_t offset, int64_t len, void *buf, size_t buf_cap);
+
 // Look up `path` in this server's remote_presence_map (populated by inbound
 // register-file RPCs from other servers). Returns the serve_addr of the
 // most recent registering server, or an empty string if no one has registered
@@ -235,6 +289,8 @@ extern hg_return_t fitcache_rpc_handler(hg_handle_t handle);
 extern hg_return_t fitcache_open_rpc_handler(hg_handle_t handle);
 extern hg_return_t fitcache_trigger_srv_print_stats_rpc_handler(hg_handle_t handle);
 extern hg_return_t fitcache_peer_lookup_rpc_handler(hg_handle_t handle);
+extern hg_return_t fitcache_prefetch_rpc_handler(hg_handle_t handle);
+extern hg_return_t fitcache_migrate_chunk_rpc_handler(hg_handle_t handle);
 
 #endif
 

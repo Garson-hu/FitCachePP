@@ -37,6 +37,22 @@ pthread_mutex_t init_mutex = PTHREAD_MUTEX_INITIALIZER;
 std::map<int,std::string> fd_map;					// Store the FD of file to the file path
 std::map<int, int > fd_redir_map;					// Store the map of local FD to the remote FD
 
+// Idempotent Mercury-client init. The open interceptor inits lazily on the
+// first open; fitcache_prefetch() may be called before any open, so both go
+// through this one helper (sharing g_mercury_init_mutex) to avoid the double
+// HG_Init race that hangs parallel data-pipeline workers.
+static pthread_mutex_t g_mercury_init_mutex = PTHREAD_MUTEX_INITIALIZER;
+extern "C" void fitcache_client_ensure_comm_init()
+{
+    pthread_mutex_lock(&g_mercury_init_mutex);
+    if (!g_mercury_init) {
+        fitcache_init_comm(false);
+        fitcache_client_comm_register_rpc();
+        g_mercury_init = true;
+    }
+    pthread_mutex_unlock(&g_mercury_init_mutex);
+}
+
 /* Devise a way to safely call this and initialize early */
 static void __attribute__((constructor)) fitcache_client_init()
 {	
@@ -158,16 +174,7 @@ bool fitcache_track_file(const char *path, int flags, int fd)
 		// tasks at AveCPU=00:00:00). The reference HVAC code has the same race
 		// but TF didn't trigger it under its older single-threaded data pipeline.
 		// Our env (TF 2.14.0.600 + horovod 0.28.1 with tf.data.AUTOTUNE) does.
-		{
-			static pthread_mutex_t mercury_init_mutex = PTHREAD_MUTEX_INITIALIZER;
-			pthread_mutex_lock(&mercury_init_mutex);
-			if (!g_mercury_init){
-				fitcache_init_comm(false);
-				fitcache_client_comm_register_rpc();
-				g_mercury_init = true;
-			}
-			pthread_mutex_unlock(&mercury_init_mutex);
-		}
+			fitcache_client_ensure_comm_init();
 		// Decide which server should we sent data. In single-job mode this is
 		// modulo over the local rank set; in cross-job mode (FitCache_CROSS_JOB=1)
 		// it returns an HRW-chosen slot from the cluster live-server set.

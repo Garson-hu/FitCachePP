@@ -26,6 +26,26 @@ extern std::map<int,std::string> fd_map;
 static hg_return_t ms_read_cb(const struct hg_cb_info *info);
 
 extern uint32_t g_fitcache_server_count;
+extern "C" void fitcache_client_ensure_comm_init();
+
+// Prefetch hint API (TPDS). Resolve the owning server slot for `path` the same
+// way ms_read routes reads, then forward a fire-and-forget prefetch hint so the
+// server promotes the file ahead of the mmap. Non-blocking; returns 0 on send.
+extern "C" int fitcache_prefetch(const char *original_path, int replication_mode)
+{
+    if (!original_path || !original_path[0]) return -1;
+    if (g_fitcache_server_count == 0) return -1;
+    // The open interceptor inits Mercury lazily on first open; prefetch may run
+    // before any open, so ensure the client comm is up before forwarding.
+    fitcache_client_ensure_comm_init();
+    std::string path(original_path);
+    int slot = fitcache::select_server_for_path(path,
+                                                static_cast<int>(g_fitcache_server_count));
+    if (slot < 0) return -1;
+    fitcache_client_comm_gen_prefetch_rpc(static_cast<uint32_t>(slot), path,
+                                          replication_mode, 0);
+    return 0;
+}
 
 ssize_t ms_read(int fd, void* buf, size_t count, int64_t offset)
 {

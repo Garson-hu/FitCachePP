@@ -63,7 +63,9 @@ bool magic_version_ok(const fitcache_file_meta_v1 &m) {
 
 fitcache_file_meta_v1 meta_make_initial(const std::string &original_path,
                                         uint64_t original_size,
-                                        uint64_t dataset_id_hash) {
+                                        uint64_t dataset_id_hash,
+                                        uint32_t replication_mode,
+                                        uint32_t replication_cap) {
     fitcache_file_meta_v1 m;
     std::memset(&m, 0, sizeof(m));
     m.magic            = FITCACHE_META_MAGIC;
@@ -74,6 +76,8 @@ fitcache_file_meta_v1 meta_make_initial(const std::string &original_path,
     m.last_access_unix = m.cached_at_unix;
     m.access_count     = 0;
     m.refcount         = 0;
+    m.replication_mode = replication_mode;
+    m.replication_cap  = replication_cap;
     std::strncpy(m.original_path, original_path.c_str(),
                  FITCACHE_META_PATH_MAX - 1);
     m.original_path[FITCACHE_META_PATH_MAX - 1] = '\0';

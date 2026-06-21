@@ -39,8 +39,17 @@ namespace fitcache {
 // On-disk sidecar layout. Fields are written / read in host byte order
 // (single-cluster scope means we don't need endian portability).
 constexpr uint32_t FITCACHE_META_MAGIC   = 0xF17CACE0u;
-constexpr uint32_t FITCACHE_META_VERSION = 1u;
+constexpr uint32_t FITCACHE_META_VERSION = 2u;   // v2 adds replication_mode + replication_cap
 constexpr size_t   FITCACHE_META_PATH_MAX = 1024;
+
+// Replication policy for a cached file (TPDS prefetch-informed migration).
+// Default 0 preserves today's behavior (replicate-all, no cap); the new modes
+// are opt-in and only change eviction/placement when set explicitly.
+enum fitcache_replication_mode_t {
+    FITCACHE_REPL_UNBOUNDED   = 0,  // current behavior: replicate-all, no cap
+    FITCACHE_REPL_SINGLE_COPY = 1,  // one copy cluster-wide; source evictable after migrate
+    FITCACHE_REPL_BOUNDED_K   = 2,  // at most replication_cap copies
+};
 
 #pragma pack(push, 8)
 struct fitcache_file_meta_v1 {
@@ -52,6 +61,8 @@ struct fitcache_file_meta_v1 {
     uint64_t last_access_unix;                     // last read access
     uint32_t access_count;                         // total reads
     uint32_t refcount;                             // # of jobs currently subscribing
+    uint32_t replication_mode;                     // fitcache_replication_mode_t (0 = unbounded, default)
+    uint32_t replication_cap;                      // bounded-k copy cap (0 = unlimited / N/A)
     char     original_path[FITCACHE_META_PATH_MAX];// PFS path, NUL-terminated
 };
 #pragma pack(pop)
@@ -84,7 +95,9 @@ int meta_scan_tier_dir(
 // meta_write_sidecar to persist it.
 fitcache_file_meta_v1 meta_make_initial(const std::string &original_path,
                                         uint64_t original_size,
-                                        uint64_t dataset_id_hash);
+                                        uint64_t dataset_id_hash,
+                                        uint32_t replication_mode = FITCACHE_REPL_UNBOUNDED,
+                                        uint32_t replication_cap = 0);
 
 // Bump the refcount on an existing sidecar. Reads, increments, writes
 // atomically (flock-serialised). Returns the new refcount, or -1 on

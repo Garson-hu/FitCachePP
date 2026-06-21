@@ -7,6 +7,9 @@
 #include "fitcache_timer.h"
 
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -58,6 +61,8 @@ hg_id_t fitcache_peer_lookup_get_id(void) {
 // hg_id_t for fitcache_register_file_rpc — captured at registration time
 // so the data-mover broadcast helper can find peers.
 static hg_id_t g_register_file_id = 0;
+static hg_id_t g_prefetch_id = 0;
+static hg_id_t g_migrate_chunk_id = 0;
 
 hg_id_t fitcache_register_file_get_id(void) {
     return g_register_file_id;
@@ -901,4 +906,322 @@ void fitcache_broadcast_register_file(const std::string &path) {
         L4C_INFO("register_file: rank=%d broadcast %s to %d peers",
                  server_rank, path.c_str(), forwarded);
     }
+}
+
+// ============================================================
+// Prefetch RPC handler (TPDS prefetch-informed migration).
+// The client forwards a prefetch hint for `path`; if the file is already
+// cached locally we answer HIT, otherwise we enqueue it for the data mover
+// (the same promotion path the open handler uses) and answer QUEUED. The
+// promotion runs asynchronously so the call returns immediately and the app
+// can overlap the prefetch with compute. replication_mode is forwarded for
+// the limited-replication policy; the data mover / eviction policy consume it
+// (no behavior change while it is the default UNBOUNDED=0).
+// ============================================================
+hg_return_t
+fitcache_prefetch_rpc_handler(hg_handle_t handle)
+{
+    fitcache_prefetch_in_t in;
+    int ret = HG_Get_input(handle, &in);
+    assert(ret == HG_SUCCESS);
+
+    std::string path_str = (in.path && in.path[0]) ? in.path : std::string();
+    int mode = in.replication_mode;
+    (void)in.target_slot; (void)in.replication_cap; (void)in.dataset_hash;
+    HG_Free_input(handle, &in);
+
+    fitcache_prefetch_out_t out;
+    out.tier = 0;
+
+    bool local_hit = false;
+    if (!path_str.empty()) {
+        std::shared_lock<std::shared_mutex> rlock(cache_mtx);
+        local_hit = (path_cache_map.find(path_str) != path_cache_map.end());
+    }
+
+    if (path_str.empty()) {
+        out.status = FITCACHE_PREFETCH_ERR;
+    } else if (local_hit) {
+        out.status = FITCACHE_PREFETCH_HIT;
+    } else {
+        L4C_INFO("Prefetch enqueue: %s (replication_mode=%d)", path_str.c_str(), mode);
+        pthread_mutex_lock(&data_mutex);
+        data_queue.push(path_str);
+        pthread_cond_signal(&data_cond);
+        pthread_mutex_unlock(&data_mutex);
+        out.status = FITCACHE_PREFETCH_QUEUED;
+    }
+
+    HG_Respond(handle, NULL, NULL, &out);
+    HG_Destroy(handle);
+    return (hg_return_t)ret;
+}
+
+hg_id_t
+fitcache_prefetch_rpc_register_server(void)
+{
+    hg_id_t tmp = MERCURY_REGISTER(
+        hg_class, "fitcache_prefetch_rpc",
+        fitcache_prefetch_in_t, fitcache_prefetch_out_t,
+        fitcache_prefetch_rpc_handler);
+    g_prefetch_id = tmp;
+    return tmp;
+}
+
+hg_id_t
+fitcache_prefetch_get_id(void)
+{
+    return g_prefetch_id;
+}
+
+// ============================================================
+// Peer-migrate chunk RPC (TPDS migration primitive). Runs on the SOURCE server.
+// The TARGET asked us to push [offset, len) of a cached file into its receive
+// buffer (in.bulk_handle). We read the chunk synchronously, then HG_Bulk_PUSH
+// it into the target's bulk handle; the bulk callback answers with the byte
+// count and frees everything. Mirrors the read-bulk path (fitcache_rpc_handler).
+// ============================================================
+struct MigrateChunkServeState {
+    hg_handle_t handle;
+    void       *buffer;
+    hg_size_t   size;          // bytes actually read (to transfer)
+    hg_bulk_t   local_bulk;    // bulk over `buffer`
+    fitcache_migrate_chunk_in_t in;  // kept alive (incl. origin bulk) until the cb
+};
+
+static hg_return_t
+fitcache_migrate_chunk_bulk_cb(const struct hg_cb_info *info)
+{
+    MigrateChunkServeState *st = (MigrateChunkServeState *)info->arg;
+    fitcache_migrate_chunk_out_t out;
+    out.ret = (info->ret == HG_SUCCESS) ? (int64_t)st->size : -1;
+    HG_Respond(st->handle, NULL, NULL, &out);
+    HG_Bulk_free(st->local_bulk);
+    HG_Free_input(st->handle, &st->in);
+    HG_Destroy(st->handle);
+    free(st->buffer);
+    delete st;
+    return HG_SUCCESS;
+}
+
+hg_return_t
+fitcache_migrate_chunk_rpc_handler(hg_handle_t handle)
+{
+    MigrateChunkServeState *st = new MigrateChunkServeState();
+    st->handle     = handle;
+    st->buffer     = NULL;
+    st->local_bulk = HG_BULK_NULL;
+    st->size       = 0;
+    int ret = HG_Get_input(handle, &st->in);
+    assert(ret == HG_SUCCESS);
+
+    std::string path = (st->in.path && st->in.path[0]) ? st->in.path : std::string();
+    int64_t offset   = st->in.offset;
+    int64_t len      = st->in.len;
+
+    // Common failure exit: answer -1 and free everything.
+    auto fail = [&]() {
+        fitcache_migrate_chunk_out_t out; out.ret = -1;
+        HG_Respond(handle, NULL, NULL, &out);
+        HG_Free_input(handle, &st->in);
+        HG_Destroy(handle);
+        if (st->buffer) free(st->buffer);
+        delete st;
+    };
+
+    if (path.empty() || len <= 0) { fail(); return (hg_return_t)ret; }
+
+    std::string cached;
+    {
+        std::shared_lock<std::shared_mutex> rlock(cache_mtx);
+        auto it = path_cache_map.find(path);
+        if (it != path_cache_map.end()) cached = it->second;
+    }
+    if (cached.empty()) { fail(); return (hg_return_t)ret; }   // not ours -> target falls back
+
+    int fd = open(cached.c_str(), O_RDONLY);
+    if (fd < 0) { fail(); return (hg_return_t)ret; }
+
+    st->buffer = malloc((size_t)len);
+    if (!st->buffer) { close(fd); fail(); return (hg_return_t)ret; }
+
+    // Read [offset, offset+len), looping on short pread.
+    char *buf = (char *)st->buffer;
+    size_t want = (size_t)len, got = 0;
+    bool herr = false;
+    while (got < want) {
+        ssize_t n = pread(fd, buf + got, want - got, offset + (int64_t)got);
+        if (n < 0) { if (errno == EINTR) continue; herr = true; break; }
+        if (n == 0) break;   // EOF
+        got += (size_t)n;
+    }
+    close(fd);
+    if (herr && got == 0) { fail(); return (hg_return_t)ret; }
+    st->size = (hg_size_t)got;
+
+    const struct hg_info *hgi = HG_Get_info(handle);
+    ret = HG_Bulk_create(hgi->hg_class, 1, &st->buffer, &st->size,
+                         HG_BULK_READ_ONLY, &st->local_bulk);
+    if (ret != 0) {                       // resource exhaustion etc. -> fail gracefully
+        st->local_bulk = HG_BULK_NULL;
+        L4C_ERR("migrate serve: HG_Bulk_create failed (%d)", ret);
+        fail();
+        return (hg_return_t)ret;
+    }
+    // PUSH source buffer -> target's receive bulk (origin).
+    ret = HG_Bulk_transfer(hgi->context, fitcache_migrate_chunk_bulk_cb, st,
+                           HG_BULK_PUSH, hgi->addr, st->in.bulk_handle, 0,
+                           st->local_bulk, 0, st->size, HG_OP_ID_IGNORE);
+    if (ret != 0) {                       // transfer setup failed; cb won't fire
+        L4C_ERR("migrate serve: HG_Bulk_transfer failed (%d)", ret);
+        HG_Bulk_free(st->local_bulk);
+        st->local_bulk = HG_BULK_NULL;
+        fail();
+        return (hg_return_t)ret;
+    }
+    return (hg_return_t)ret;
+}
+
+hg_id_t
+fitcache_migrate_chunk_rpc_register_server(void)
+{
+    hg_id_t tmp = MERCURY_REGISTER(
+        hg_class, "fitcache_migrate_chunk_rpc",
+        fitcache_migrate_chunk_in_t, fitcache_migrate_chunk_out_t,
+        fitcache_migrate_chunk_rpc_handler);
+    g_migrate_chunk_id = tmp;
+    return tmp;
+}
+
+hg_id_t
+fitcache_migrate_chunk_get_id(void)
+{
+    return g_migrate_chunk_id;
+}
+
+// ----- Target-side blocking single-chunk pull -----
+// Refcounted state so the forward callback can safely fire even after the
+// data-mover thread has timed out and moved on. The LAST of {callback, waiter}
+// to release tears down the Mercury handle/bulk/addr and frees the state.
+// notify is done UNDER the lock so the woken waiter cannot destroy the cv
+// mid-notify (the classic "cv destroyed by woken thread" race).
+namespace {
+struct MigratePullState {
+    std::mutex              m;
+    std::condition_variable cv;
+    bool                    done = false;
+    int64_t                 ret  = -1;
+    std::atomic<int>        refs{2};        // waiter + callback
+    hg_handle_t             handle     = NULL;
+    hg_bulk_t               local_bulk = HG_BULK_NULL;
+    hg_addr_t               addr       = NULL;
+};
+
+void migrate_pull_release(MigratePullState *st)
+{
+    if (st->refs.fetch_sub(1) == 1) {       // last out frees everything
+        if (st->local_bulk != HG_BULK_NULL) HG_Bulk_free(st->local_bulk);
+        if (st->handle) HG_Destroy(st->handle);
+        if (st->addr)   HG_Addr_free(hg_class, st->addr);
+        delete st;
+    }
+}
+
+hg_return_t fitcache_migrate_pull_cb(const struct hg_cb_info *info)
+{
+    MigratePullState *st = (MigratePullState *)info->arg;
+    int64_t r = -1;
+    if (info->ret == HG_SUCCESS) {
+        fitcache_migrate_chunk_out_t out;
+        if (HG_Get_output(info->info.forward.handle, &out) == HG_SUCCESS) {
+            r = out.ret;
+            HG_Free_output(info->info.forward.handle, &out);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(st->m);
+        st->ret  = r;
+        st->done = true;
+        st->cv.notify_one();                // notify under the lock (destruction-safe)
+    }
+    migrate_pull_release(st);
+    return HG_SUCCESS;
+}
+
+// Per-chunk timeout (seconds). A 1 GiB chunk over the fabric is seconds; a dead
+// peer must not wedge the data mover, so we cap the wait and HG_Cancel.
+int migrate_pull_timeout_sec()
+{
+    const char *e = getenv("FitCache_MIGRATE_TIMEOUT_SEC");
+    int v = e ? atoi(e) : 0;
+    return (v > 0) ? v : 300;
+}
+}  // namespace
+
+int64_t
+fitcache_comm_migrate_pull_chunk(const std::string &src_addr, const std::string &path,
+                                 int64_t offset, int64_t len, void *buf, size_t buf_cap)
+{
+    if (len <= 0 || (size_t)len > buf_cap || buf == NULL) return -1;
+
+    hg_addr_t addr = NULL;
+    if (HG_Addr_lookup2(hg_class, src_addr.c_str(), &addr) != HG_SUCCESS || addr == NULL) {
+        L4C_ERR("migrate pull: cannot resolve src addr %s", src_addr.c_str());
+        return -1;
+    }
+    hg_handle_t handle = NULL;
+    if (HG_Create(hg_context, addr, g_migrate_chunk_id, &handle) != HG_SUCCESS) {
+        HG_Addr_free(hg_class, addr);
+        return -1;
+    }
+    hg_size_t bsz = (hg_size_t)len;
+    hg_bulk_t local_bulk = HG_BULK_NULL;
+    if (HG_Bulk_create(hg_class, 1, &buf, &bsz, HG_BULK_WRITE_ONLY, &local_bulk) != HG_SUCCESS) {
+        HG_Destroy(handle); HG_Addr_free(hg_class, addr);
+        return -1;
+    }
+
+    // Path fits a stack buffer (bounded by the filesystem PATH_MAX); no malloc,
+    // and HG_Forward serializes the input synchronously so the buffer is only
+    // needed until HG_Forward returns.
+    char path_buf[4096];
+    if (path.size() >= sizeof(path_buf)) {
+        HG_Bulk_free(local_bulk); HG_Destroy(handle); HG_Addr_free(hg_class, addr);
+        return -1;
+    }
+    (void)snprintf(path_buf, sizeof(path_buf), "%s", path.c_str());
+
+    MigratePullState *st = new MigratePullState();
+    st->handle     = handle;
+    st->local_bulk = local_bulk;
+    st->addr       = addr;
+
+    fitcache_migrate_chunk_in_t in;
+    in.path        = path_buf;
+    in.offset      = offset;
+    in.len         = len;
+    in.bulk_handle = local_bulk;
+
+    hg_return_t hr = HG_Forward(handle, fitcache_migrate_pull_cb, st, &in);
+
+    int64_t result = -1;
+    if (hr != HG_SUCCESS) {
+        L4C_ERR("migrate pull: HG_Forward failed %d", hr);
+        migrate_pull_release(st);           // callback will not fire; drop its ref
+    } else {
+        std::unique_lock<std::mutex> lk(st->m);
+        auto deadline = std::chrono::steady_clock::now()
+                      + std::chrono::seconds(migrate_pull_timeout_sec());
+        if (st->cv.wait_until(lk, deadline, [&] { return st->done; })) {
+            result = st->ret;
+        } else {
+            L4C_ERR("migrate pull: timeout on chunk @%lld of %s",
+                    (long long)offset, path.c_str());
+            HG_Cancel(st->handle);          // force the callback to fire (HG_CANCELED)
+            result = -1;
+        }
+    }
+
+    migrate_pull_release(st);               // drop the waiter ref (last out tears down)
+    return result;
 }

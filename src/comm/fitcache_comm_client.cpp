@@ -234,6 +234,7 @@ static hg_id_t fitcache_client_rpc_id;
 static hg_id_t fitcache_client_open_id;
 static hg_id_t fitcache_client_close_id;
 static hg_id_t fitcache_client_seek_id;
+static hg_id_t fitcache_client_prefetch_id;
 
 /* Mercury Data Caching */
 static std::mutex address_cache_mutex;  // Protects address_cache
@@ -476,6 +477,7 @@ void fitcache_client_comm_register_rpc()
     fitcache_client_rpc_id = fitcache_rpc_register_client();    
     fitcache_client_close_id = fitcache_close_rpc_register_client();
     fitcache_client_seek_id = fitcache_seek_rpc_register_client();
+    fitcache_client_prefetch_id = fitcache_prefetch_rpc_register_client();
 }
 
 // ========== Updated Blocking Functions ==========
@@ -655,6 +657,55 @@ void fitcache_client_comm_gen_open_rpc(uint32_t svr_hash, string path, int fd)
 
     return;
 
+}
+
+// Callback for a fire-and-forget prefetch forward: log the ack, free the
+// output, destroy the handle. The app does not block on the prefetch.
+static hg_return_t fitcache_prefetch_cb(const struct hg_cb_info *info)
+{
+    hg_handle_t h = info->info.forward.handle;
+    if (info->ret == HG_SUCCESS) {
+        fitcache_prefetch_out_t out;
+        if (HG_Get_output(h, &out) == HG_SUCCESS) {
+            L4C_INFO("Prefetch ack: status=%d tier=%d", out.status, out.tier);
+            HG_Free_output(h, &out);
+        }
+    }
+    HG_Destroy(h);
+    return HG_SUCCESS;
+}
+
+// Client-side: forward a prefetch hint for `path` to server slot `svr_hash`.
+// Fire-and-forget — the server enqueues promotion and we return without
+// waiting for the response (it arrives on the progress thread via the cb).
+void fitcache_client_comm_gen_prefetch_rpc(uint32_t svr_hash, const std::string &path,
+                                           int replication_mode, int replication_cap)
+{
+    hg_addr_t svr_addr = fitcache_client_comm_lookup_addr(svr_hash);
+    if (!svr_addr) {
+        L4C_ERR("Prefetch RPC: could not resolve server rank %d (missing .ports.cfg?)",
+                (int)svr_hash);
+        return;
+    }
+
+    hg_handle_t handle;
+    fitcache_comm_create_handle(svr_addr, fitcache_client_prefetch_id, &handle);
+
+    fitcache_prefetch_in_t in;
+    in.path = (hg_string_t)malloc(path.size() + 1);
+    sprintf(in.path, "%s", path.c_str());
+    in.target_slot      = (int32_t)svr_hash;
+    in.replication_mode = (int32_t)replication_mode;
+    in.replication_cap  = (int32_t)replication_cap;
+    in.dataset_hash     = 0;
+
+    hg_return_t ret = HG_Forward(handle, fitcache_prefetch_cb, NULL, &in);
+    free(in.path);
+    fitcache_comm_free_addr(svr_addr);
+    if (ret != HG_SUCCESS) {
+        L4C_ERR("Prefetch RPC: HG_Forward failed ret=%d", ret);
+        HG_Destroy(handle);
+    }
 }
 
 void fitcache_client_comm_gen_read_rpc(uint32_t svr_hash, int localfd, void *buffer, ssize_t count, off_t offset)
@@ -1049,6 +1100,16 @@ fitcache_peer_lookup_rpc_register_client(void)
     hg_id_t tmp = MERCURY_REGISTER(
         hg_class, "fitcache_peer_lookup_rpc",
         fitcache_peer_lookup_in_t, fitcache_peer_lookup_out_t,
+        NULL);
+    return tmp;
+}
+
+hg_id_t
+fitcache_prefetch_rpc_register_client(void)
+{
+    hg_id_t tmp = MERCURY_REGISTER(
+        hg_class, "fitcache_prefetch_rpc",
+        fitcache_prefetch_in_t, fitcache_prefetch_out_t,
         NULL);
     return tmp;
 }

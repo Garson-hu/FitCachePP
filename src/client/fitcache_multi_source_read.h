@@ -27,6 +27,13 @@ ssize_t ms_read(int fd, void* buf, size_t count, int64_t offset);
 int fitcache_resolve_cached_path(const char *original_path,
                                  char *out, size_t outsz);
 
+// Prefetch hint (TPDS prefetch-informed migration). The application calls this
+// to declare a file it is about to mmap; FitCachePP forwards the hint to the
+// owning server, which promotes the file ahead of the read. replication_mode
+// follows fitcache_replication_mode_t (0 = unbounded = today's behavior).
+// Returns 0 if the hint was sent, <0 on a bad path / no server. Non-blocking.
+int fitcache_prefetch(const char *original_path, int replication_mode);
+
 // A structure to hold the asynchronous state for the multi-source read.
 // Visible to wrappers.c (via this header) only as an opaque struct; only
 // the C++ implementation accesses its fields.

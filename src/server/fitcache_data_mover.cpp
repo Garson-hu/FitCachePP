@@ -12,6 +12,9 @@
 #include <chrono>
 #include <utility>
 #include <vector>
+#include <fcntl.h>       // open(), O_CREAT/O_WRONLY
+#include <cstdlib>       // malloc/free
+#include <cstdio>        // rename()
 #include "fitcache_logging.h"
 #include "fitcache_data_mover_internal.h"
 #include "fitcache_cache_policy.h"
@@ -41,6 +44,141 @@ shared_mutex cache_mtx;                       // & Mutex for the path cache
 queue<string> data_queue;               // & List of files to be moved
 
 std::atomic<bool> fitcache_eviction_reaper_running{false};
+
+// ---- Peer->local migration (TPDS prefetch-informed migration) ----
+// Streams one cached copy of `original_path` from peer `src_addr` to this
+// node's local tier in <=1 GiB chunks, then lands it exactly like the data
+// mover lands a PFS promote (hash-bin path + path_cache_map + sidecar +
+// presence broadcast). Bounded memory: only one CHUNK buffer is held.
+int fitcache_server_migrate_file(const std::string &original_path,
+                                 const std::string &src_addr, int requested_tier)
+{
+    // Already cached locally? Nothing to do.
+    {
+        std::shared_lock<std::shared_mutex> rlock(cache_mtx);
+        if (path_cache_map.find(original_path) != path_cache_map.end()) return 0;
+    }
+
+    // Size from the PFS original (the cached copy is byte-identical, same size).
+    uint64_t file_size = 0;
+    try {
+        file_size = fs::file_size(original_path);
+    } catch (const fs::filesystem_error &e) {
+        L4C_ERR("migrate: stat %s failed: %s", original_path.c_str(), e.what());
+        return -1;
+    }
+    if (file_size == 0) { L4C_ERR("migrate: %s is empty", original_path.c_str()); return -1; }
+
+    // Target tier base (default NVMe; DRAM if explicitly requested and set).
+    const char *nvme = getenv("FitCache_NVME_PATH");
+    const char *dram = getenv("FitCache_DRAM_PATH");
+    const char *pmem = getenv("FitCache_PMEM_PATH");
+    std::string base;
+    cache_tier_t actual_tier = CACHE_TIER_NVME;
+    if      (requested_tier == CACHE_TIER_DRAM && dram && dram[0]) { base = dram; actual_tier = CACHE_TIER_DRAM; }
+    else if (requested_tier == CACHE_TIER_PMEM && pmem && pmem[0]) { base = pmem; actual_tier = CACHE_TIER_PMEM; }
+    else if (nvme && nvme[0])                                      { base = nvme; actual_tier = CACHE_TIER_NVME; }
+    else if (pmem && pmem[0])                                      { base = pmem; actual_tier = CACHE_TIER_PMEM; }
+    else if (dram && dram[0])                                      { base = dram; actual_tier = CACHE_TIER_DRAM; }
+    else { L4C_ERR("migrate: no tier path set (FitCache_NVME_PATH/DRAM_PATH/PMEM_PATH)"); return -1; }
+
+    // Deterministic hash-bin path (same scheme as the data mover + resolver).
+    size_t h = std::hash<std::string>{}(original_path);
+    char subdir[16];
+    snprintf(subdir, sizeof(subdir), "%02zx/%02zx", (h >> 8) & 0xFF, h & 0xFF);
+    std::string dirpath = base + "/" + subdir;
+    try { fs::create_directories(dirpath); } catch (const std::exception &e) {
+        L4C_ERR("migrate: mkdir %s: %s", dirpath.c_str(), e.what()); return -1;
+    }
+    std::string dst = dirpath + "/" + fs::path(original_path).filename().string();
+    // Unique temp name so two concurrent migrations of the same path (different
+    // Mercury handler threads) cannot collide on the .part file.
+    static std::atomic<uint64_t> migrate_seq{0};
+    std::string tmp = dst + ".part." + std::to_string(getpid()) + "." +
+                      std::to_string(migrate_seq.fetch_add(1));
+
+    int dfd = open(tmp.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (dfd < 0) { L4C_ERR("migrate: open %s: %s", tmp.c_str(), strerror(errno)); return -1; }
+
+    const size_t CHUNK = (size_t)1 << 30;   // 1 GiB (a single bulk RMA caps near 2 GiB)
+    void *buf = malloc(CHUNK);
+    if (!buf) { close(dfd); unlink(tmp.c_str()); return -1; }
+
+    int rc = 0;
+    uint64_t done = 0;
+    while (done < file_size) {
+        uint64_t rem  = file_size - done;
+        size_t   want = (rem < CHUNK) ? (size_t)rem : CHUNK;
+        int64_t got = fitcache_comm_migrate_pull_chunk(src_addr, original_path,
+                                                       (int64_t)done, (int64_t)want, buf, CHUNK);
+        if (got <= 0) {
+            L4C_ERR("migrate: pull chunk @%llu of %s failed (ret=%lld)",
+                    (unsigned long long)done, original_path.c_str(), (long long)got);
+            rc = -1; break;
+        }
+        size_t w = 0; const char *p = (const char *)buf;
+        while (w < (size_t)got) {
+            ssize_t n = write(dfd, p + w, (size_t)got - w);
+            if (n < 0) { if (errno == EINTR) continue; rc = -1; break; }
+            w += (size_t)n;
+        }
+        if (rc != 0) break;
+        done += (uint64_t)got;
+        if ((size_t)got < want) break;   // short pull => source hit EOF early
+    }
+    free(buf);
+
+    if (rc != 0 || done != file_size) {
+        close(dfd); unlink(tmp.c_str());
+        L4C_ERR("migrate: incomplete %s (%llu/%llu bytes)", original_path.c_str(),
+                (unsigned long long)done, (unsigned long long)file_size);
+        return -1;
+    }
+    if (close(dfd) != 0)               { unlink(tmp.c_str()); return -1; }
+    if (rename(tmp.c_str(), dst.c_str()) != 0) {
+        L4C_ERR("migrate: rename %s -> %s: %s", tmp.c_str(), dst.c_str(), strerror(errno));
+        unlink(tmp.c_str()); return -1;
+    }
+
+    // Land it: register, account, sidecar (SINGLE_COPY), presence broadcast.
+    {
+        std::unique_lock<std::shared_mutex> wlock(cache_mtx);
+        path_cache_map[original_path] = dst;
+    }
+    // Charge the tier the file actually landed in (eviction watermarks are
+    // per-tier; mis-charging NVMe for a DRAM file breaks both watermarks).
+    if      (actual_tier == CACHE_TIER_DRAM) g_dram_used_bytes += file_size;
+    else if (actual_tier == CACHE_TIER_PMEM) g_pmem_used_bytes += file_size;
+    else                                     g_nvme_used_bytes += file_size;
+    if (fitcache::persist_meta_enabled()) {
+        fitcache::fitcache_file_meta_v1 meta = fitcache::meta_make_initial(
+            original_path, file_size, fitcache::get_self_dataset_manifest_hash(),
+            fitcache::FITCACHE_REPL_SINGLE_COPY, 0);
+        if (fitcache::meta_write_sidecar(dst, meta) != 0)
+            L4C_ERR("migrate: sidecar write failed for %s (file is cached + usable "
+                    "locally; peer discovery still covered by the presence broadcast, "
+                    "but this server won't restore it from sidecar after a restart)",
+                    dst.c_str());
+    }
+    fitcache_broadcast_register_file(original_path);
+    L4C_INFO("migrate: %s <- %s (%llu bytes) -> %s",
+             original_path.c_str(), src_addr.c_str(),
+             (unsigned long long)file_size, dst.c_str());
+    return 0;
+}
+
+// When FitCache_PREFER_MIGRATE=1, the data mover pulls a file from a peer that
+// already caches it (peer->local migration, single cluster-wide copy) instead
+// of promoting a fresh copy from the PFS. Default off => unchanged full-promote.
+static bool migrate_preferred()
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("FitCache_PREFER_MIGRATE");
+        cached = (v && v[0] == '1') ? 1 : 0;
+    }
+    return cached != 0;
+}
 
 namespace {
 
@@ -435,6 +573,22 @@ void *fitcache_data_mover_fn(void *args)
         {
             L4C_INFO("Data mover: Moving file %s", local_list.front().c_str());
             string original_path = local_list.front();
+
+            // 1x single-copy policy: if a peer already caches this file, pull it
+            // peer->local (migration) rather than promoting a fresh copy from the
+            // PFS. The prefetch hint routed this enqueue to the requester's own
+            // node, so the migrated copy lands where the upcoming mmap needs it.
+            if (migrate_preferred() && fitcache::cross_job_enabled()) {
+                std::string src = fitcache_remote_presence_lookup(original_path);
+                if (!src.empty() &&
+                    fitcache_server_migrate_file(original_path, src, CACHE_TIER_NVME) == 0) {
+                    L4C_INFO("Data mover: migrated %s from peer %s (1x single-copy)",
+                             original_path.c_str(), src.c_str());
+                    local_list.pop();
+                    continue;
+                }
+                // peer absent or migrate failed -> fall through to PFS promote
+            }
 
             // (&used_dram_bytes, &used_nvme_bytes);
 

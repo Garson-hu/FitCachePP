@@ -70,4 +70,14 @@ int fitcache_data_mover_refresh_from_siblings_once();
 void *fitcache_sibling_refresh_fn(void *arg);
 extern std::atomic<bool> fitcache_sibling_refresh_running;
 
+// Pull a single cached copy of `original_path` from a peer server `src_addr`
+// into this node's local tier (peer->local migration, TPDS). Streams the whole
+// file in <=1 GiB chunks via fitcache_comm_migrate_pull_chunk, writes it at the
+// deterministic hash-bin path, registers it in path_cache_map, writes a sidecar
+// tagged replication_mode=SINGLE_COPY, and broadcasts presence. Returns 0 on
+// success (or if already cached locally), <0 on failure (caller falls back to a
+// PFS promote). requested_tier is CACHE_TIER_DRAM/NVME (default NVMe).
+int fitcache_server_migrate_file(const std::string &original_path,
+                                 const std::string &src_addr, int requested_tier);
+
 #endif //__FitCache_DATA_MOVER_INTERNAL_H__

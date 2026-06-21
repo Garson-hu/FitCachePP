@@ -1,6 +1,8 @@
 #include <csignal>   // signal
 #include <cstdlib>   // exit
 #include <atomic>
+#include <thread>
+#include <string>
 #include <iostream>
 #include <string.h>
 #include <pthread.h>
@@ -132,6 +134,8 @@ int fitcache_start_comm_server(void)
     fitcache_open_rpc_register_server();
     fitcache_close_rpc_register_server();
     fitcache_seek_rpc_register_server();
+    fitcache_prefetch_rpc_register_server();   // TPDS prefetch-informed migration
+    fitcache_migrate_chunk_rpc_register_server();  // TPDS peer->local migration primitive
 
     // // ! Register the trigger RPC
     // fitcache_trigger_srv_print_stats_rpc_register();
@@ -212,6 +216,32 @@ int fitcache_start_comm_server(void)
         if (restored > 0) {
             L4C_INFO("Sidecar warm-restart: restored %d cached files from "
                      "sidecar metadata", restored);
+        }
+    }
+
+    // TEST-ONLY: peer->local migration self-test. When FitCache_MIGRATE_SELFTEST
+    // names a PFS path, spawn a thread that waits (<=60s) for a peer to announce
+    // it caches that path (cross-job presence broadcast), then migrates it into
+    // this server's local tier and logs the result. Lets a localhost 2-server
+    // smoke validate the migrate primitive over real Mercury bulk with no client.
+    {
+        const char *selftest = std::getenv("FitCache_MIGRATE_SELFTEST");
+        if (selftest && selftest[0]) {
+            std::string mpath = selftest;
+            std::thread([mpath]() {
+                for (int i = 0; i < 60; i++) {
+                    std::string src = fitcache_remote_presence_lookup(mpath);
+                    if (!src.empty()) {
+                        L4C_INFO("MIGRATE_SELFTEST: %s announced by peer %s; migrating",
+                                 mpath.c_str(), src.c_str());
+                        int rc = fitcache_server_migrate_file(mpath, src, CACHE_TIER_NVME);
+                        L4C_INFO("MIGRATE_SELFTEST: result rc=%d for %s", rc, mpath.c_str());
+                        return;
+                    }
+                    sleep(1);
+                }
+                L4C_ERR("MIGRATE_SELFTEST: no peer announced %s within 60s", mpath.c_str());
+            }).detach();
         }
     }
 
