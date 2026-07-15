@@ -73,6 +73,34 @@ each runs as the first reader of its corpus after an ≥8.5&nbsp;h cool-down (on
 <p class="note"><strong>Read:</strong> with per-scale cold baselines the speedup is <strong>17–46× through 128 GPUs</strong>, tapering as the per-node slice shrinks (4.8×/3.6× at 256/512 GPUs) and reaching ~1× at 1024+ GPUs, where the ≤8&nbsp;GB slice sits in RAM — the regime where caching is unnecessary by construction. Warm is cache-served throughout (1–9&nbsp;s) while
 per-node data shrinks 537G→4G (1×). At 2048 GPUs the 4&nbsp;GB slice confirms it: native itself takes only ~4&nbsp;s, so there is essentially no I/O left to accelerate (0.9×).</p>
 
+<h2>1.1b — Megatron WEAK scaling (128&nbsp;GiB/node constant) — 1× footprint <span class="badge done">FINAL</span></h2>
+<p class="note">Same real loader and layout as §1.1 (8 DataLoader ranks/node × 4 workers, random document reads),
+but the dataset <em>grows with the cluster</em>: every node always owns 32 × 4&nbsp;GiB = <strong>128&nbsp;GiB</strong>
+of a 64&nbsp;TiB corpus (<code>synth_weak_16320x4gb</code>), so the per-node working set never enters the RAM regime.
+Each scale reads a <strong>disjoint</strong> shard range never touched before its run (per-scale cold natives,
+≥8.5&nbsp;h slots); cache/node confirmed at 137.4&nbsp;GB (1×) at every scale. Map:
+<code>megatron_weak_1x/ladder_map.txt</code>.</p>
+<table>
+<tr><th>Nodes</th><th>GPUs</th><th>Native cold (s)</th><th>FCPP warm (s)</th><th>Speedup</th><th>cache/node</th></tr>
+<tr><td>2</td><td>16</td><td>40.3</td><td>0.74</td><td><strong>54×</strong></td><td>128&nbsp;GiB</td></tr>
+<tr><td>4</td><td>32</td><td>21.0</td><td>0.88</td><td><strong>24×</strong></td><td>128&nbsp;GiB</td></tr>
+<tr><td>8</td><td>64</td><td>24.2</td><td>1.01</td><td><strong>24×</strong></td><td>128&nbsp;GiB</td></tr>
+<tr><td>16</td><td>128</td><td>95.2</td><td>1.12</td><td><strong>85×</strong></td><td>128&nbsp;GiB</td></tr>
+<tr><td>32</td><td>256</td><td>137.5</td><td>1.23</td><td><strong>112×</strong></td><td>128&nbsp;GiB</td></tr>
+<tr><td>64</td><td>512</td><td>97.3</td><td>1.59</td><td><strong>61×</strong></td><td>128&nbsp;GiB</td></tr>
+<tr><td>128</td><td>1024</td><td>144.9</td><td>1.95</td><td><strong>74×</strong></td><td>128&nbsp;GiB</td></tr>
+<tr><td>256</td><td>2048</td><td>53.5</td><td>3.66</td><td><strong>15×</strong></td><td>128&nbsp;GiB</td></tr>
+</table>
+<p class="note"><strong>Read:</strong> when the dataset scales with the machine — the realistic large-training
+regime — the benefit is <strong>sustained at every scale up to 2048 GPUs (15–112×)</strong>, in contrast to the
+strong-scaling table above where the fixed 1&nbsp;TiB corpus shrinks into RAM at 1024+ GPUs. The two sides move
+oppositely: the warm epoch stays nearly flat (0.7&nbsp;s → 3.7&nbsp;s; all I/O is node-local NVMe), while the
+cold-Lustre native epoch is large and grows noisy with concurrent-reader contention (21&nbsp;s → 145&nbsp;s across
+scales; hundreds-to-thousands of ranks issuing random small reads against the shared PFS). Speedup therefore tracks
+Lustre's contention behavior, not a cache limitation — exactly the <em>T<sub>pfs</sub></em>-contention regime of the
+performance model. This is the headline scaling result: FitCache++ turns a contended shared-PFS workload into a
+scale-invariant node-local one.</p>
+
 <h2>1.2 — Vision (real torch DataLoader, 150&nbsp;KB image records) — 1× footprint <span class="badge done">FINAL</span></h2>
 <p class="note">Corpus <code>synth_2tb_256x8gb_img</code>: 256 × 8&nbsp;GiB shards of fixed 150,528-byte records
 (3×224×224 uint8; ~14.6&nbsp;M images, 2&nbsp;TiB). Same whole-shard 1/N partition → 1×. Random whole-record reads,
@@ -170,7 +198,9 @@ files themselves.</p>
 when the working set fits tmpfs the native baseline page-caches it too and the sustained gap washes out. NVMe backs the headline.</p>
 
 <footer>
-Last updated: 2026-07-12. <strong>Per-scale cold ladder COMPLETE (16/16)</strong> — every scale measured as the first
+Last updated: 2026-07-15. <strong>Weak-scaling ladder COMPLETE (8/8)</strong> — 128&nbsp;GiB/node constant, disjoint
+cold shard ranges: 15–112× sustained through 2048 GPUs (§1.1b). <strong>Per-scale cold (strong) ladder COMPLETE
+(16/16)</strong> — every scale measured as the first
 reader of its corpus after a cool-down. Megatron: 30.2×/46.1×/30.1×/17.2× at 16–128 GPUs → 4.8×/3.6× at 256–512 →
 0.8×/0.9× at 1024–2048 (≤8&nbsp;GB slices sit in RAM: caching unnecessary by construction). Vision: 5.2× at 16–32 GPUs;
 ~1× and below from 64 GPUs (node-SSD class + DataLoader ceiling; 100% cache hits verified). GNN: 18.8×→24.1×, N×.
