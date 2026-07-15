@@ -39,12 +39,13 @@
 
 <h1>FitCachePP TPDS Extension — Final Design</h1>
 <p class="note">System view of the mechanisms that back the paper claims. Companion pages:
-<a href="../EXPERIMENTS_STATUS.html">EXPERIMENTS_STATUS.html</a> ·
-<a href="experiments.html">experiments.html</a> ·
-<a href="paper.html">paper.html</a>.</p>
+<a href="experiments.html">experiments.html</a> (results) ·
+<a href="experiments_methodology.html">experiments_methodology.html</a> (how) ·
+<a href="implementation_walkthrough.html">implementation_walkthrough.html</a> (code).</p>
 
 <h2>Pipeline overview</h2>
-<p>FitCachePP is an LD_PRELOAD client paired with Mercury-RPC metadata/data servers (default 4 servers/node). An application's
+<p>FitCachePP is an LD_PRELOAD client paired with Mercury-RPC metadata/data servers (one server per node in all reported
+experiments). An application's
 file access is intercepted transparently; on a warm hit the data is served from a node-local cached copy held in a local cache
 tier (DRAM/tmpfs &rarr; PMem &rarr; NVMe), on a cold miss from the parallel filesystem (PFS) while the file is promoted to local cache for
 next time. The new piece is <strong>prefetch-informed migration</strong>: an application declares the files it is about to
@@ -106,6 +107,17 @@ file in whichever local tier holds it (DRAM/PMem/NVMe), so the kernel page-fault
 <em>open</em> time (the mmap/fd-reuse pattern made a close-time RPC skip leave the cache empty). The populate path copies in
 &le;1 GiB chunks and the server loops on short reads, so files larger than ~2 GiB are no longer truncated. Eviction safety relies
 on Linux unlink-while-mapped semantics protecting active mappings.</p>
+<p><strong>2026-07 hardening (required at 8 ranks/node scale, shipped before the headline runs):</strong></p>
+<ul>
+<li><strong>PFS-free warm resolve.</strong> The resolver verifies the cached copy with a <em>local</em> <code>stat</code>; if a
+<code>.meta</code> sidecar exists it additionally checks recorded size + original path. No per-<code>mmap</code> PFS
+<code>stat</code> — at 2048 ranks the old PFS stat was itself a metadata storm.</li>
+<li><strong>Open-RPC skip on warm hit.</strong> When the resolver hits, the open-time promotion RPC is skipped entirely (the file
+is already local), removing per-open server traffic from the warm path.</li>
+<li><strong>fstat coverage guard.</strong> Before <code>__real_mmap</code> of a cached file, an <code>fstat</code> confirms the
+cached copy covers <code>offset+length</code>; if not (an in-flight promotion), the mmap falls back to the native path instead of
+faulting — structurally prevents SIGBUS races.</li>
+</ul>
 
 <h2>Mechanism 2 — Prefetch-informed migration + limited replication <span class="badge done">DONE</span></h2>
 <p>A warm hit requires the cached file on the requester's own node, but on Frontier a node cannot <code>mmap</code> a peer's NVMe
@@ -144,13 +156,41 @@ prefetches only its own 1/N partition, so partitionable workloads keep the datas
 can touch any row) cannot shrink to 1/N and falls back to a wider replication mode, but still wins the warm hit; see
 <a href="experiments.html">experiments.html</a> for the per-workload breakdown.</p>
 
+<h3>Implementation shape (merged from the standalone prefetch-migration design note)</h3>
+<pre><code>[dataloader] next epoch needs a,b → fitcache_prefetch(a,b)          (A) app-facing API
+       │ (overlapped with this epoch's compute)
+       ▼
+[server] prefetch RPC → remote_presence_map: a is on node X          (B) prefetch RPC + handler
+       → peer-migrate RPC: pull whole file a from X to local NVMe    (C) whole-file primitive
+       → register path_cache_map + record replication_mode           (reuse)
+       → source copy evictable (SINGLE_COPY) / kept (BOUNDED_k)      (E) eviction policy
+       ▼
+[client] mmap(a) → resolver stats local tier → local zero-copy mmap  (reuse, automatic)</code></pre>
+<table>
+<tr><th>Component</th><th>Where</th><th>Status</th></tr>
+<tr><td>(A) <code>fitcache_prefetch(path, replication_mode)</code> client API</td><td><code>src/client/fitcache_multi_source_read.{h,cpp}</code>, exported via <code>wrappers.c</code>; benchmarks drive it through <code>benchmarks/fitcache_prefetch_shim.py</code> (ctypes)</td><td>new</td></tr>
+<tr><td>(B) prefetch RPC + handler (PREFETCH priority)</td><td><code>src/comm/fitcache_comm.h</code> (<code>fitcache_prefetch_in/out_t</code> incl. <code>replication_cap</code>); <code>fitcache_comm_server.cpp:922</code></td><td>new</td></tr>
+<tr><td>(C) <code>fitcache_server_migrate_file()</code> — whole-file peer→local bulk transfer (the crux; before it, remote hits were per-<code>pread</code> RPC bytes)</td><td><code>src/server/fitcache_data_mover.cpp:53</code>; invoked from prefetch path (<code>fitcache_server.cpp:237</code>) and open-time promote (<code>:584</code>)</td><td>new</td></tr>
+<tr><td>(D) priority promotion queue (prefetch before reactive promotes)</td><td><code>fitcache_data_mover.cpp</code> queue entry {path, priority, replication_mode}</td><td>small change</td></tr>
+<tr><td>(E) <code>replication_mode</code>/<code>cap</code> persisted + eviction hook (SINGLE_COPY source freed once a copy exists elsewhere; BOUNDED_k caps copies)</td><td><code>src/cross_job/fitcache_persistent_meta.h</code>; victim selection <code>fitcache_cross_job.cpp</code></td><td>new field + policy</td></tr>
+<tr><td>(F) source/target discovery</td><td><code>remote_presence_map</code>, <code>select_server_for_path</code> / node-local placement</td><td>reuse</td></tr>
+</table>
+<p class="note"><strong>Effort verdict:</strong> the migration primitive landed as a ~200–300 LOC increment on existing
+infrastructure (data queue, <code>path_cache_map</code>, Mercury bulk, presence map, client resolver), not a new subsystem.
+<strong>Deliberately out of scope</strong> (future CXL multi-tier work): automatic hint inference (reuse-distance/ML),
+cluster-wide bounded-k census, multi-job sharing, preemption durability.</p>
+
 <h2>Mechanism 3 — .meta file cache-state recovery <span class="badge supp">Supporting</span></h2>
-<p>The data mover writes a <code>.meta</code> file per cached file on organic promotion. After a metadata-service restart,
-<code>restore_from_sidecars</code> rebuilds the server-side cache-state map (eviction/promotion accounting, including the recorded
-<code>replication_mode</code>). The client warm-hit
-resolver is independent of the server map: it recomputes the deterministic cached path and <code>stat</code>s the local cache tier, so as
-long as the cached files persist on local storage (the burst buffer in the Frontier runs) the client warm-hits in both the with- and without-.meta file arms. The .meta file
-therefore restores reusable cache <em>state</em> and reduces cold metadata recovery; it is not the bandwidth source.</p>
+<p>The data mover writes a <code>.meta</code> file per cached file on organic (open-triggered) promotion. After a metadata-service
+restart, <code>restore_from_sidecars</code> rebuilds the server-side cache-state map (eviction/promotion accounting, including the
+recorded <code>replication_mode</code>). The client warm-hit resolver is independent of the server map: it recomputes the
+deterministic cached path and <code>stat</code>s the local cache tier, so as long as the cached files persist on local storage
+(the burst buffer in the Frontier runs) the client warm-hits in both the with- and without-.meta file arms. Since the 2026-07
+fixes the sidecar is also consulted on the warm hot path when present (size + original-path verification). The .meta file
+therefore restores reusable cache <em>state</em> and reduces cold metadata recovery; it is not the bandwidth source.
+<strong>Scoping:</strong> the prefetch/populate path used by the headline experiments does <em>not</em> write sidecars, so
+server-side restore currently covers on-demand-promoted data; client-side warm correctness is unaffected either way
+(validated in <a href="experiments.html">experiments.html</a> Part 2).</p>
 
 <h2>Future work — cross-job cache sharing <span class="badge supp">Future work</span></h2>
 <p>Cross-job sharing (<code>FitCache_CROSS_JOB=1</code>, HRW/peer-read path) remains future work only; no new compute is spent on
@@ -174,8 +214,11 @@ Fixed with the server short-read loop and &le;1 GiB chunked populate.</li>
 </ul>
 
 <footer>
-Last updated: 2026-06-20 (reworked Mechanism 2 into prefetch-informed migration + limited replication; updated pipeline overview and dependency chain; removed the integrated end-to-end / replicate-all framing).<br>
-Generated from markdown source, but updated to reflect latest final results. Markdown source was not modified.
+Last updated: 2026-07-15 (merged the standalone prefetch-migration design note into Mechanism 2; added the 2026-07 client
+hardening to Mechanism 1 — PFS-free warm resolve, open-RPC skip, fstat coverage guard; scoped Mechanism 3 to
+on-demand-promoted data; fixed companion links; corrected server count to 1/node).<br>
+2026-06-20: reworked Mechanism 2 into prefetch-informed migration + limited replication; removed the integrated
+end-to-end / replicate-all framing.
 </footer>
 
 </body>

@@ -182,7 +182,7 @@ server restart ──► restore_from_sidecars() rebuilds path_cache_map</code><
         return __real_mmap(addr, length, prot, flags, fd, offset);   // untracked fd → passthrough</code></pre>
 <p><code>fitcache_get_path(fd)</code> returns the original PFS path if this fd came through our <code>open</code> wrapper; otherwise we pass through. From here on we know the original path.</p>
 
-<span class="filetag">src/client/wrappers.c:532 — the warm-hit path (direct local-tier mmap, no RPC)</span>
+<span class="filetag">src/client/wrappers.c:532 — the warm-hit path (direct local-tier mmap, no RPC; 2026-07 form)</span>
 <pre><code>    char cached_path[4096];
     double __t0 = fitpp_now_us();
     int __resolved = fitcache_resolve_cached_path(path, cached_path, sizeof(cached_path));
@@ -190,6 +190,17 @@ server restart ──► restore_from_sidecars() rebuilds path_cache_map</code><
     if (__resolved) {
         int cfd = __real_open(cached_path, O_RDONLY);
         if (cfd &gt;= 0) {
+            /* SIGBUS guard: the mapping must be fully backed by the cached
+             * file RIGHT NOW (resolve raced a concurrent promotion once and a
+             * fault past EOF is a bus error, not a graceful miss). If the
+             * cached copy does not cover [offset, offset+length), fall back
+             * to the native PFS mmap. Local fstat only -- no PFS traffic. */
+            struct stat __cst;
+            if (fstat(cfd, &amp;__cst) != 0 ||
+                __cst.st_size &lt; (off_t)offset + (off_t)length) {
+                __real_close(cfd);
+                goto fitcache_mmap_native;
+            }
             int map_flags = (flags &amp; MAP_SHARED) ? MAP_SHARED : MAP_PRIVATE;
             void *m = __real_mmap(NULL, length, prot, map_flags, cfd, offset);
             __real_close(cfd);                 // inode stays alive via the mapping
@@ -199,11 +210,14 @@ server restart ──► restore_from_sidecars() rebuilds path_cache_map</code><
                 return m;                       // ← app now page-faults from the local cache tier
             }
         }
-    }</code></pre>
-<p>This is the heart of the 2026-05-21 redesign. Step by step:</p>
+    }
+
+fitcache_mmap_native:   /* cold miss / any warm-path failure lands here */</code></pre>
+<p>This is the heart of the 2026-05-21 redesign, hardened 2026-07. Step by step:</p>
 <ol>
-<li><span class="step">resolve</span> — <code>fitcache_resolve_cached_path()</code> (next section) deterministically computes where the cached copy <em>would</em> be and confirms it is present + complete. Purely client-side, <strong>no Mercury RPC</strong>. The two <code>fitcache_stat_add</code> calls time this for the shutdown profile.</li>
+<li><span class="step">resolve</span> — <code>fitcache_resolve_cached_path()</code> (next section) deterministically computes where the cached copy <em>would</em> be and confirms it is present + complete. Purely client-side, <strong>no Mercury RPC and no PFS stat</strong>. The two <code>fitcache_stat_add</code> calls time this for the shutdown profile.</li>
 <li><span class="step">open</span> — on a hit, <code>__real_open</code> the cached file on its local tier read-only (the resolver returns whichever of DRAM/PMem/NVMe matched).</li>
+<li><span class="step">coverage guard (2026-07)</span> — a local <code>fstat</code> confirms the cached copy covers <code>[offset, offset+length)</code> <em>right now</em>. A copy still being written by an in-flight promotion is short; mapping it would SIGBUS at fault time. The guard turns that race into a graceful native fallback. This is also what makes the resolver's presence-trust (next section) safe.</li>
 <li><span class="step">map</span> — <code>__real_mmap(NULL, ...)</code> on the cached fd. We honor the caller's <code>prot</code> and sharing flag (read-only, so <code>MAP_SHARED</code> has no write-back concern). The kernel will now satisfy page faults from the local cache tier instead of Lustre.</li>
 <li><span class="step">close</span> — <code>__real_close(cfd)</code> immediately. The mapping keeps the inode alive after the fd is closed (POSIX unlink/close-while-mapped semantics), which <em>also</em> protects an in-use mapping if the eviction reaper unlinks the cached file underneath us.</li>
 <li><span class="step">track + return</span> — record <code>(addr → length)</code> so <code>munmap</code> can undo it, then return the mapping. The app never knows it is reading from a local cache tier instead of the PFS.</li>
@@ -228,19 +242,16 @@ server restart ──► restore_from_sidecars() rebuilds path_cache_map</code><
 }</code></pre>
 <p>This alias matters in practice: CPython's <code>_mmap.so</code> calls <code>mmap64</code> (the explicit 64-bit variant), <em>not</em> plain <code>mmap</code>. Without intercepting <code>mmap64</code> the entire numpy.memmap path would skip our redirect. On 64-bit Linux the two are identical, so we just delegate.</p>
 
-<h3 id="m1-resolver">3b. The resolver — <code>fitcache_resolve_cached_path()</code></h3>
-<p>At <a href="../src/client/fitcache_multi_source_read.cpp#L291">fitcache_multi_source_read.cpp:291</a>. This is what makes the warm hit RPC-free: it reconstructs the cached path with the <em>same</em> hashing the server uses, then confirms completeness by size.</p>
+<h3 id="m1-resolver">3b. The resolver — <code>fitcache_resolve_cached_path()</code> <span class="badge done">2026-07 form</span></h3>
+<p>At <a href="../src/client/fitcache_multi_source_read.cpp#L316">fitcache_multi_source_read.cpp:316</a>. This is what makes the warm hit RPC-free <em>and PFS-free</em>: it reconstructs the cached path with the <em>same</em> hashing the server uses, then verifies the copy <strong>locally</strong> — the original 2026-05 version began with a <code>stat()</code> of the original path on Lustre, and at 1–2k ranks that per-mmap PFS stat serialized every warm mmap on the metadata server (~10× warm-bandwidth loss). The current resolver never touches the PFS.</p>
 
-<span class="filetag">src/client/fitcache_multi_source_read.cpp:291</span>
+<span class="filetag">src/client/fitcache_multi_source_read.cpp:316</span>
 <pre><code>extern "C" int fitcache_resolve_cached_path(const char *original_path,
                                             char *out, size_t outsz)
 {
     if (!original_path || !out || outsz == 0) return 0;
 
-    struct stat ost;
-    if (stat(original_path, &amp;ost) != 0 || ost.st_size &lt;= 0) return 0;
-    const off_t orig_size = ost.st_size;          // completeness reference
-
+    // Deterministic two-level hash bin (matches data_mover.cpp:482-488).
     size_t h = std::hash&lt;std::string&gt;{}(std::string(original_path));
     char subdir[16];
     snprintf(subdir, sizeof(subdir), "%02zx/%02zx", (h &gt;&gt; 8) &amp; 0xFF, h &amp; 0xFF);
@@ -249,6 +260,7 @@ server restart ──► restore_from_sidecars() rebuilds path_cache_map</code><
     size_t slash = op.find_last_of('/');
     std::string base = (slash == std::string::npos) ? op : op.substr(slash + 1);
 
+    // Probe tiers in placement priority order: DRAM, PMem, NVMe.
     const char *tier_env[3] = {
         getenv("FitCache_DRAM_PATH"),
         getenv("FitCache_PMEM_PATH"),
@@ -259,19 +271,30 @@ server restart ──► restore_from_sidecars() rebuilds path_cache_map</code><
         if (!t || !t[0]) continue;
         std::string cand = std::string(t) + "/" + subdir + "/" + base;
         struct stat cst;
-        if (stat(cand.c_str(), &amp;cst) == 0 &amp;&amp; S_ISREG(cst.st_mode) &amp;&amp;
-            cst.st_size == orig_size) {            // ← the completeness GATE
-            std::strncpy(out, cand.c_str(), outsz - 1);
-            out[outsz - 1] = '\0';
-            return 1;                              // warm hit
+        if (stat(cand.c_str(), &amp;cst) != 0 || !S_ISREG(cst.st_mode) ||
+            cst.st_size &lt;= 0)
+            continue;                              // not present on this tier
+        // Local completeness gate, no PFS stat. When a .meta sidecar exists,
+        // use it to reject stale/incomplete copies and hash-bin basename
+        // collisions across datasets. When it does NOT exist, accept the file.
+        fitcache::fitcache_file_meta_v1 m;
+        if (fitcache::meta_read_sidecar(cand, &amp;m) == 0) {
+            if ((off_t)m.original_size != cst.st_size)
+                continue;                          // incomplete/stale copy
+            if (std::strncmp(m.original_path, original_path,
+                             sizeof(m.original_path)) != 0)
+                continue;                          // hash-bin collision
         }
+        std::strncpy(out, cand.c_str(), outsz - 1);
+        out[outsz - 1] = '\0';
+        return 1;                                  // warm hit
     }
     return 0;                                      // miss
 }</code></pre>
 <p>The key design points:</p>
 <ul>
 <li><strong>Same hash as the server.</strong> <code>std::hash&lt;std::string&gt;</code> of the original path, then a two-level bucket <code>&lt;(h&gt;&gt;8)&amp;0xFF&gt;/&lt;h&amp;0xFF&gt;</code>. The server's data mover and the migration primitive compute the identical bucket (<a href="../src/server/fitcache_data_mover.cpp#L482">data_mover.cpp:482-484</a> and <a href="../src/server/fitcache_data_mover.cpp#L86">data_mover.cpp:86-88</a>). Client and server link the same libstdc++, so the hash value matches bit for bit — this is what lets the client reconstruct the path with no RPC.</li>
-<li><strong>The completeness gate</strong> is <code>cst.st_size == orig_size</code>. The data mover does a full <code>fs::copy</code> (and the migration primitive a full chunked pull) before a file is usable; if a partial copy is on disk its size won't match, and we correctly treat it as a miss and fall through to the PFS. This is what makes the warm hit safe to take without asking the server — and it is exactly why a migration must complete before its rename publishes the file (section 4c).</li>
+<li><strong>The completeness gate is local and sidecar-optional (2026-07).</strong> The cached file lands via an atomic rename, so its presence already implies a complete copy; when a <code>.meta</code> sidecar exists it is cross-checked (recorded source size + original path — this also rejects hash-bin basename collisions across datasets). When no sidecar exists the file is <em>accepted</em>: the prefetch/populate path lands complete cached files with no sidecar, and requiring one (tried 2026-07-06) turned every populated file into a miss and silently sent "warm" reads back to Lustre. Presence-trust is safe because the mmap wrapper's <code>fstat</code> coverage guard (section 3a) independently verifies the mapping range before <code>__real_mmap</code> — a short in-flight copy falls back to native instead of SIGBUS-ing.</li>
 <li><strong>Tier-general, DRAM-first.</strong> The probe order is <code>tier_env[3] = {DRAM_PATH, PMEM_PATH, NVME_PATH}</code> and the warm hit maps <em>whichever tier matched</em> — the returned <code>cand</code> path is tier-agnostic. This mirrors the server data mover, which places a promoted file <strong>DRAM (tmpfs) first, then PMem, then NVMe</strong> by remaining capacity (<a href="../src/server/fitcache_data_mover.cpp#L443">data_mover.cpp:443-466</a>: <code>target_tier = CACHE_TIER_DRAM</code> unless DRAM is full). So the mechanism is a tiered node-local cache, not an NVMe-only cache.</li>
 <li><strong>Server-map independent.</strong> Notice it only <code>stat()</code>s the filesystem; it never consults a server. This is why the with/no-.meta file ablation (section 5) shows the client warm-hits in <em>both</em> arms — the resolver needs only the files on disk, not the server's in-memory map.</li>
 </ul>
@@ -323,6 +346,32 @@ void   fitcache_mmap_tracker_drop(void *addr);                   // erase on mun
 <strong>Why open-time, not close-time.</strong> numpy.memmap reuses the same fd per shard. Under that access pattern the client's <code>open_cb</code> response is sometimes dropped as stale by the epoch guard, leaving <code>fd_redir_map[fd]==0</code>, which makes the client skip the close RPC — so close-time promotion never fired and the cache stayed empty (exactly the cache the warm-hit path needs). Enqueuing at open time guarantees promotion regardless of the close RPC. The data mover dedups against <code>path_cache_map</code>, so a double enqueue is harmless. The prefetch hint (section 4) uses this <em>same</em> enqueue, just proactively and ahead of the open.
 </div>
 <p>The data mover thread then does the physical copy (or, when a peer already holds the file, a peer&rarr;local migration) and computes the cached path — covered in section 4c and in section 3 of Mechanism 3 below, because the same landing code also writes the .meta file.</p>
+
+<h3 id="m1-openfix">3e. Open-path scaling fixes (2026-07)</h3>
+<p>Two client-side changes in <a href="../src/client/fitcache_client.cpp#L140">fitcache_client.cpp</a> removed the remaining
+per-open PFS/RPC traffic; both were required before the 8-ranks/node runs at 1–2k ranks would scale.</p>
+<span class="filetag">src/client/fitcache_client.cpp:180 — skip the open RPC on a warm hit</span>
+<pre><code>	// Already cached locally? Then the warm mmap hits NVMe directly and the
+	// open RPC -- which exists only to TRIGGER a server-side promote -- is
+	// pure overhead. At 1-2k ranks the per-open RPC + server open-handling
+	// is itself a scaling bottleneck, so probe the local cache (no PFS stat)
+	// and skip the RPC when the file is already complete on this node.
+	{
+		char __cached_probe[4096];
+		if (fitcache_resolve_cached_path(fd_map[fd].c_str(),
+		                                 __cached_probe, sizeof(__cached_probe)))
+			return tracked;  // already cached; no promote needed
+	}</code></pre>
+<ul>
+<li><strong>Open-RPC skip.</strong> The open RPC exists only to trigger a server-side promotion; once the file is cached
+locally it is pure overhead. The client probes the local cache (same resolver, no PFS stat) and returns before Mercury is
+even initialized. Result: a fully-warm epoch performs <em>zero</em> RPCs.</li>
+<li><strong>canonical() dedup.</strong> <code>std::filesystem::canonical()</code> is a Lustre realpath — one MDS round-trip per
+path component. The old open path called it 3–4× per open plus once per open on <code>data_dir</code>; at 1–2k ranks that
+stormed the MDS and throttled warm mmaps. Now: computed once per open into <code>cpath</code> and reused, and
+<code>canonical(data_dir)</code> is a <code>static const</code> computed once per process
+(<a href="../src/client/fitcache_client.cpp#L142">fitcache_client.cpp:142-154</a>).</li>
+</ul>
 
 <hr>
 
@@ -591,12 +640,14 @@ rename(tmp_path.c_str(), final_path.c_str());   // POSIX-atomic publish</code></
 <hr>
 
 <h2 id="exp">6. What we ran — the experiments</h2>
-<p>Every performance cell passes a hard FitCachePP-vs-<code>Native_mmap_PFS</code> checksum-equality gate (per-rank for multi-seed benches) plus a decode gate where applicable. Full tables and all numbers on <a href="experiments.html">experiments.html</a> — that page is authoritative for results; the shape only:</p>
+<p>Full tables and all numbers on <a href="experiments.html">experiments.html</a> (authoritative); method in
+<a href="experiments_methodology.html">experiments_methodology.html</a> §12. The 2026-07 final campaign uses <strong>real
+loaders fed synthetic corpora, random access, the real 8-ranks/node layout, per-scale cold natives</strong>; the shape only:</p>
 <table>
 <tr><th>Contribution</th><th>Workload / cells</th><th>What it shows</th><th>Harness</th></tr>
-<tr><td>1 — mmap path</td><td>All three workloads (Megatron dense-sequential, GNN sparse 2-hop gather, DINOv2 sequential vision)</td><td>Every read is a warm local mmap with no RPC on the read path. Headline benefit is <strong>cold&rarr;warm</strong> (native first cold read vs. FitCachePP warm); <strong>warm&rarr;warm</strong> is small because a partition that fits node RAM gets page-cached by the native baseline too. (Read GNN as "NVMe-warm-flat + native-volatile", not "speedup grows with scale".)</td><td><code>benchmarks/{megatron,gnn,dinov2}/*</code></td></tr>
-<tr><td>2 — prefetch migration</td><td>Whole system = mmap cache path + <code>fitcache_prefetch</code>. Each node prefetches only its own 1/N partition.</td><td><strong>1&times; cluster storage</strong> (du-confirmed) for the 1&times;-partitionable Megatron and DINOv2, vs N&times; for replicate-all, while reads stay warm local mmaps. <strong>GNN is un-partitionable</strong>: its sparse 2-hop gather can touch any feature row, so each node must hold the whole feat+CSR set (~902&nbsp;GB) and storage stays N&times; — but prefetch still wins the warm hit.</td><td><code>benchmarks/fitcache_prefetch_shim.py</code> driving <code>fitcache_prefetch</code> per loader</td></tr>
-<tr><td>3 — .meta file</td><td>Part-2 ablations: (1) .meta-file recovery vs. none; (2) DRAM(tmpfs) vs. NVMe tier</td><td>restore rebuilds the cache map (with replication mode) across a live restart; client warm-hits in both ablation arms; tier choice follows the per-node working-set / page-cache argument of section 3b</td><td><code>frontier_sidecar_recovery.sh</code></td></tr>
+<tr><td>1 — mmap path</td><td>Three real loaders: Megatron <code>IndexedDataset</code> + <code>DataLoader</code> (random ~2&nbsp;KB docs), Vision <code>DataLoader</code> (random 150&nbsp;KB records), GNN 2-hop sampler (random 4&nbsp;KB rows)</td><td>Every read is a warm local mmap with zero RPCs on a fully-warm epoch. Headline benefit is <strong>cold&rarr;warm</strong> at 16→2048 GPUs, strong- and weak-scaling.</td><td><code>benchmarks/megatron/megatron_dataloader_bench.py</code>, <code>benchmarks/vision/vision_dataloader_bench.py</code>, <code>benchmarks/gnn/*</code></td></tr>
+<tr><td>2 — prefetch migration</td><td>Whole system = mmap cache path + <code>fitcache_prefetch</code>. Each node prefetches only its own 1/N partition.</td><td><strong>1&times; cluster storage</strong> (du-confirmed, footprints exact 1/N) for the partitionable Megatron and Vision, while reads stay warm local mmaps. <strong>GNN is un-partitionable</strong>: its 2-hop gather can touch any feature row, so each node holds the whole feat+CSR set (841&nbsp;GiB) and storage stays N&times; — but still wins the warm hit (18.8–24.1&times;).</td><td><code>benchmarks/fitcache_prefetch_shim.py</code> driving <code>fitcache_prefetch</code> per loader</td></tr>
+<tr><td>3 — .meta file</td><td>Part-2 design-feature validations: (1) .meta-file recovery across service restart; (2) DRAM(tmpfs) vs. NVMe tier</td><td>client warm path is server-independent across a restart; tier choice follows the per-node working-set / page-cache argument of section 3b</td><td><code>frontier_sidecar_recovery.sh</code></td></tr>
 </table>
 <p class="note">The standalone access-aware-placement ablation is folded into prefetch (Mechanism 2) and is no longer a separate cell; the old "integrated promote + placement + recovery" run is likewise gone. Defer every concrete number to <a href="experiments.html">experiments.html</a>.</p>
 
@@ -615,11 +666,14 @@ rename(tmp_path.c_str(), final_path.c_str());   // POSIX-atomic publish</code></
 <tr><td>Eager-populate via Mercury anon-mmap</td><td><span class="badge bad">Superseded</span> — replaced by the warm-hit direct path</td></tr>
 <tr><td>Replicate-all whole-working-set placement (N&times; storage)</td><td><span class="badge bad">Superseded</span> — replaced by prefetch-informed migration (1&times; / limited replication); retained only as the <code>UNBOUNDED=0</code> default</td></tr>
 </table>
-<p><strong>Bottom line:</strong> both contributions and the supporting mechanism are implemented and gated. Nothing is missing for the current claims (see <a href="paper.html">paper.html</a>); the only open item is the cross-job HRW path, explicitly scoped as future work.</p>
+<p><strong>Bottom line:</strong> both contributions and the supporting mechanism are implemented and gated. Nothing is missing for the current claims (results: <a href="experiments.html">experiments.html</a>); the only open item is the cross-job HRW path, explicitly scoped as future work.</p>
 
 <footer>
-Last updated: 2026-06-20 (rewrote Mechanism 2 to the implemented prefetch-informed-migration + limited-replication design: <code>fitcache_prefetch</code> API, prefetch RPC + handler, whole-file peer&rarr;local <code>fitcache_server_migrate_file</code>, replication_mode/cap policy; removed the old node-local full-replication placement and the integrated run).<br>
-Generated from the source tree (line numbers verified against the working copy at write time). No markdown source was modified.
+Last updated: 2026-07-15 (documented the 2026-07 client hardening in place: PFS-free sidecar-optional resolver [3b], fstat
+coverage guard in the mmap wrapper [3a], open-RPC skip + canonical() dedup [new 3e]; refreshed §6 to the final random-access
+real-loader campaign; fixed stale links).<br>
+2026-06-20: rewrote Mechanism 2 to the implemented prefetch-informed-migration + limited-replication design.<br>
+Generated from the source tree (line numbers verified against the working copy at write time).
 </footer>
 
 </body>

@@ -42,8 +42,8 @@
 <p class="note"><strong>Structure.</strong> <strong>Part 1</strong> is the final results: three real data-loading
 workloads (fed synthetic data), measured in the layout real training uses, cold-Lustre native vs FitCachePP-warm NVMe,
 16→2048 GPUs (2→256 nodes, 8 GPUs/node). Megatron is measured both <strong>strong-scaling</strong> (fixed 1&nbsp;TiB
-corpus, §1.1) and <strong>weak-scaling</strong> (128&nbsp;GiB/node constant, §1.1b). <strong>Part 2</strong> ablations
-are unchanged. Method: <a href="experiments_methodology.html">experiments_methodology.html</a> §12.</p>
+corpus, §1.1) and <strong>weak-scaling</strong> (128&nbsp;GiB/node constant, §1.1b). <strong>Part 2</strong> validates the
+design features (restart resilience, tier generality). Method: <a href="experiments_methodology.html">experiments_methodology.html</a> §12.</p>
 
 <h1>Part 1 — Final results: three real workloads, 16→2048 GPUs <span class="badge done">FINAL</span></h1>
 
@@ -178,30 +178,44 @@ zero fallbacks.</p>
 
 <hr>
 
-<h1>Part 2 — Ablations: what each mechanism contributes</h1>
-<p class="note">Each ablation turns one mechanism off (or compares it against the naive alternative) so the whole-system result is
-attributed to the right cause.</p>
+<h1>Part 2 — Design-feature validations</h1>
+<p class="note">Part 1 measures the whole system; Part 2 validates the individual <em>design features</em> the system relies
+on — restart resilience via <code>.meta</code> recovery, and tier generality of the cache path — each with its own measured
+result. (Design rationale: <a href="design.html">design.html</a>; code: <a href="implementation_walkthrough.html">implementation_walkthrough.html</a>.)</p>
 
-<h2>2.1 — .meta-file recovery <span class="badge supp">RE-VERIFIED 2026-07-07</span></h2>
-<p class="note"><strong>What holds (re-measured on the current system, restart test):</strong> the client's warm path is
-fully <strong>server-independent</strong> — after killing and restarting the cache service, the loader still warm-hits
-<strong>32/32 mmaps (100%, zero fallbacks)</strong> at 2.4&nbsp;GB/s. Training never stalls on a cache-service restart.
-Since the 2026-07 client fixes, the <code>.meta</code> file is also consulted on the warm hot path (size +
-original-path check when present).</p>
-<p class="note"><strong>What changed:</strong> the prefetch/populate path used by the headline experiments lands cached
-shards <strong>without</strong> <code>.meta</code> files (measured: 31 shards cached, 0 sidecars). Server-side restore
-therefore has nothing to rebuild for populate-cached data — recovery of server bookkeeping currently applies only to
-shards promoted through the on-demand (open-triggered) path, which writes sidecars. The earlier restore-count/time
-tables were measured on old workloads through that path and are retired. <strong>Open decision:</strong> have the
-populate path write sidecars too (small server-side change → full recovery coverage), or scope the recovery claim to
-on-demand-promoted data. Correctness is unaffected either way — the client resolves and verifies against the cached
-files themselves.</p>
+<h2>2.1 — Restart resilience: server-independent warm path + .meta recovery <span class="badge done">RE-VERIFIED 2026-07-07</span></h2>
+<p class="note"><strong>Design feature:</strong> training must survive a cache-service crash/restart. Two layers provide it:
+the client warm path never depends on server state (deterministic resolve + local verification), and the server rebuilds its
+bookkeeping from <code>.meta</code> sidecars on startup. <strong>Restart test</strong> (kill the cache service mid-run,
+restart, continue the loader):</p>
+<table>
+<tr><th>Measure</th><th>Result</th></tr>
+<tr><td>Warm mmaps after service kill + restart</td><td><strong>32/32 (100%), zero native fallbacks</strong></td></tr>
+<tr><td>Warm read bandwidth across the restart</td><td><strong>2.4&nbsp;GB/s</strong> (unchanged)</td></tr>
+<tr><td>Loader stall on restart</td><td><strong>None</strong> — client resolves and verifies against the cached files themselves</td></tr>
+<tr><td>Warm-path .meta use (2026-07 client)</td><td>Sidecar consulted when present: size + original-path verification on the hot path</td></tr>
+</table>
+<p class="note"><strong>Scope (honest):</strong> the prefetch/populate path used by the headline experiments lands cached
+shards <strong>without</strong> <code>.meta</code> files (measured: 31 shards cached, 0 sidecars), so server-side
+<code>restore_from_sidecars</code> currently rebuilds bookkeeping only for shards promoted through the on-demand
+(open-triggered) path, which writes sidecars. The earlier restore-count/time tables (old workloads through that path) are
+retired. <strong>Open decision:</strong> have the populate path write sidecars too (small server-side change → full
+recovery coverage), or keep the recovery claim scoped to on-demand-promoted data. Client-side warm correctness across
+restart holds either way, as measured above.</p>
 
-<h2>2.2 — Cache tier: DRAM (tmpfs) vs NVMe <span class="badge supp">DONE</span></h2>
-<p class="note">Tier-general (DRAM/tmpfs → PMem → NVMe by remaining capacity). The headline runs were served from the per-node
-<strong>NVMe</strong> burst buffer (<code>/mnt/bb</code>). A DRAM-tier datapoint confirms the path also serves from tmpfs at parity
-(48 warm hits resolve to <code>/tmp</code>, bit-identical checksum <code>3453497658530916</code>), but that is a cold-start regime:
-when the working set fits tmpfs the native baseline page-caches it too and the sustained gap washes out. NVMe backs the headline.</p>
+<h2>2.2 — Tier generality: DRAM (tmpfs) vs NVMe <span class="badge done">DONE</span></h2>
+<p class="note"><strong>Design feature:</strong> the cache path is tier-general — the data mover places by remaining
+capacity (DRAM/tmpfs → PMem → NVMe) and the resolver probes the same order, so the mechanism is a tiered node-local
+cache, not an NVMe-only cache.</p>
+<table>
+<tr><th>Measure</th><th>Result</th></tr>
+<tr><td>Warm hits served from the DRAM (tmpfs) tier</td><td><strong>48/48 resolve to <code>/tmp</code></strong></td></tr>
+<tr><td>Data integrity vs NVMe-served run</td><td><strong>Bit-identical</strong> (checksum <code>3453497658530916</code>)</td></tr>
+<tr><td>Tier backing the headline runs</td><td><strong>NVMe</strong> (<code>/mnt/bb</code> burst buffer; Frontier has no PMem)</td></tr>
+</table>
+<p class="note"><strong>Why NVMe backs the headline:</strong> the DRAM datapoint is a cold-start regime — once a working
+set fits tmpfs, the native baseline page-caches it too and the sustained gap washes out (same-RAM-pages argument,
+walkthrough §3b). NVMe is the tier where the &gt;RAM working sets that need the cache actually live.</p>
 
 <footer>
 Last updated: 2026-07-15. <strong>Weak-scaling ladder COMPLETE (8/8)</strong> — 128&nbsp;GiB/node constant, disjoint
