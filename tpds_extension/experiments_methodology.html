@@ -582,6 +582,20 @@ effect: 32 Lustre streams/node instead of 8 (more contention at scale — the ho
 (2026-07-07, under diagnosis): partial warm fallback at Vision N≥8 (bimodal per-rank walls) and re-promote-driven
 <code>du</code> inflation during warm; the exact-1× footprint evidence remains the 1-consumer ladder.</p>
 
+<h3>12.8 Weak-scaling protocol — dataset grows with the machine (2026-07-12→15)</h3>
+<p class="note">The strong-scaling ladder (fixed 1&nbsp;TiB corpus) correctly shows the benefit fading once per-node
+slices (≤8&nbsp;GB at 1024+ GPUs) fall into RAM — but real large-scale training grows the dataset with the machine.
+The <strong>weak-scaling ladder</strong> holds per-node data constant instead: every node always owns
+<strong>32 × 4&nbsp;GiB = 128&nbsp;GiB</strong> of a 64&nbsp;TiB corpus (<code>synth_weak_16320x4gb</code>, 16,320
+shards), so the working set never enters the RAM regime at any scale. Two protocol points: (1) each scale reads a
+<strong>disjoint shard window</strong> (<code>FITCACHE_SHARD_BASE</code> offsets: N=2→0, 4→64, 8→192, 16→448, 32→960,
+64→1984, 128→4032, 256→8128), so every native is the first-ever reader of its bytes — per-scale cold without waiting
+for re-cool-downs; (2) scales still run in ≥8.5&nbsp;h slots (one at a time) so no other FitCachePP job perturbs the
+PFS during a native measure. Same 8-ranks/node real-case layout as §12.7; per-node cache confirmed at 137.4&nbsp;GB
+(1×) at every scale. Launcher <code>run_megatron_weak.sh</code>; map <code>megatron_weak_1x/ladder_map.txt</code>;
+results in experiments.html §1.1b. Native-side variance across scales (21–145&nbsp;s for identical per-node work) is
+shared-Lustre contention behavior — the measured quantity weak scaling is designed to expose.</p>
+
 <footer>
 Generated 2026-06-14 from the benchmark sources + harness scripts (mined and cross-checked; every claim cites <code>file:line</code>).
 Rewritten 2026-06-14 for plain-English readability; 2026-06-20 rewritten for the redesign — the whole system is now the <code>mmap</code>
@@ -592,7 +606,8 @@ The standalone access-aware-placement ablation is folded into prefetch and the i
 .meta-file recovery (§10) and DRAM-vs-NVMe tier (§9). <strong>2026-07-03: added §12</strong> — the 2026-06 re-measurement method
 (real loaders + synthetic data, 8 readers/node, random access, cold-native protocol, client fixes, DataLoader-ceiling finding),
 which supersedes the §4/§6/§8 measurement methods. <strong>2026-07-07: added §12.7</strong> (real-case 8-ranks/node layout) and
-extended §12.5 with the fstat SIGBUS guard and the .meta-optional resolve semantics. Numbers are authoritative in
+extended §12.5 with the fstat SIGBUS guard and the .meta-optional resolve semantics. <strong>2026-07-15: added
+§12.8</strong> (weak-scaling protocol: 128&nbsp;GiB/node constant, disjoint cold shard windows). Numbers are authoritative in
 <a href="experiments.html">experiments.html</a>. Focus is methodology (how experiments are built, run, and measured).
 </footer>
 

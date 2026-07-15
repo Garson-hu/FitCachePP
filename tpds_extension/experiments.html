@@ -41,7 +41,9 @@
 
 <p class="note"><strong>Structure.</strong> <strong>Part 1</strong> is the final results: three real data-loading
 workloads (fed synthetic data), measured in the layout real training uses, cold-Lustre native vs FitCachePP-warm NVMe,
-16→2048 GPUs (2→256 nodes, 8 GPUs/node). <strong>Part 2</strong> ablations are unchanged. Method: <a href="experiments_methodology.html">experiments_methodology.html</a> §12.</p>
+16→2048 GPUs (2→256 nodes, 8 GPUs/node). Megatron is measured both <strong>strong-scaling</strong> (fixed 1&nbsp;TiB
+corpus, §1.1) and <strong>weak-scaling</strong> (128&nbsp;GiB/node constant, §1.1b). <strong>Part 2</strong> ablations
+are unchanged. Method: <a href="experiments_methodology.html">experiments_methodology.html</a> §12.</p>
 
 <h1>Part 1 — Final results: three real workloads, 16→2048 GPUs <span class="badge done">FINAL</span></h1>
 
@@ -145,7 +147,8 @@ regime where the cache matters most.</p>
 <h2>1.4 — Cross-workload summary</h2>
 <table>
 <tr><th>Workload (real loader)</th><th>Access</th><th>Footprint</th><th>Cold speedup (anchor)</th><th>At 2048 GPUs</th><th>What bounds warm</th></tr>
-<tr><td>Megatron (IndexedDataset+DataLoader)</td><td>random ~2&nbsp;KB docs</td><td><strong>1×</strong> (537G→4G/node)</td><td><strong>30.2×</strong></td><td>warm flat ~3–6&nbsp;s; slice in RAM regime</td><td>per-sample loader latency</td></tr>
+<tr><td>Megatron strong (IndexedDataset+DataLoader)</td><td>random ~2&nbsp;KB docs</td><td><strong>1×</strong> (537G→4G/node)</td><td><strong>30.2×</strong></td><td>warm flat ~3–6&nbsp;s; slice in RAM regime</td><td>per-sample loader latency</td></tr>
+<tr><td>Megatron weak (same loader, 128&nbsp;GiB/node constant)</td><td>random ~2&nbsp;KB docs</td><td><strong>1×</strong> (128&nbsp;GiB/node at every scale)</td><td><strong>54×</strong></td><td><strong>15×</strong> (sustained; 15–112× across all scales)</td><td>native side = Lustre contention; warm nearly scale-flat</td></tr>
 <tr><td>Vision (DataLoader, 150&nbsp;KB records)</td><td>random 150&nbsp;KB images</td><td><strong>1×</strong> (1.1T→8G/node)</td><td><strong>5.2×</strong></td><td>I/O path ~10&nbsp;GB/s scale-flat; end-to-end loader- and SSD-class-bound</td><td>DataLoader consumer + node SSD class</td></tr>
 <tr><td>GNN (2-hop sampler)</td><td>random 4&nbsp;KB rows</td><td><strong>N×</strong> (841G/node)</td><td><strong>18.8×</strong></td><td><strong>24.1×</strong> (grows with contention)</td><td>genuinely storage-bound → full win</td></tr>
 </table>
@@ -153,7 +156,10 @@ regime where the cache matters most.</p>
 scans gain ~nothing on Orion (Lustre seq ≈ NVMe seq) — why the old sequential benches were retired. (2) <strong>1× vs N×
 is the storage story</strong>: sample-partitionable workloads hold the corpus once cluster-wide at every scale; GNN's
 data-dependent gather forces N×. (3) <strong>The cache scales; what fades at scale is either the need (slices fall into
-RAM) or the surroundings (loader ceiling, node SSD class)</strong> — quantified in §1.5.</p>
+RAM) or the surroundings (loader ceiling, node SSD class)</strong> — quantified in §1.5. (4) <strong>Strong vs weak
+scaling separates the two regimes cleanly</strong>: with a fixed corpus the benefit correctly fades once per-node slices
+fit in RAM (§1.1); with the dataset growing with the machine — the realistic large-training regime — the benefit is
+sustained at every scale to 2048 GPUs (§1.1b).</p>
 
 <h2>1.5 — Method notes &amp; caveats</h2>
 <p class="note"><strong>Cold baselines.</strong> A native measurement is only &ldquo;cold&rdquo; if it is the first
