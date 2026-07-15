@@ -596,6 +596,20 @@ PFS during a native measure. Same 8-ranks/node real-case layout as §12.7; per-n
 results in experiments.html §1.1b. Native-side variance across scales (21–145&nbsp;s for identical per-node work) is
 shared-Lustre contention behavior — the measured quantity weak scaling is designed to expose.</p>
 
+<h3>12.9 Adaptive-placement verification protocol (2026-07-15)</h3>
+<p class="note">Adaptive placement (<code>fitcache_adaptive_decide()</code>; design.html Mechanism 2b) is verified
+functionally, not re-benchmarked: the decision selects between the exact code paths Part 1 already measures, and the warm
+hot path is untouched, so the existing strong/weak/GNN tables stand as the performance of the selected strategy. Protocol
+(one 2-node debug job, <code>run_adaptive_sanity.sh</code>): three cases on an 8 × 4&nbsp;GiB shard subset — (1) partition
+hint present → must pick PARTITION_1X and prefetch only the owned slice (asserted via per-node <code>du</code>: disjoint
+16&nbsp;G/node); (2) no partition, dataset ≤ budget → must pick REPLICATE_NX (full set on every node: ~32&nbsp;G/node);
+(3) no partition, <code>FITCACHE_ADAPTIVE_BUDGET</code> forced below dataset size → must pick PART_FALLBACK (prefetch
+nothing; cache-on-miss serves the hot set). Un-partitionable workloads are simulated with
+<code>FITCACHE_ADAPTIVE_UNPARTITIONABLE=1</code> (the decision input is identical to a loader that declares no partition).
+Overhead is measured as <code>decide_us</code> self-timing over the real 256-file and 16,320-file corpora, 3 trials,
+reporting cold- and warm-metadata separately (first call pays Lustre inode fetch; repeats are MDS-cached). Results:
+experiments.html §2.3.</p>
+
 <footer>
 Generated 2026-06-14 from the benchmark sources + harness scripts (mined and cross-checked; every claim cites <code>file:line</code>).
 Rewritten 2026-06-14 for plain-English readability; 2026-06-20 rewritten for the redesign — the whole system is now the <code>mmap</code>
@@ -607,7 +621,8 @@ The standalone access-aware-placement ablation is folded into prefetch and the i
 (real loaders + synthetic data, 8 readers/node, random access, cold-native protocol, client fixes, DataLoader-ceiling finding),
 which supersedes the §4/§6/§8 measurement methods. <strong>2026-07-07: added §12.7</strong> (real-case 8-ranks/node layout) and
 extended §12.5 with the fstat SIGBUS guard and the .meta-optional resolve semantics. <strong>2026-07-15: added
-§12.8</strong> (weak-scaling protocol: 128&nbsp;GiB/node constant, disjoint cold shard windows). Numbers are authoritative in
+§12.8</strong> (weak-scaling protocol: 128&nbsp;GiB/node constant, disjoint cold shard windows) <strong>and §12.9</strong>
+(adaptive-placement verification: three-case decision sanity + overhead self-timing). Numbers are authoritative in
 <a href="experiments.html">experiments.html</a>. Focus is methodology (how experiments are built, run, and measured).
 </footer>
 

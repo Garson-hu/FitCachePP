@@ -180,6 +180,31 @@ infrastructure (data queue, <code>path_cache_map</code>, Mercury bulk, presence 
 <strong>Deliberately out of scope</strong> (future CXL multi-tier work): automatic hint inference (reuse-distance/ML),
 cluster-wide bounded-k census, multi-job sharing, preemption durability.</p>
 
+<h2>Mechanism 2b — Adaptive placement: choosing 1× vs N× automatically <span class="badge done">NEW 2026-07</span></h2>
+<p>The system supports two placement strategies — <strong>PARTITION_1X</strong> (each node prefetches only its owned 1/N
+slice; SINGLE_COPY) and <strong>REPLICATE_NX</strong> (every node caches the full dataset; UNBOUNDED) — but until now the
+choice was configured per workload by hand: 1× for Megatron/Vision, N× for GNN. Adaptive placement moves that decision
+into the library. At populate time, <code>fitcache_adaptive_decide()</code> takes the dataset file list, an optional
+per-file ownership hint, and the local cache budget it observes, and picks the strategy:</p>
+<table>
+<tr><th>Input</th><th>How obtained</th><th>Meaning</th></tr>
+<tr><td>Partitionability (remote ratio <em>r</em>)</td><td>Ownership flags passed with the file list: present → the loader can confine each node to a known subset (<em>r</em>&nbsp;=&nbsp;0); absent → data-dependent access may touch any byte (<em>r</em>&nbsp;→&nbsp;1, the GNN gather case)</td><td>Whether replication buys anything at all</td></tr>
+<tr><td>Dataset size <em>W</em></td><td>One <code>stat</code> per dataset file at decision time</td><td>Whether N× is feasible</td></tr>
+<tr><td>Local budget <em>C</em></td><td><code>statvfs</code> of the NVMe tier, capped by <code>FitCache_NVME_CAPACITY</code></td><td>Capacity constraint</td></tr>
+</table>
+<p><strong>Policy</strong> (the performance-model comparison made executable): if a partition exists, every access is
+already node-local under 1× — replication buys nothing at any capacity → <strong>PARTITION_1X</strong>. If no partition
+exists, every non-local access is a PFS round-trip whose latency grows with concurrent load (the
+<em>T<sub>pfs</sub></em>-contention term measured in the weak-scaling ladder), so → <strong>REPLICATE_NX</strong> iff
+<em>W</em> ≤ 0.95·<em>C</em>; otherwise → <strong>PART_FALLBACK</strong>: prefetch nothing and let the existing
+open-time cache-on-miss path cache the hot set up to capacity, with overflow reads falling through to the PFS
+(graceful degradation instead of thrashing). The decision is pure client-side computation — no RPC, no data movement —
+and the warm hot path is completely untouched, so all Part-1/Part-2 evidence carries over unchanged. Measured decision
+overhead is reported in <a href="experiments.html">experiments.html</a> §2.3.</p>
+<p class="note"><strong>v1 scope</strong> (deliberate): the decision is made once at populate time; the only runtime
+adaptivity is the cache-on-miss fallback. Mid-run strategy switching and peer-node NVMe fetch for capacity-blocked
+un-partitionable workloads are future work (peer fetch would replace the Lustre read-through in PART_FALLBACK).</p>
+
 <h2>Mechanism 3 — .meta file cache-state recovery <span class="badge supp">Supporting</span></h2>
 <p>The data mover writes a <code>.meta</code> file per cached file on organic (open-triggered) promotion. After a metadata-service
 restart, <code>restore_from_sidecars</code> rebuilds the server-side cache-state map (eviction/promotion accounting, including the

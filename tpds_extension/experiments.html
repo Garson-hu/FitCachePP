@@ -217,8 +217,32 @@ cache, not an NVMe-only cache.</p>
 set fits tmpfs, the native baseline page-caches it too and the sustained gap washes out (same-RAM-pages argument,
 walkthrough §3b). NVMe is the tier where the &gt;RAM working sets that need the cache actually live.</p>
 
+<h2>2.3 — Adaptive placement: automatic 1× vs N× <span class="badge done">NEW 2026-07-15</span></h2>
+<p class="note"><strong>Design feature:</strong> <code>fitcache_adaptive_decide()</code> chooses the placement strategy at
+populate time from (a) whether the loader declares a partition, (b) dataset size (one <code>stat</code>/file), and
+(c) the observed local NVMe budget — instead of the launcher hard-coding 1× (Megatron/Vision) vs N× (GNN). Design:
+<a href="design.html">design.html</a> Mechanism 2b; code: walkthrough §4e. The warm hot path is untouched, so all Part-1
+results carry over as the performance of whichever strategy the decision selects. <strong>Functional verification</strong>
+(2 nodes, 8 × 4&nbsp;GiB shards, job <code>adaptive_sanity/20260715_144858_N2</code>):</p>
+<table>
+<tr><th>Case</th><th>Inputs</th><th>Decision</th><th>Observed cache behavior</th></tr>
+<tr><td>Partition hint present</td><td>owned = 4/8 shards, budget 1.83&nbsp;TB</td><td><strong>PARTITION_1X</strong> (SINGLE_COPY)</td><td>Each node prefetched exactly its 4 owned shards; 16&nbsp;G/node, disjoint (1×); 4/4 landed</td></tr>
+<tr><td>No partition, fits budget</td><td>dataset 32&nbsp;GiB ≤ 1.83&nbsp;TB</td><td><strong>REPLICATE_NX</strong> (UNBOUNDED)</td><td>Every node prefetched all 8 shards; ~32&nbsp;G on <em>each</em> node (N×); 8/8 landed</td></tr>
+<tr><td>No partition, capacity-blocked</td><td>dataset 32&nbsp;GiB &gt; 8&nbsp;GiB budget override</td><td><strong>PART_FALLBACK</strong></td><td>Prefetched nothing; open-time cache-on-miss cached the hot set (8.0&nbsp;G/node), overflow reads fell through to the PFS — no thrash, no failure</td></tr>
+</table>
+<p class="note"><strong>Decision overhead (the reported evaluation):</strong> the decision is one <code>stat()</code> per
+dataset file + one <code>statvfs</code>; no RPC, no data movement. Measured on a compute node (3 trials; first call pays
+cold Lustre metadata, repeats are MDS-cached):</p>
+<table>
+<tr><th>Corpus</th><th>Files</th><th>Decision, cold metadata</th><th>Decision, warm metadata</th><th>Context</th></tr>
+<tr><td><code>synth_1tb_256x4gb</code> (1&nbsp;TiB)</td><td>256</td><td>1.5&nbsp;s</td><td><strong>2.1–3.0&nbsp;ms</strong></td><td>vs minutes of population — negligible</td></tr>
+<tr><td><code>synth_weak_16320x4gb</code> (64&nbsp;TiB)</td><td>16,320</td><td>144&nbsp;s</td><td><strong>2.8&nbsp;s</strong></td><td>one-time per job, amortized against population of the same corpus; a loader that already indexes its shards (e.g. Megatron <code>.idx</code>) can supply sizes and skip the stat scan entirely</td></tr>
+</table>
+
 <footer>
-Last updated: 2026-07-15. <strong>Weak-scaling ladder COMPLETE (8/8)</strong> — 128&nbsp;GiB/node constant, disjoint
+Last updated: 2026-07-15. <strong>Adaptive placement v1 verified</strong> — all three decisions correct on 2 nodes;
+overhead 2–3&nbsp;ms (256 files) / 2.8&nbsp;s (16,320 files) warm-metadata (§2.3). <strong>Weak-scaling ladder COMPLETE
+(8/8)</strong> — 128&nbsp;GiB/node constant, disjoint
 cold shard ranges: 15–112× sustained through 2048 GPUs (§1.1b). <strong>Per-scale cold (strong) ladder COMPLETE
 (16/16)</strong> — every scale measured as the first
 reader of its corpus after a cool-down. Megatron: 30.2×/46.1×/30.1×/17.2× at 16–128 GPUs → 4.8×/3.6× at 256–512 →

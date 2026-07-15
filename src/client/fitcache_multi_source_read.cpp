@@ -17,6 +17,7 @@
 #include "fitcache_multi_source_read.h"
 #include "fitcache_logging.h"         // For L4C_INFO, L4C_ERR
 #include "fitcache_timer.h"           // FitCache_TIMING per-path tags
+#include "fitcache_persistent_meta.h" // meta_read_sidecar: local completeness gate
 
 extern std::map<int, int > fd_redir_map;
 // extern map<int,string> fd_to_path;             // & Server File Descriptor -> Original path
@@ -44,6 +45,95 @@ extern "C" int fitcache_prefetch(const char *original_path, int replication_mode
     if (slot < 0) return -1;
     fitcache_client_comm_gen_prefetch_rpc(static_cast<uint32_t>(slot), path,
                                           replication_mode, 0);
+    return 0;
+}
+
+// ============================================================
+// Adaptive placement decision (TPDS adaptive caching, 2026-07).
+// Pure client-side decision: one lstat per dataset file + a statvfs of the
+// local NVMe tier. No RPC, no data movement. See the header for the policy.
+// Budget resolution order:
+//   FITCACHE_ADAPTIVE_BUDGET (test override, bytes)
+//   min(statvfs(FitCache_NVME_PATH) available bytes, FitCache_NVME_CAPACITY)
+// A 5% headroom is reserved: replication requires dataset <= 0.95 * budget,
+// matching the populate target the ladder jobs use.
+// ============================================================
+#include <sys/statvfs.h>
+#include <ctime>
+
+static inline double fitcache_adaptive_now_us()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
+}
+
+extern "C" int fitcache_adaptive_decide(const char *const *paths,
+                                        const int *owned, int npaths,
+                                        fitcache_adaptive_decision_t *out)
+{
+    if (!paths || npaths <= 0 || !out) return -1;
+    const double t0 = fitcache_adaptive_now_us();
+    memset(out, 0, sizeof(*out));
+
+    // --- scan: dataset + owned sizes (one lstat per file) -----------------
+    uint64_t total = 0, owned_total = 0;
+    int seen = 0;
+    for (int i = 0; i < npaths; ++i) {
+        if (!paths[i] || !paths[i][0]) continue;
+        struct stat st;
+        if (stat(paths[i], &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        total += (uint64_t)st.st_size;
+        if (!owned || owned[i]) owned_total += (uint64_t)st.st_size;
+        ++seen;
+    }
+    if (seen == 0) return -2;  // unreadable dataset
+
+    // --- budget: usable local cache bytes ---------------------------------
+    uint64_t budget = 0;
+    const char *ov = getenv("FITCACHE_ADAPTIVE_BUDGET");
+    if (ov && ov[0]) {
+        budget = strtoull(ov, nullptr, 10);
+    } else {
+        const char *nvme = getenv("FitCache_NVME_PATH");
+        if (nvme && nvme[0]) {
+            struct statvfs vfs;
+            if (statvfs(nvme, &vfs) == 0)
+                budget = (uint64_t)vfs.f_bavail * (uint64_t)vfs.f_frsize;
+        }
+        const char *cap = getenv("FitCache_NVME_CAPACITY");
+        if (cap && cap[0]) {
+            uint64_t c = strtoull(cap, nullptr, 10);
+            if (c > 0 && (budget == 0 || c < budget)) budget = c;
+        }
+    }
+
+    // --- policy ------------------------------------------------------------
+    // owned!=NULL: the loader declared a partition -> every access is already
+    // local under 1x; replication buys nothing regardless of capacity.
+    // owned==NULL: any node may touch any byte; replicate iff it fits.
+    if (owned) {
+        out->mode = FITCACHE_PLACE_PARTITION_1X;
+        out->replication_mode = 1;                 // SINGLE_COPY
+    } else if (total <= (uint64_t)(0.95 * (double)budget)) {
+        out->mode = FITCACHE_PLACE_REPLICATE_NX;
+        out->replication_mode = 0;                 // UNBOUNDED
+    } else {
+        out->mode = FITCACHE_PLACE_PART_FALLBACK;  // cache-on-miss hot set;
+        out->replication_mode = 0;                 // overflow reads -> PFS
+    }
+    out->dataset_bytes = total;
+    out->owned_bytes   = owned_total;
+    out->budget_bytes  = budget;
+    out->decide_us     = fitcache_adaptive_now_us() - t0;
+
+    L4C_INFO("adaptive_decide: mode=%d files=%d dataset=%llu owned=%llu "
+             "budget=%llu decide_us=%.1f",
+             out->mode, seen,
+             (unsigned long long)out->dataset_bytes,
+             (unsigned long long)out->owned_bytes,
+             (unsigned long long)out->budget_bytes, out->decide_us);
+    fitcache::add_value("adaptive.decide_us", out->decide_us);
     return 0;
 }
 
@@ -304,19 +394,18 @@ static hg_return_t ms_read_cb(const struct hg_cb_info *info)
 // (fitcache_data_mover.cpp): cached file lives at
 //   <tier_base>/<(h>>8)&0xFF>/<h&0xFF>/<basename(original_path)>
 // with h = std::hash<std::string>(original_path). Client and server link the
-// same libstdc++, so the hash matches. A cached copy is "complete" iff it
-// exists AND its size equals the original PFS file's size (the data mover
-// does a full fs::copy before the file is usable). No RPC.
+// same libstdc++, so the hash matches. Completeness is verified LOCALLY: the
+// cached file lands via an atomic rename in the data mover (so its presence
+// already implies a complete copy), and the .meta sidecar -- written right
+// after, on the same local tier -- records the source size as a cross-check.
+// No RPC, and -- critically -- NO stat() of the original on the PFS. That
+// per-mmap PFS stat was an MDS bottleneck: at 1-2k ranks it serialized every
+// warm mmap on the Lustre metadata server and dropped warm bandwidth ~10x.
 // ============================================================
 extern "C" int fitcache_resolve_cached_path(const char *original_path,
                                             char *out, size_t outsz)
 {
     if (!original_path || !out || outsz == 0) return 0;
-
-    // Original file size = completeness reference.
-    struct stat ost;
-    if (stat(original_path, &ost) != 0 || ost.st_size <= 0) return 0;
-    const off_t orig_size = ost.st_size;
 
     // Deterministic two-level hash bin (matches data_mover.cpp:482-488).
     size_t h = std::hash<std::string>{}(std::string(original_path));
@@ -340,13 +429,31 @@ extern "C" int fitcache_resolve_cached_path(const char *original_path,
         if (!t || !t[0]) continue;
         std::string cand = std::string(t) + "/" + subdir + "/" + base;
         struct stat cst;
-        if (stat(cand.c_str(), &cst) == 0 && S_ISREG(cst.st_mode) &&
-            cst.st_size == orig_size) {
-            // Warm hit: complete local cached copy.
-            std::strncpy(out, cand.c_str(), outsz - 1);
-            out[outsz - 1] = '\0';
-            return 1;
+        if (stat(cand.c_str(), &cst) != 0 || !S_ISREG(cst.st_mode) ||
+            cst.st_size <= 0)
+            continue;  // not present on this tier
+        // Local completeness gate, no PFS stat. When a .meta sidecar exists,
+        // use it to reject stale/incomplete copies and hash-bin basename
+        // collisions across datasets. When it does NOT exist, accept the
+        // file: the prefetch/populate path lands complete cached files with
+        // no sidecar (verified 2026-07-06 -- requiring one turned every
+        // populated file into a miss and silently sent "warm" reads back to
+        // Lustre). Presence-trust is safe against the old SIGBUS because the
+        // mmap wrapper independently fstat-verifies that the cached file
+        // covers the requested [offset, offset+length) before mapping; a
+        // short or still-growing copy falls back to the native PFS mmap.
+        fitcache::fitcache_file_meta_v1 m;
+        if (fitcache::meta_read_sidecar(cand, &m) == 0) {
+            if ((off_t)m.original_size != cst.st_size)
+                continue;  // incomplete/stale copy
+            if (std::strncmp(m.original_path, original_path,
+                             sizeof(m.original_path)) != 0)
+                continue;  // different source file in the same hash bin
         }
+        // Warm hit: complete local cached copy.
+        std::strncpy(out, cand.c_str(), outsz - 1);
+        out[outsz - 1] = '\0';
+        return 1;
     }
     return 0;  // miss
 }
