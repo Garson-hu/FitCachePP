@@ -594,7 +594,7 @@ for re-cool-downs; (2) scales still run in ≥8.5&nbsp;h slots (one at a time) s
 PFS during a native measure. Same 8-ranks/node real-case layout as §12.7; per-node cache confirmed at 137.4&nbsp;GB
 (1×) at every scale. Launcher <code>run_megatron_weak.sh</code>; map <code>megatron_weak_1x/ladder_map.txt</code>;
 results in experiments.html §1.1b. Native-side variance across scales (21–145&nbsp;s for identical per-node work) is
-shared-Lustre contention behavior — the measured quantity weak scaling is designed to expose.</p>
+shared-Lustre contention behavior — the measured quantity weak scaling is designed to expose. <strong>2026-07-19 addendum:</strong> cold-slot repeats at 256 and 2048 GPUs (same shard range, fresh ≥8.5&nbsp;h slots, one job at a time; <code>run_weak_variance.sh</code>, results <code>megatron_weak_var/</code>) quantify this: the native epoch differs up to 4.6× between slots at the same scale (137.5&nbsp;s vs 30.0&nbsp;s at 256 GPUs) while warm repeats are stable (3.66 vs 3.81&nbsp;s at 2048 GPUs), so per-scale speedups must be read with native slot variance in mind.</p>
 
 <h3>12.9 Adaptive-placement verification protocol (2026-07-15)</h3>
 <p class="note">Adaptive placement (<code>fitcache_adaptive_decide()</code>; design.html Mechanism 2b) is verified
