@@ -20,6 +20,12 @@
 #include "fitcache_comm.h"
 #include "fitcache_cross_job.h"
 
+// From fitcache_multi_source_read.cpp: client-side warm-hit resolver (purely
+// local tier stats, no PFS stat). Lets the open path skip the server RPC when
+// a complete cached copy already exists on this node.
+extern "C" int fitcache_resolve_cached_path(const char *original_path,
+                                            char *out, size_t outsz);
+
 
 #define FitCache_CLIENT 1
 
@@ -133,19 +139,26 @@ bool fitcache_track_file(const char *path, int flags, int fd)
 	}    
 
 	try {
-		std::string ppath = std::filesystem::canonical(path).parent_path();
+		// canonical() is a Lustre realpath (one MDS round-trip per path
+		// component). Compute it ONCE per open and reuse it everywhere below.
+		// The old code called canonical(path) 3-4x per open (ppath, the log
+		// line, fd_map) plus canonical(data_dir) every open; at 1-2k ranks that
+		// storms the Lustre metadata server and throttles warm mmaps.
+		std::filesystem::path cpath = std::filesystem::canonical(path);
+		std::string ppath = cpath.parent_path();
 
 		// Check if current file exists in FitCache_DATA_DIR
 		if (fitcache_data_dir != NULL)
 		{
-			std::string test = std::filesystem::canonical(fitcache_data_dir);
+			// data_dir is constant for the process -> canonicalize it once.
+			static const std::string test = std::filesystem::canonical(fitcache_data_dir);
 			// ? path should be the directory of data
 			if (ppath.find(test) != std::string::npos)
 			{
 				L4C_INFO("Tracking used HV_DD file path %s",path);
 				L4C_INFO("Tracking used HV_DD file ppath %s",ppath.c_str());
-				L4C_INFO("Tracking used HV_DD file canonical of path %s",std::filesystem::canonical(path).c_str());
-				fd_map[fd] = std::filesystem::canonical(path);
+				L4C_INFO("Tracking used HV_DD file canonical of path %s",cpath.c_str());
+				fd_map[fd] = cpath;
 				tracked = true;
 			}		
 		}
@@ -154,8 +167,8 @@ bool fitcache_track_file(const char *path, int flags, int fd)
 		{     
 			L4C_INFO("Tracking used CWD file path %s",path);
 			L4C_INFO("Tracking used CWD file ppath %s",ppath.c_str());
-			L4C_INFO("Tracking used CWD file canonical of path %s",std::filesystem::canonical(path).c_str());
-			fd_map[fd] = std::filesystem::canonical(path);
+			L4C_INFO("Tracking used CWD file canonical of path %s",cpath.c_str());
+			fd_map[fd] = cpath;
 			tracked = true;
 		}
 	} catch (...)
@@ -165,6 +178,17 @@ bool fitcache_track_file(const char *path, int flags, int fd)
 
 	// Send RPC to tell server to open file
 	if (tracked){
+		// Already cached locally? Then the warm mmap hits NVMe directly and the
+		// open RPC -- which exists only to TRIGGER a server-side promote -- is
+		// pure overhead. At 1-2k ranks the per-open RPC + server open-handling
+		// is itself a scaling bottleneck, so probe the local cache (no PFS stat)
+		// and skip the RPC when the file is already complete on this node.
+		{
+			char __cached_probe[4096];
+			if (fitcache_resolve_cached_path(fd_map[fd].c_str(),
+			                                 __cached_probe, sizeof(__cached_probe)))
+				return tracked;  // already cached; no promote needed
+		}
 		// Thread-safe one-shot Mercury init. Without the mutex, TF data-pipeline
 		// parallel workers in the same python rank can both see g_mercury_init
 		// as false on their first open(), each call fitcache_init_comm() which

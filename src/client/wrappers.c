@@ -536,6 +536,20 @@ void* WRAP_DECL(mmap)(void *addr, size_t length, int prot, int flags,
     if (__resolved) {
         int cfd = __real_open(cached_path, O_RDONLY);
         if (cfd >= 0) {
+            /* SIGBUS guard: the mapping must be fully backed by the cached
+             * file RIGHT NOW (resolve raced a concurrent promotion once and a
+             * fault past EOF is a bus error, not a graceful miss). If the
+             * cached copy does not cover [offset, offset+length), fall back
+             * to the native PFS mmap. Local fstat only -- no PFS traffic. */
+            struct stat __cst;
+            if (fstat(cfd, &__cst) != 0 ||
+                __cst.st_size < (off_t)offset + (off_t)length) {
+                __real_close(cfd);
+                if (DEBUG_HU)
+                    L4C_INFO("mmap: cached %s too short for %zu@%ld; native fallback",
+                             cached_path, length, (long)offset);
+                goto fitcache_mmap_native;
+            }
             /* Honor the caller's prot + sharing flag, but map the CACHED file.
              * Read-only, so MAP_SHARED has no write-back concern. */
             int map_flags = (flags & MAP_SHARED) ? MAP_SHARED : MAP_PRIVATE;
@@ -561,6 +575,7 @@ void* WRAP_DECL(mmap)(void *addr, size_t length, int prot, int flags,
         }
     }
 
+fitcache_mmap_native:
     /* === Cold miss: native mmap on the original PFS file ===
      * Deliberately NOT the Mercury anon-populate path (that was the
      * bottleneck). The file is already tracked via the open RPC, so the
