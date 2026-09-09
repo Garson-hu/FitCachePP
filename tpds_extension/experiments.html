@@ -42,8 +42,11 @@
 <p class="note"><strong>Structure.</strong> <strong>Part 1</strong> is the final results: three real data-loading
 workloads (fed synthetic data), measured in the layout real training uses, cold-Lustre native vs FitCachePP-warm NVMe,
 16→2048 GPUs (2→256 nodes, 8 GPUs/node). Megatron is measured both <strong>strong-scaling</strong> (fixed 1&nbsp;TiB
-corpus, §1.1) and <strong>weak-scaling</strong> (128&nbsp;GiB/node constant, §1.1b). <strong>Part 2</strong> validates the
-design features (restart resilience, tier generality). Method: <a href="experiments_methodology.html">experiments_methodology.html</a> §12.</p>
+corpus, §1.1) and <strong>weak-scaling</strong> (128&nbsp;GiB/node constant, §1.1b). The <strong>syscall path</strong> is
+measured weak-scaling with <strong>real CosmoFlow training</strong> (44.5&nbsp;GB/node constant, 16→2048 GPUs, §1.1c) and
+with real DeepCAM training (97.9&nbsp;GB/node, 16→512 GPUs, §1.1d — recorded, held out of the paper). <strong>Part 2</strong>
+validates the design features (restart resilience, tier generality). Method:
+<a href="experiments_methodology.html">experiments_methodology.html</a> §12 (§12.10 for the syscall campaigns).</p>
 
 <h1>Part 1 — Final results: three real workloads, 16→2048 GPUs <span class="badge done">FINAL</span></h1>
 
@@ -124,6 +127,110 @@ denominator); in repeat slots the curve is flat-with-noise (~16&times; and ~12&t
 The honest paper statement is the warm side's scale-invariance plus native ranges across slots, not any single
 speedup peak.</p>
 
+<h2>1.1c — Syscall-path WEAK scaling: CosmoFlow real training (44.5&nbsp;GB/node constant) — 1× footprint <span class="badge done">FINAL</span></h2>
+<p class="note">The <code>read</code>/<code>pread</code> interception path (the FitCache path used by CosmoFlow and DeepCAM in
+the base paper) measured with the same weak-scaling protocol as §1.1b, but on <strong>real MLPerf HPC CosmoFlow
+training</strong> (stock TensorFlow model, Horovod, 8 GPU ranks/node, batch 4, <code>configs/cosmo_weak_stock.yaml</code>):
+every node always owns one corpus window of <strong>15,360 GZIP TFRecords = 44.5&nbsp;GB</strong>
+(<code>cosmo_weak_512x32gb</code>, 512 windows, real byte copies of the MLCommons files so each window is its own Lustre
+objects). Each scale reads a <strong>disjoint</strong> window range (bases N=2→0, 4→2, 8→6, 16→14, 32→30, 64→62, 128→126,
+256→254) and every native is the first-ever reader of its bytes; repeats of one scale re-read the same windows only after
+a ≥9.25&nbsp;h cool-down. Per job: one <strong>native</strong> training epoch from Lustre (no LD_PRELOAD), then a
+<strong>FitCache++</strong> run of three epochs (epoch&nbsp;1 = <em>fill</em>: cold through the cache, servers read Lustre
+and promote; epochs 2–3 = <em>warm</em>). Epoch time = the trainer's own per-epoch wall (rank&nbsp;0; slowest rank
+also recorded). <strong>3 repeats per scale, medians</strong>; 24/24 jobs usable. Cache tier: DRAM (tmpfs, 100&nbsp;GiB
+capacity) holds the whole 44.5&nbsp;GB/node window (NVMe path stays at 40&nbsp;B → nothing spilled), 1× footprint. A
+one-node <strong>PFS probe</strong> runs beside every job (§12.10). Map:
+<code>cosmoflow_weak/campaign_map.txt</code> (append-only; last line per (scale, repeat) wins).</p>
+<table>
+<tr><th>Nodes</th><th>GPUs</th><th>Native cold (s)</th><th>FCPP fill (s)</th><th>FCPP warm (s)</th><th>Speedup</th><th>Slowest-rank speedup</th><th>PFS 4&nbsp;KiB read latency, native / warm (ms)</th><th>Native spread (3 reps)</th></tr>
+<tr><td>2</td><td>16</td><td>172.6</td><td>153.6</td><td>132.5</td><td><strong>1.30×</strong></td><td>1.30×</td><td>0.7 / 0.9</td><td>170–176</td></tr>
+<tr><td>4</td><td>32</td><td>175.7</td><td>159.4</td><td>134.6</td><td><strong>1.31×</strong></td><td>1.31×</td><td>1.4 / 1.0</td><td>172–182</td></tr>
+<tr><td>8</td><td>64</td><td>178.3</td><td>157.2</td><td>136.6</td><td><strong>1.30×</strong></td><td>1.31×</td><td>23.6 / 14.9</td><td>177–221</td></tr>
+<tr><td>16</td><td>128</td><td>183.1</td><td>167.1</td><td>137.7</td><td><strong>1.33×</strong></td><td>1.33×</td><td>2.4 / 1.0</td><td>179–185</td></tr>
+<tr><td>32</td><td>256</td><td>187.2</td><td>169.0</td><td>142.9</td><td><strong>1.31×</strong></td><td>1.31×</td><td>3.6 / 1.9</td><td>185–188</td></tr>
+<tr><td>64</td><td>512</td><td>193.2</td><td>187.1</td><td>139.6</td><td><strong>1.38×</strong></td><td>1.39×</td><td>4.2 / 1.5</td><td>190–451</td></tr>
+<tr><td>128</td><td>1024</td><td>235.0</td><td>216.6</td><td>142.3</td><td><strong>1.65×</strong></td><td>1.76×</td><td>17.7 / 8.3</td><td>225–819</td></tr>
+<tr><td>256</td><td>2048</td><td>456.7</td><td>514.0</td><td>148.7</td><td><strong>3.07×</strong></td><td>3.17×</td><td>14.4 / 7.1</td><td>358–617</td></tr>
+</table>
+<p class="note"><strong>Read:</strong> CosmoFlow is a <em>compute-carrying</em> workload, so the warm epoch is bounded
+by GPU work and Horovod all-reduce, not by storage: it stays within <strong>132.5–148.7&nbsp;s from 16 to 2048 GPUs</strong>
+(+12% over 128× more nodes) because every warm read is a local tmpfs hit. The native epoch is flat while the shared PFS
+keeps up (170–193&nbsp;s through 512 GPUs, i.e. Lustre adds only ~40&nbsp;s of I/O to a ~135&nbsp;s compute epoch → the
+speedup is capped near 1.3× by Amdahl), then rises to 235&nbsp;s at 1024 and 456.7&nbsp;s at 2048 GPUs as thousands of
+concurrent readers contend on Lustre. The speedup therefore grows from 1.3× to <strong>3.07× at 2048 GPUs</strong>, and
+the slowest-rank view (3.17×) is slightly higher because native stragglers are PFS stragglers. The fill epoch costs
+0.88–1.13× of a native epoch (it reads Lustre once through the servers and promotes), so the cache pays for itself
+within the second epoch.</p>
+<p class="note"><strong>PFS analysis (probe: 4&nbsp;KiB O_DIRECT random reads at 100/s from one node of every job on a
+separate 1&nbsp;TB dataset; latency is bimodal — ~0.25&nbsp;ms Lustre-server-cache hit vs ~25&nbsp;ms disk — so
+per-phase <em>means</em> are reported, medians hide the state).</strong>
+(1)&nbsp;<strong>Ambient PFS state differs by 170× between slots</strong>: during the warm epochs, when the job itself
+issues no PFS reads, the probe sees 0.44–76.5&nbsp;ms across the 24 jobs (miss fraction 0–0.82). (2)&nbsp;<strong>The
+warm epoch is insensitive to it</strong>: at 16 GPUs the ambient latency was 0.9 vs 64.8&nbsp;ms in two repeats and the
+warm epoch 132.5 vs 132.5&nbsp;s; at 128 GPUs 0.4 vs 76.5&nbsp;ms gave 137.6 vs 139.3&nbsp;s. (3)&nbsp;<strong>The cold
+epoch is visible to other users</strong>: within a job, probe latency during the native epoch exceeds the warm-window
+value in 18 of 24 jobs (paired ratio median 1.4×, up to 4.2× at 512 GPUs), i.e. the cold epoch adds load to the shared
+file system that disappears once the job is warm. (4)&nbsp;<strong>Native slot variance is not predicted by the
+probe</strong>: the native epoch differs up to 3.6× between repeats at the same scale (1024 GPUs: 225/235/819&nbsp;s;
+2048: 358/457/617&nbsp;s; 512: 190/193/451&nbsp;s) while the probe during those slow natives was quiet (4.9&nbsp;ms for the
+819&nbsp;s run, 4.2&nbsp;ms for the 451&nbsp;s run). The contention that slows a cold epoch sits on the corpus's own
+OSTs (and the Sep&nbsp;1–2 post-maintenance Lustre slowdown), which a probe on a separate dataset cannot see — hence
+medians of three, with the spread reported. Per-job numbers and the per-scale table are reproduced by
+<code>benchmarks/cosmoflow/analyze_cosmoflow_weak.py</code> (phases.log ↔ fio epoch-ms alignment), outputs
+<code>cosmoflow_weak/FINAL_TABLE.txt</code>, <code>final_rows.json</code>, <code>final_probe_by_phase.json</code>.</p>
+<p class="note"><strong>Correctness / serving proof.</strong> Every warm epoch was served by FitCache++ (TF binds plain
+<code>pread</code>, which is interposed; ~55k read RPCs / ~12.5&nbsp;GB per rank at fill); per-rank exit counters show
+<code>ms_read_rpc_timeouts=0</code> on 512/512 (N64 r3) and 1024/1024 (N128 r1, r2) ranks on the final client; training
+loss/MAE identical native vs FitCache++. Per-repeat rows (cold / fill / warm1 / warm2, s):
+N2 175.6/155.0/132.5/132.4 · 169.9/153.2/132.9/134.7 · 172.6/153.6/132.5/132.6;
+N4 175.7/152.2/134.2/134.8 · 171.7/159.4/133.7/135.6 · 181.6/173.0/135.4/134.6;
+N8 178.3/155.0/136.7/135.5 · 177.2/157.2/135.3/138.0 · 220.9/267.0/150.0/146.7;
+N16 183.1/248.9/136.6/138.7 · 179.2/161.4/136.2/139.2 · 185.1/167.1/140.7/137.9;
+N32 188.4/169.0/142.7/144.4 · 187.2/178.4/143.1/142.8 · 184.8/167.1/141.9/141.2;
+N64 189.5/164.0/140.2/138.8 · 193.2/187.1/138.1/141.2 · 451.1/245.8/141.8/141.4;
+N128 818.5/289.0/142.0/142.6 · 235.0/216.6/140.5/146.0 · 225.2/208.7/141.2/141.5;
+N256 456.7/514.0/157.3/155.4 · 358.0/377.7/150.2/147.2 · 617.4/822.8/148.2/147.9.</p>
+
+<h2>1.1d — Syscall-path WEAK scaling: DeepCAM real training (97.9&nbsp;GB/node constant, 16→512 GPUs) — 1× footprint <span class="badge done">MEASURED</span> <span class="badge arch">HELD OUT OF PAPER</span></h2>
+<p class="note">Same protocol on <strong>real MLPerf HPC DeepCAM training</strong> (PyTorch, DDP, 8 ranks/node, local batch
+2, <code>--max_inter_threads 0</code> as in the IPDPS runs — DataLoader workers fork and wedge the preloaded client),
+but on the <strong>original IPDPS FitCache/HVAC code</strong> (<code>FitCache_Frontier</code> build_v9: the pristine
+build_v4 plus the <code>pread64</code> alias, the server map locks, timed RPC waits with PFS fallback, and a client
+bounce buffer; NVMe-primary tiers, 4 servers/node) — <em>not</em> the FitCachePP binaries used for CosmoFlow. Every node
+owns <strong>3 windows × 512 HDF5 files = 97.9&nbsp;GB</strong> of <code>deepcam_weak_512win</code> (1,530 windows,
+32.6&nbsp;GB each); disjoint per-scale window ranges (N2 0–5, N4 6–17, N8 18–41, N16 42–89, N32 90–185, N64 186–377;
+378–1529 reserved for N128/N256 and never read). Phases: native 1 epoch → FitCache fill + 2 warm epochs; epoch time from
+the trainer's MLLOG <code>epoch_start/stop</code>. <strong>3 repeats per scale, medians</strong>, all 18 usable
+(two natives lost to a MIOpen <code>ocl_wrw_rdc</code> workspace flake were redone in fresh cold slots). Map:
+<code>deepcam_hvac/campaign_map.txt</code>.</p>
+<table>
+<tr><th>Nodes</th><th>GPUs</th><th>Native cold (s)</th><th>Fill (s)</th><th>Warm (s)</th><th>Speedup</th><th>Native spread (3 reps)</th><th>Ranks that hit the 20&nbsp;s RPC timeout → PFS fallback (per rep)</th></tr>
+<tr><td>2</td><td>16</td><td>1037.9</td><td>159.2</td><td>60.5</td><td><strong>17.1×</strong></td><td>774 / 1163 / 1038</td><td>1 / 0 / 1 of 16</td></tr>
+<tr><td>4</td><td>32</td><td>842.7</td><td>168.9</td><td>61.0</td><td><strong>13.8×</strong></td><td>774 / 1079 / 843</td><td>0 / 1 / 0 of 32</td></tr>
+<tr><td>8</td><td>64</td><td>812.6</td><td>182.1</td><td>68.4</td><td><strong>11.9×</strong></td><td>813 / 793 / 874</td><td>0 / 1 / 1 of 64</td></tr>
+<tr><td>16</td><td>128</td><td>802.2</td><td>198.0</td><td>81.3</td><td><strong>9.9×</strong></td><td>791 / 802 / 850</td><td>1 / 1 / 1 of 128</td></tr>
+<tr><td>32</td><td>256</td><td>860.2</td><td>205.3</td><td>86.6</td><td><strong>9.9×</strong></td><td>850 / 928 / 860</td><td>2 / 0 / 1 of 256</td></tr>
+<tr><td>64</td><td>512</td><td>1114.3</td><td>298.1</td><td>110.0</td><td><strong>10.1×</strong></td><td>1202 / 702 / 1114</td><td>23 / 5 / 5 of 512</td></tr>
+</table>
+<p class="note"><strong>Read:</strong> DeepCAM's reference loader is storage-bound on Lustre (h5py reads of 2.9&nbsp;MB
+samples), so serving from node-local NVMe gives ~10× from 128 GPUs up, with the warm epoch growing 60→110&nbsp;s (DDP
+all-reduce and the fallback ranks) while the native epoch stays near 800–1100&nbsp;s. Two properties must be stated with
+any use of these numbers: (a) the native cold epoch behaves like a nearly <em>fixed</em> cost that does not scale with
+bytes read (774–1160&nbsp;s at 97.9&nbsp;GB/node vs 750–1030&nbsp;s at 32.6&nbsp;GB/node in the validation wave, per-file
+cost 12.2→4.0&nbsp;s), so the headline ratio depends on the per-node size chosen (~50× at 32.6&nbsp;GB/node, ~10× here);
+(b) the ratio compares the first native epoch with a warm cached epoch — at 32.6&nbsp;GB/node the second and third
+native epochs were rescued by Lustre server caches (N32: 898 → 115 → 73&nbsp;s vs 20&nbsp;s cached), and no multi-epoch
+native control exists at 97.9&nbsp;GB/node.</p>
+<p class="warn"><strong>Decision 2026-09-09 (Garson): DeepCAM stays out of the paper; the syscall-path weak-scaling
+claim is carried by CosmoFlow (§1.1c).</strong> Reasons: the campaign stops at 512 GPUs (both 1024- and 2048-GPU
+attempts hung in the torch c10d TCPStore rendezvous <em>during the native phase</em>, with no FitCache library loaded —
+all ranks log &ldquo;client socket cannot be initialized … errno 97&rdquo; and 0 ranks initialise; the same scales ran in
+August, both hangs are post-Sep-1-maintenance; ~380 node-hours were spent for zero data and the 5 remaining large jobs
+were cancelled with 471 node-hours left), the binaries differ from the FitCachePP CosmoFlow runs, and the cold-vs-warm
+framing needs multi-epoch native controls. Everything needed to resume (corpus windows 378–1529 untouched, runner
+<code>run_deepcam_hvac.sh</code>, build_v9) is in place.</p>
+
 <h2>1.2 — Vision (real torch DataLoader, 150&nbsp;KB image records) — 1× footprint <span class="badge done">FINAL</span></h2>
 <p class="note">Corpus <code>synth_2tb_256x8gb_img</code>: 256 × 8&nbsp;GiB shards of fixed 150,528-byte records
 (3×224×224 uint8; ~14.6&nbsp;M images, 2&nbsp;TiB). Same whole-shard 1/N partition → 1×. Random whole-record reads,
@@ -172,6 +279,8 @@ regime where the cache matters most.</p>
 <tr><td>Megatron weak (same loader, 128&nbsp;GiB/node constant)</td><td>random ~2&nbsp;KB docs</td><td><strong>1×</strong> (128&nbsp;GiB/node at every scale)</td><td><strong>54×</strong></td><td><strong>15×</strong> (sustained; 15–112× across all scales)</td><td>native side = Lustre contention; warm nearly scale-flat</td></tr>
 <tr><td>Vision (DataLoader, 150&nbsp;KB records)</td><td>random 150&nbsp;KB images</td><td><strong>1×</strong> (1.1T→8G/node)</td><td><strong>5.2×</strong></td><td>I/O path ~10&nbsp;GB/s scale-flat; end-to-end loader- and SSD-class-bound</td><td>DataLoader consumer + node SSD class</td></tr>
 <tr><td>GNN (2-hop sampler)</td><td>random 4&nbsp;KB rows</td><td><strong>N×</strong> (841G/node)</td><td><strong>18.8×</strong></td><td><strong>24.1×</strong> (grows with contention)</td><td>genuinely storage-bound → full win</td></tr>
+<tr><td>CosmoFlow real training, syscall path, weak (44.5&nbsp;GB/node constant)</td><td>sequential 2.9&nbsp;MB TFRecords via <code>pread</code></td><td><strong>1×</strong> (44.5&nbsp;GB/node in DRAM tier at every scale)</td><td><strong>1.30×</strong></td><td><strong>3.07×</strong> (1.3× flat to 512 GPUs, then native climbs as Lustre contends)</td><td>GPU compute + all-reduce (warm 132–149&nbsp;s scale-flat)</td></tr>
+<tr><td>DeepCAM real training, syscall path, weak (97.9&nbsp;GB/node; IPDPS code; <em>held out of paper</em>)</td><td>sequential 2.9&nbsp;MB HDF5 samples via <code>pread64</code></td><td><strong>1×</strong> (97.9&nbsp;GB/node NVMe at every scale)</td><td><strong>17.1×</strong></td><td>10.1× at 512 GPUs (campaign capped; ≥1024-rank rendezvous hang)</td><td>DDP all-reduce + RPC-timeout fallback ranks</td></tr>
 </table>
 <p class="note">(1) <strong>Access pattern decides the win</strong>: random/latency-bound access gains 5–30×; sequential
 scans gain ~nothing on Orion (Lustre seq ≈ NVMe seq) — why the old sequential benches were retired. (2) <strong>1× vs N×
@@ -196,6 +305,19 @@ node. This is a property of node-local storage, not of FitCachePP — worth one 
 reads through its real <code>.idx</code>. Client fixes shipped during the campaign (local warm resolve without PFS
 stat; open-RPC skip when cached; fstat coverage guard) — warm-path correctness verified at scale: 100% cache hits,
 zero fallbacks.</p>
+<p class="note"><strong>Syscall campaigns (§1.1c–d).</strong> <em>Timing.</em> CosmoFlow epoch time is the trainer's own
+per-epoch wall on rank&nbsp;0 (all ranks agree within 1–5%; slowest rank reported separately); DeepCAM uses MLLOG
+<code>epoch_start/stop</code>. <em>Cold slots.</em> Every scale reads its own never-read window range; a repeat re-reads
+the same windows only after ≥9.25&nbsp;h. <em>RPC robustness.</em> The final clients time out a lost RPC after 20&nbsp;s
+and fall back to the PFS instead of hanging (this class of hang — untimed waits after a lost Mercury response at epoch
+boundaries — cost ~12 jobs across both campaigns before the fix); per-rank counters are logged at exit and are zero on
+all CosmoFlow ranks, 0–2 ranks up to 256 ranks and 5–23 of 512 ranks in DeepCAM. <em>Probe.</em> The probe's first
+~120&nbsp;s read its own cold corpus and are not a baseline; the 86&nbsp;s pre-native sleep therefore yields no idle
+baseline in campaign jobs — the warm-epoch window (job idle on the PFS) is used as the ambient reference instead.
+<em>Slot variance.</em> Native cold epochs vary up to 3.6× between repeats at ≥512 GPUs (Sep&nbsp;1–2 post-maintenance
+Lustre slowdown included); warm epochs vary &lt;2%. Medians of three are reported with the spread. <em>Cache footprint.</em>
+CosmoFlow's 44.5&nbsp;GB/node lands entirely in the 100&nbsp;GiB DRAM tier (NVMe path 40&nbsp;B); DeepCAM's 97.9&nbsp;GB/node
+is NVMe-primary (du-verified 93.9–97.6&nbsp;GB/node, DRAM ≤1&nbsp;GB).</p>
 
 <hr>
 
@@ -261,7 +383,11 @@ cold Lustre metadata, repeats are MDS-cached):</p>
 </table>
 
 <footer>
-Last updated: 2026-07-19. <strong>Weak-scaling variance decomposition added (§1.1b)</strong> — cold-slot repeats show the speedup peak was native-slot contention (native 137.5→30.0 s at 256 GPUs between slots) while warm repeats are stable. <strong>Adaptive placement v1 verified</strong> — all three decisions correct on 2 nodes;
+Last updated: 2026-09-09. <strong>Syscall-path weak scaling added (§1.1c–d)</strong> — CosmoFlow real training 24/24
+jobs, 16→2048 GPUs at 44.5&nbsp;GB/node: 1.30× flat to 512 GPUs → 1.65× at 1024 → 3.07× at 2048 (warm 132.5–148.7&nbsp;s
+scale-flat; per-phase PFS probe analysis included); DeepCAM real training 18/18 jobs 16→512 GPUs at 97.9&nbsp;GB/node,
+17.1×→10.1×, recorded but held out of the paper (campaign capped at 512 GPUs by a ≥1024-rank torch rendezvous hang; IPDPS
+binaries). Cross-workload summary (§1.4) and caveats (§1.5) extended. Earlier entry (2026-07-19): <strong>Weak-scaling variance decomposition added (§1.1b)</strong> — cold-slot repeats show the speedup peak was native-slot contention (native 137.5→30.0 s at 256 GPUs between slots) while warm repeats are stable. <strong>Adaptive placement v1 verified</strong> — all three decisions correct on 2 nodes;
 overhead 2–3&nbsp;ms (256 files) / 2.8&nbsp;s (16,320 files) warm-metadata (§2.3). <strong>Weak-scaling ladder COMPLETE
 (8/8)</strong> — 128&nbsp;GiB/node constant, disjoint
 cold shard ranges: 15–112× sustained through 2048 GPUs (§1.1b). <strong>Per-scale cold (strong) ladder COMPLETE

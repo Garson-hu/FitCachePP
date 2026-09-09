@@ -610,6 +610,67 @@ Overhead is measured as <code>decide_us</code> self-timing over the real 256-fil
 reporting cold- and warm-metadata separately (first call pays Lustre inode fetch; repeats are MDS-cached). Results:
 experiments.html §2.3.</p>
 
+<h3>12.10 Syscall-path weak-scaling protocol — real CosmoFlow and DeepCAM training (2026-08-15 → 09-09)</h3>
+<p class="note"><strong>Why.</strong> §12.8 covers the <code>mmap</code> path with a synthetic-data real loader. The
+<code>read</code>/<code>pread</code> interception path is the one the base paper's CosmoFlow and DeepCAM numbers use, and
+its weak-scaling behaviour had not been measured. Both workloads here are <em>real training</em> (model, optimiser,
+all-reduce), so epochs carry GPU time and the speedup is bounded by the I/O fraction, unlike the loader-only §12.8.</p>
+<p class="note"><strong>Corpora (real byte copies, so every window is its own Lustre objects).</strong> CosmoFlow:
+<code>data/cosmoflow/cosmo_weak_512x32gb</code>, 512 windows × 15,360 GZIP TFRecords (window <i>w</i> copies source files
+[<i>w</i>·15360, …] mod 524288 of the MLCommons set) = <strong>44.5&nbsp;GB per window</strong> (du -sb; the runner's
+&ldquo;~32&nbsp;GB&rdquo; comment was the design estimate), one window per node, windows 510–511 reserved for
+validation. DeepCAM: <code>data/deepcam/deepcam_weak_512win</code>, 1,530 windows × 512 HDF5 samples = 32.6&nbsp;GB per
+window, <strong>three windows per node = 97.9&nbsp;GB</strong> (a 32.6&nbsp;GB/node validation wave showed the native
+epoch does not scale with bytes read, so the per-node size was raised to keep the working set far outside node RAM
+caches). Builders: <code>build_cosmoflow_weak_corpus.sh</code>, <code>build_deepcam_weak_corpus{,_ext768,_ext1530}.sh</code>
+(idempotent, resumable).</p>
+<p class="note"><strong>Job shape (one job = one scale × one repeat; 8 GPU ranks/node).</strong> <em>stage_env</em>
+(conda env untarred to node-local storage) → 86&nbsp;s idle → <em>native_train</em>: one epoch, stock launcher, no
+LD_PRELOAD, first-ever reader of its windows → 20&nbsp;s → <em>fitcache_train</em>: servers started (FitCachePP
+<code>fitcache_server</code>, 4/node, DRAM tier 100&nbsp;GiB tmpfs + NVMe 1500&nbsp;GiB, ports file rendezvous), then
+three epochs under LD_PRELOAD (epoch&nbsp;1 = fill, 2–3 = warm) → cache footprint census (<code>du -sb</code> per node)
+→ probe stopped. Every scale reads a <strong>disjoint window range</strong> (CosmoFlow bases 0/2/6/14/30/62/126/254;
+DeepCAM 0/6/18/42/90/186/378/762) so per-scale natives are cold without waiting; a repeat of the same scale waits
+≥9.25&nbsp;h (<code>--begin</code> floors, chained dependencies) before re-reading its windows. Phase outcomes
+(<code>phase_outcomes.log</code>: 0 ok / 124 timeout / 143 killed) and absolute-epoch phase marks (<code>phases.log</code>)
+are written by the job. Launchers: <code>cosmoflow/run_cosmoflow_weak.sh</code> + <code>submit_cosmoflow_weak.sh</code>
+(24-job chain, three waves); <code>deepcam/run_deepcam_hvac.sh</code> + <code>submit_deepcam_hvac_campaign.sh</code>.
+Epoch time: CosmoFlow = the trainer's own &ldquo;…&nbsp;s/epoch&rdquo; wall on rank&nbsp;0 (max over ranks = slowest rank);
+DeepCAM = MLLOG <code>epoch_start/epoch_stop</code>. Analysis: <code>cosmoflow/analyze_cosmoflow_weak.py</code>.</p>
+<p class="note"><strong>DeepCAM runs the IPDPS code, not FitCachePP.</strong> By decision (2026-08-26) DeepCAM uses the
+original FitCache/HVAC tree <code>FitCache_Frontier</code>: build_v4 is the pristine IPDPS binary; build_v9 = v4 + the
+<code>pread64</code> alias (h5py's libhdf5 imports <code>pread64</code>, which the original client did not export, so
+every HDF5 read had bypassed the cache — the reason the first DeepCAM campaign was discarded), the server-map locks,
+timed RPC waits with PFS fallback, and a client bounce buffer. <code>--max_inter_threads 0</code> as in IPDPS (DataLoader
+workers fork and wedge the preloaded client in Mercury init). NVMe-primary tiers (DRAM 256&nbsp;MiB), 4 servers/node,
+20&nbsp;s RPC timeout. Results in experiments.html §1.1d; held out of the paper (see the decision box there).</p>
+<p class="note"><strong>RPC-robustness fixes shipped during the campaigns (both trees).</strong> The hang class that cost
+~12 fill/warm phases was a chain: (1) the data-mover's promote insert into <code>path_cache_map</code> was unlocked while
+the close-RPC handler read the map → server segfault under the fill promote storm → srun killed every server → clients
+waited forever; (2) the client's <code>ms_read</code> wait was an untimed <code>pthread_cond_wait</code> and its failure
+branch only completed when both tiers had answered (only the DRAM RPC is ever issued); (3) the HVAC open path also blocked
+untimed; (4) cancelling a timed-out RPC made the server assert on a push into a freed client buffer. Final design: locked
+server maps, tolerant server bulk callbacks (respond −1 instead of asserting), client RDMA into an internal bounce buffer
+with memcpy on success, timeout = <em>abandon</em> (no cancel) + PFS fallback, callbacks free before signalling, per-rank
+exit counters <code>ms_read_rpc_timeouts= abandoned= late_success=</code> / <code>open_rpc_timeouts=</code>. Validation:
+CosmoFlow N64 r3 and N128 r1/r2 clean with 512/512 and 1024/1024 ranks at zero timeouts; DeepCAM N32 clean with one
+rank falling back and the job surviving (the pre-fix behaviour was a job-wide hang on that exact event).</p>
+<p class="note"><strong>PFS probe beside every job</strong> (<code>megatron/probe_filesystem.sh</code>, unchanged from
+§12.8): one node per job, fio O_DIRECT random reads on a separate 1&nbsp;TB synthetic dataset — 4&nbsp;KiB at 100/s
+(latency, iodepth&nbsp;1) and 4&nbsp;MiB×4 in flight at 5/s (bandwidth), per-read logs stamped with absolute Unix ms,
+clean shutdown via stop file. Two protocol facts learned in this campaign: the probe's first ~120&nbsp;s read its own cold
+corpus and are up to 100× slow, so the 86&nbsp;s pre-native window is <em>not</em> an idle baseline (use the warm-epoch
+window, when the job issues no PFS reads, as the ambient reference); and the probe reads different OSTs than the training
+corpus, so it measures the system-wide ambient state, not the contention on the corpus's own OSTs — native slot variance
+(up to 3.6× between repeats at ≥512 GPUs) is real but invisible to it. Latency is bimodal (~0.25&nbsp;ms Lustre-server-cache
+hit vs ~25&nbsp;ms disk), so per-phase means and miss fractions are reported.</p>
+<p class="note"><strong>Large-scale DeepCAM (1024/2048 GPUs) not measured.</strong> Both attempts hung in the torch
+c10d TCPStore rendezvous during the <em>native</em> phase (no FitCache library loaded): every rank printed the APEX banner
+and &ldquo;[c10d] client socket cannot be initialized … errno 97&rdquo;, 0 ranks initialised, 0 MLLOG events, with
+<code>USE_LIBUV=1</code> and a 60&nbsp;min process-group timeout already set. The same scales ran in August; both hangs
+followed the Sep&nbsp;1 maintenance. ~380 node-hours were consumed for zero data; the five remaining large jobs were
+cancelled on 2026-09-09 with 471 node-hours left and the campaign capped at 512 GPUs.</p>
+
 <footer>
 Generated 2026-06-14 from the benchmark sources + harness scripts (mined and cross-checked; every claim cites <code>file:line</code>).
 Rewritten 2026-06-14 for plain-English readability; 2026-06-20 rewritten for the redesign — the whole system is now the <code>mmap</code>
@@ -622,7 +683,9 @@ The standalone access-aware-placement ablation is folded into prefetch and the i
 which supersedes the §4/§6/§8 measurement methods. <strong>2026-07-07: added §12.7</strong> (real-case 8-ranks/node layout) and
 extended §12.5 with the fstat SIGBUS guard and the .meta-optional resolve semantics. <strong>2026-07-15: added
 §12.8</strong> (weak-scaling protocol: 128&nbsp;GiB/node constant, disjoint cold shard windows) <strong>and §12.9</strong>
-(adaptive-placement verification: three-case decision sanity + overhead self-timing). Numbers are authoritative in
+(adaptive-placement verification: three-case decision sanity + overhead self-timing). <strong>2026-09-09: added
+§12.10</strong> (syscall-path weak scaling with real CosmoFlow / DeepCAM training: corpora, job shape, IPDPS-tree DeepCAM,
+RPC-robustness fixes, probe caveats, the ≥1024-rank rendezvous hang that capped DeepCAM). Numbers are authoritative in
 <a href="experiments.html">experiments.html</a>. Focus is methodology (how experiments are built, run, and measured).
 </footer>
 
