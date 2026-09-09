@@ -61,6 +61,59 @@ extern "C" int fitcache_prefetch(const char *original_path, int replication_mode
 #include <sys/statvfs.h>
 #include <ctime>
 
+// ============================================================
+// 2026-09-03 RPC-hang fix (ms_read):
+//  (1) Only the DRAM-tagged RPC is ever issued, but the callback's failure
+//      branches completed the wait only when BOTH tiers were done -> any
+//      failed/cancelled RPC left ms_read waiting forever (job-wide hang via
+//      the training collective).  ms_all_issued_done_failed() fixes that.
+//  (2) The wait itself was untimed.  ms_wait_completed_timed() bounds it
+//      (FitCache_RPC_TIMEOUT_S, default 60 s; 0 = untimed), HG_Cancel()s the in-flight
+//      forward, and lets the wrapper fall back to the PFS read.  Per-rank
+//      counters are printed at exit so the campaign can prove how often
+//      this fired (expected: 0).
+// ============================================================
+#include <atomic>
+#include <time.h>
+#include <errno.h>
+static std::atomic<unsigned long> g_ms_rpc_timeouts{0};
+static std::atomic<unsigned long> g_ms_rpc_abandoned{0};
+static std::atomic<unsigned long> g_ms_rpc_late_success{0};
+static int ms_rpc_timeout_s(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("FitCache_RPC_TIMEOUT_S"); v = e ? atoi(e) : 60; if (v < 0) v = 0; }
+    return v;
+}
+static inline bool ms_all_issued_done_failed(ms_read_state *ms) {
+    bool all_done   = ms->pm_done && (ms->ssd_done || !ms->ssd_issued);
+    bool all_failed = ms->pm_result < 0 && (ms->ssd_result < 0 || !ms->ssd_issued);
+    return all_done && all_failed;
+}
+/* Called with ms->lock HELD. Returns 0 = completed (normally or after cancel),
+ * 1 = abandoned (cancel callback never arrived; caller must NOT free state). */
+static int ms_wait_completed_timed(ms_read_state *ms, fitcache_rpc_state *st, int fd, int64_t offset, size_t count) {
+    (void)st;
+    int tmo = ms_rpc_timeout_s();
+    if (tmo <= 0) { while (!ms->completed) pthread_cond_wait(&ms->cond, &ms->lock); return 0; }
+    struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += tmo;
+    int rc = 0;
+    while (!ms->completed && rc != ETIMEDOUT) rc = pthread_cond_timedwait(&ms->cond, &ms->lock, &dl);
+    if (ms->completed) return 0;
+    /* Timed out: ABANDON the RPC (no HG_Cancel — the server may still be mid-push
+     * into our bounce buffer and must not hit a freed handle). The state, bounce
+     * buffer and ms are leaked on purpose; the callback, if it ever fires, sees
+     * ms->abandoned and skips the memcpy into the app buffer. */
+    ms->abandoned = true;
+    g_ms_rpc_timeouts++;
+    L4C_ERR("ms_read: read RPC timed out after %d s (fd %d off %lld len %zu): abandoning RPC, falling back to PFS read",
+            tmo, fd, (long long)offset, count);
+    return 1;
+}
+static void __attribute__((destructor)) ms_read_rpc_report(void) {
+    fprintf(stderr, "[fitcache-client] ms_read_rpc_timeouts=%lu abandoned=%lu late_success=%lu timeout_s=%d\n",
+            g_ms_rpc_timeouts.load(), g_ms_rpc_abandoned.load(), g_ms_rpc_late_success.load(), ms_rpc_timeout_s());
+}
+
 static inline double fitcache_adaptive_now_us()
 {
     struct timespec ts;
@@ -195,16 +248,25 @@ ssize_t ms_read(int fd, void* buf, size_t count, int64_t offset)
     ms->ssd_done = false;
     ms->pm_result = -1;
     ms->ssd_result= -1;
+    ms->ssd_issued = false;
+    ms->abandoned = false;
 
+    /* 2026-09-04: RDMA into an internal bounce buffer, never the app buffer, so a
+     * timed-out RPC can be abandoned (no HG_Cancel, no freed remote handle for the
+     * server to trip over) and a late push lands in orphaned memory harmlessly. */
+    void *bounce = malloc(count);
+    if (!bounce) { pthread_mutex_destroy(&ms->lock); pthread_cond_destroy(&ms->cond); free(ms); return -1; }
     fitcache_rpc_state* dram_state = (fitcache_rpc_state*) calloc(1, sizeof(fitcache_rpc_state));
     dram_state->ms = ms;
-    dram_state->buffer = buf;
+    dram_state->buffer = bounce;
+    dram_state->user_buf = buf;
     dram_state->size = count;
     dram_state->requested_tier = CACHE_TIER_DRAM;
 
     fitcache_rpc_state* nvme_state = (fitcache_rpc_state*) calloc(1, sizeof(fitcache_rpc_state));
     nvme_state->ms = ms;
-    nvme_state->buffer = buf;
+    nvme_state->buffer = bounce;
+    nvme_state->user_buf = buf;
     nvme_state->size = count;
     nvme_state->requested_tier = CACHE_TIER_NVME;
 
@@ -224,7 +286,7 @@ ssize_t ms_read(int fd, void* buf, size_t count, int64_t offset)
     }
 
     fitcache::add_value("ms_read.fetch_rpcs_issued", 1.0);
-    fitcache_client_comm_gen_read_rpc_with_ms(host, fd, buf, count, offset,
+    fitcache_client_comm_gen_read_rpc_with_ms(host, fd, bounce, count, offset,
         ms_read_cb, dram_state);
     
     L4C_INFO("Generated read rpc with ms");
@@ -233,10 +295,7 @@ ssize_t ms_read(int fd, void* buf, size_t count, int64_t offset)
 
     pthread_mutex_lock(&ms->lock);
 
-    while(!ms->completed) 
-    {
-        pthread_cond_wait(&ms->cond, &ms->lock);
-    }
+    int __ms_abandoned = ms_wait_completed_timed(ms, dram_state, fd, offset, count);
 
     if(ms->pm_done && ms->pm_result != -1) 
     {
@@ -256,7 +315,11 @@ ssize_t ms_read(int fd, void* buf, size_t count, int64_t offset)
         L4C_INFO("ms->pm_result: %ld, ms->ssd_result: %ld", ms->pm_result, ms->ssd_result);
     }
 
+    if (__ms_abandoned) {
+        return -1;   /* state deliberately leaked: the cancel callback may still fire */
+    }
     // 7. Clean up
+    free(dram_state->buffer);   /* bounce */
     free(dram_state);
     free(nvme_state);
     pthread_mutex_destroy(&ms->lock);
@@ -275,6 +338,11 @@ static hg_return_t ms_read_cb(const struct hg_cb_info *info)
     if(info->ret != HG_SUCCESS) 
     {
         L4C_INFO("RPC failed");
+        /* 2026-09-04: release Mercury resources BEFORE signaling — once the
+         * waiter is woken it frees `state`; touching it afterwards was a
+         * use-after-free (glibc "free(): invalid next size" aborts). */
+        if (state->bulk_handle != HG_BULK_NULL) { HG_Bulk_free(state->bulk_handle); state->bulk_handle = HG_BULK_NULL; }
+        HG_Destroy(info->info.forward.handle);
         pthread_mutex_lock(&ms->lock);
         if(state->requested_tier == CACHE_TIER_DRAM) 
         {
@@ -290,8 +358,7 @@ static hg_return_t ms_read_cb(const struct hg_cb_info *info)
         if (!ms->completed) 
         {
             // check if the other request is done or not
-            if ((ms->pm_done && ms->ssd_done) &&
-                (ms->pm_result < 0 && ms->ssd_result < 0)) 
+            if (ms_all_issued_done_failed(ms)) 
                 {
                 // both fail => complete
                 ms->completed = true;
@@ -299,12 +366,6 @@ static hg_return_t ms_read_cb(const struct hg_cb_info *info)
             }
         }
         pthread_mutex_unlock(&ms->lock);
-
-        if (state->bulk_handle != HG_BULK_NULL) {
-            HG_Bulk_free(state->bulk_handle);
-        }
-        HG_Destroy(info->info.forward.handle);
-
         return HG_SUCCESS;
     }
 
@@ -312,7 +373,9 @@ static hg_return_t ms_read_cb(const struct hg_cb_info *info)
     hg_return_t ret = HG_Get_output(info->info.forward.handle, &out);
     if (ret != HG_SUCCESS) 
     {
-        // handle error
+        // handle error — release Mercury resources BEFORE signaling (see above)
+        if (state->bulk_handle != HG_BULK_NULL) { HG_Bulk_free(state->bulk_handle); state->bulk_handle = HG_BULK_NULL; }
+        HG_Destroy(info->info.forward.handle);
         pthread_mutex_lock(&ms->lock);
         if (state->requested_tier == CACHE_TIER_DRAM) 
         {
@@ -325,26 +388,19 @@ static hg_return_t ms_read_cb(const struct hg_cb_info *info)
         // check if both done => complete
         if (!ms->completed) 
         {
-            if ((ms->pm_done && ms->ssd_done) &&
-                (ms->pm_result < 0 && ms->ssd_result < 0)) 
+            if (ms_all_issued_done_failed(ms)) 
                 {
                 ms->completed = true;
                 pthread_cond_signal(&ms->cond);
             }
         }
         pthread_mutex_unlock(&ms->lock);
-
-        // TODO: add destroy in here.
-        if (state->bulk_handle != HG_BULK_NULL) {
-            HG_Bulk_free(state->bulk_handle);
-        }
-        HG_Destroy(info->info.forward.handle);
-
         return HG_SUCCESS;
     }
 
     ssize_t bytes_read = out.ret;
     fitcache_rpc_state *rpc = state;
+    if (bytes_read > (ssize_t)rpc->size) bytes_read = (ssize_t)rpc->size;   /* defensive */
 
     ret = HG_Bulk_free(rpc->bulk_handle);
     ret = HG_Free_output(info->info.forward.handle, &out);
@@ -352,6 +408,8 @@ static hg_return_t ms_read_cb(const struct hg_cb_info *info)
 
     // success read, update ms
     pthread_mutex_lock(&ms->lock);
+    if (!ms->abandoned && bytes_read > 0 && rpc->user_buf && rpc->buffer != rpc->user_buf)
+        memcpy(rpc->user_buf, rpc->buffer, (size_t)bytes_read);   /* deliver from bounce to the app */
     if (rpc->requested_tier == CACHE_TIER_DRAM) {
         ms->pm_done   = true;
         ms->pm_result = bytes_read;
@@ -377,8 +435,7 @@ static hg_return_t ms_read_cb(const struct hg_cb_info *info)
             fitcache::add_value("ms_read.bytes_redundant", (double)bytes_read);
         }
         // if the other side also done or both fail => complete
-        if ((ms->pm_done && ms->ssd_done) &&
-            (ms->pm_result < 0 && ms->ssd_result < 0)) 
+        if (ms_all_issued_done_failed(ms)) 
         {
             ms->completed = true;
             pthread_cond_signal(&ms->cond);

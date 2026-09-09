@@ -84,6 +84,8 @@ struct ms_read_state {
     bool                 completed;
     bool                 pm_done;
     bool                 ssd_done;
+    bool                 ssd_issued;   // 2026-09-03: was the NVMe RPC actually sent? (never, today)
+    bool                 abandoned;    // 2026-09-03: timed out AND cancel callback never came (state leaked)
     ssize_t              pm_result;
     ssize_t              ssd_result;
 };

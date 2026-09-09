@@ -643,7 +643,10 @@ void *fitcache_data_mover_fn(void *args)
 
             try{
                 fs::copy(original_path, filename);
-                path_cache_map[original_path] = filename;
+                {   // 2026-09-04: THE remaining unlocked writer (crashed close handler's locked find at :541 x5)
+                    std::unique_lock<std::shared_mutex> wlock(cache_mtx);
+                    path_cache_map[original_path] = filename;
+                }
                 // Update the used bytes for whichever tier we landed in.
                 switch (target_tier) {
                     case CACHE_TIER_DRAM: g_dram_used_bytes += file_size; break;

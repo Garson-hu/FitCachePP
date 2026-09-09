@@ -270,7 +270,8 @@ struct fitcache_seek_state;
 struct fitcache_rpc_state {
     uint32_t            value;
     hg_size_t           size;
-    void                *buffer;
+    void                *buffer;      /* bounce buffer registered for RDMA (client) / server-side buffer */
+    void                *user_buf;    /* 2026-09-04: client only — the app's buffer; filled by memcpy in the success cb */
     hg_bulk_t           bulk_handle;
     hg_handle_t         handle;
     fitcache_rpc_in_t       in;

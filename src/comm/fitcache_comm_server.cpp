@@ -501,6 +501,14 @@ fitcache_rpc_handler(hg_handle_t handle)
         }
     }
 
+    if (readbytes < 0) {   /* 2026-09-04: respond -1 instead of pushing a negative size */
+        L4C_ERR("server read on fd %d failed: %s", fitcache_rpc_state_p->in.accessfd, strerror(errno));
+        fitcache_rpc_out_t out; out.ret = -1;
+        HG_Respond(handle, NULL, NULL, &out);
+        HG_Bulk_free(fitcache_rpc_state_p->bulk_handle); HG_Destroy(handle);
+        free(fitcache_rpc_state_p->buffer); free(fitcache_rpc_state_p);
+        return HG_SUCCESS;
+    }
     //Reduce size of transfer to what was actually read 
     //We may need to revisit this.
     fitcache_rpc_state_p->size = readbytes;
@@ -509,11 +517,14 @@ fitcache_rpc_handler(hg_handle_t handle)
     ret = HG_Bulk_transfer(hgi->context, fitcache_rpc_handler_bulk_cb, fitcache_rpc_state_p,
         HG_BULK_PUSH, hgi->addr, fitcache_rpc_state_p->in.bulk_handle, 0,
         fitcache_rpc_state_p->bulk_handle, 0, fitcache_rpc_state_p->size, HG_OP_ID_IGNORE);
-    
-    assert(ret == 0);
-    (void) ret;
-
-    return (hg_return_t)ret;
+    if (ret != HG_SUCCESS) {   /* 2026-09-04: tolerate a failed transfer start */
+        L4C_ERR("HG_Bulk_transfer failed to start (hg ret=%d): responding -1", (int)ret);
+        fitcache_rpc_out_t out; out.ret = -1;
+        HG_Respond(handle, NULL, NULL, &out);
+        HG_Bulk_free(fitcache_rpc_state_p->bulk_handle); HG_Destroy(handle);
+        free(fitcache_rpc_state_p->buffer); free(fitcache_rpc_state_p);
+    }
+    return HG_SUCCESS;
 }
 
 static hg_return_t
@@ -528,16 +539,28 @@ fitcache_close_rpc_handler(hg_handle_t handle)
         L4C_ERR("Failed to close file %d, errno: %d (%s)", in.fd, errno, strerror(errno));
     }
 
-    if (path_cache_map.find(fd_to_path[in.fd]) == path_cache_map.end())
+    // Both maps are shared with the data mover thread (which inserts into
+    // path_cache_map under cache_mtx); reading them unlocked here races with
+    // a rehash. fd_to_path[] would also insert an empty entry for unknown fds.
+    std::string original_path;
+    bool need_promote = false;
     {
-        L4C_INFO("Caching %s",fd_to_path[in.fd].c_str());
+        std::unique_lock<std::shared_mutex> wlock(cache_mtx);
+        auto itf = fd_to_path.find(in.fd);
+        if (itf != fd_to_path.end()) {
+            original_path = itf->second;
+            need_promote = (path_cache_map.find(original_path) == path_cache_map.end());
+            fd_to_path.erase(itf);
+        }
+    }
+    if (need_promote)
+    {
+        L4C_INFO("Caching %s", original_path.c_str());
         pthread_mutex_lock(&data_mutex);
-        data_queue.push(fd_to_path[in.fd]);
+        data_queue.push(original_path);
         pthread_cond_signal(&data_cond);
         pthread_mutex_unlock(&data_mutex);
-    }   
-
-    fd_to_path.erase(in.fd);
+    }
  
     return (hg_return_t)ret;
 }

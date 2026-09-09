@@ -193,12 +193,14 @@ fitcache_rpc_handler_bulk_cb(const struct hg_cb_info *info)
     struct fitcache_rpc_state *fitcache_rpc_state_p = (struct fitcache_rpc_state*)info->arg;
     int ret;
     fitcache_rpc_out_t out;
-    out.ret = fitcache_rpc_state_p->size;
-    // & infor->ret is the type of hg_return_t
-    assert(info->ret == 0);
-
+    /* 2026-09-04: never assert in the completion path — a failed push (e.g. the
+     * client abandoned/timed out its RPC) must not take the whole server down. */
+    out.ret = (info->ret == HG_SUCCESS) ? (int64_t)fitcache_rpc_state_p->size : -1;
+    if (info->ret != HG_SUCCESS)
+        L4C_ERR("bulk push to client failed (hg ret=%d): responding -1", (int)info->ret);
     ret = HG_Respond(fitcache_rpc_state_p->handle, NULL, NULL, &out);
-    assert(ret == HG_SUCCESS);        
+    if (ret != HG_SUCCESS)
+        L4C_ERR("HG_Respond after bulk push failed (hg ret=%d)", (int)ret);
 
     HG_Bulk_free(fitcache_rpc_state_p->bulk_handle);
     // L4C_INFO("Info Server: Freeing Bulk Handle\n");

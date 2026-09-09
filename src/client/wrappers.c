@@ -351,11 +351,17 @@ ssize_t WRAP_DECL(pread)(int fd, void *buf, size_t count, off_t offset)
     	pread_stats.total_time += delta;
 		// ! End pread delta time
 	}
-	
+
 	return ret;
 }
 
-
+/* _FILE_OFFSET_BITS=64 callers (h5py/libhdf5 among them) bind the pread64
+ * symbol, not pread; interposition is symbol-exact, so without this alias
+ * their reads bypass FitCache entirely. Route through our pread wrapper. */
+ssize_t WRAP_DECL(pread64)(int fd, void *buf, size_t count, off64_t offset)
+{
+	return WRAP_DECL(pread)(fd, buf, count, (off_t) offset);
+}
 
 ssize_t WRAP_DECL(read64)(int fd, void *buf, size_t count)
 {
