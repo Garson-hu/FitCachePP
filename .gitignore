@@ -3,6 +3,7 @@
 /.claude/*
 .clangd
 /logs/*
+/slides/
 *log*
 core
 WORKLOG.md
