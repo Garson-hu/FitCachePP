@@ -43,7 +43,11 @@ const std::string &fitcache_comm_get_self_addr_string() {
 //This is based on the rpc_engine template provided by the mercury lib
 void fitcache_init_comm(hg_bool_t listen)
 {
-    const char *info_string = "ofi+tcp;ofi_rxm://";  
+    // Mercury transport. The IPDPS build on ARC used "ofi+verbs;ofi_rxm://"
+    // (RDMA over InfiniBand); the Frontier work moved to TCP. Let the site
+    // choose: FitCache_HG_INFO overrides, the default stays TCP.
+    const char *info_string = getenv("FitCache_HG_INFO");
+    if (!info_string || !info_string[0]) info_string = "ofi+tcp;ofi_rxm://";
     
     char *rank_str = getenv("SLURM_PROCID");
     if (rank_str == NULL) {
