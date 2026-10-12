@@ -21,6 +21,7 @@
 #include "fitcache_cross_job.h"
 #include "fitcache_cluster_registry.h"  // registry_record_file_presence (Option 1)
 #include "fitcache_persistent_meta.h"
+#include "fitcache_cxl_pool.h"
 #include "fitcache_comm.h"               // fitcache_comm_get_self_addr_string,
                                           // fitcache_broadcast_register_file (Option 2)
 using namespace std;
@@ -531,6 +532,33 @@ void *fitcache_data_mover_fn(void *args)
         L4C_INFO("PMem tier DISABLED (FitCache_PMEM_PATH and/or FitCache_PMEM_CAPACITY unset)");
     }
 
+    // CXL tier is opt-in: FitCache_CXL_PATH and FitCache_CXL_CAPACITY (bytes,
+    // per server process) must both be set. Files that do not fit in DRAM are
+    // packed into this server's pre-allocated pool file (see
+    // fitcache_cxl_pool.h). FitCache_CXL_INDEX_PATH names the regular-filesystem
+    // directory for the pool index; it defaults to the NVMe tier directory.
+    bool cxl_tier_enabled = false;
+    {
+        const char *cxl_path_env = getenv("FitCache_CXL_PATH");
+        const char *cxl_cap_env  = getenv("FitCache_CXL_CAPACITY");
+        if (cxl_path_env && cxl_path_env[0] && cxl_cap_env && cxl_cap_env[0]) {
+            const char *index_env = getenv("FitCache_CXL_INDEX_PATH");
+            const char *rank_env  = getenv("SLURM_PROCID");
+            cxl_tier_enabled = fitcache::cxl_pool_init(
+                cxl_path_env, std::stoull(cxl_cap_env), rank_env ? atoi(rank_env) : 0,
+                (index_env && index_env[0]) ? string(index_env) : g_nvme_path,
+                [](const std::string &original, const std::string &pool_ref) {
+                    std::unique_lock<std::shared_mutex> wlock(cache_mtx);
+                    path_cache_map[original] = pool_ref;
+                }) == 0;
+            if (!cxl_tier_enabled)
+                L4C_ERR("CXL tier requested (FitCache_CXL_PATH=%s) but could not be set up; "
+                        "continuing without it", cxl_path_env);
+        } else {
+            L4C_INFO("CXL tier DISABLED (FitCache_CXL_PATH and/or FitCache_CXL_CAPACITY unset)");
+        }
+    }
+
     queue<string> local_list;
 
     // string fsdax_base = string(fsdax_path) + "/XXXXXX";
@@ -602,6 +630,25 @@ void *fitcache_data_mover_fn(void *args)
                 L4C_ERR("Data mover: failed to stat %s: %s", original_path.c_str(), e.what());
                 local_list.pop();
                 continue;
+            }
+
+            // CXL tier sits right below DRAM. A pooled file has no path of its
+            // own, so it skips the per-file copy/sidecar/peer-announce steps
+            // below; if the pool is full, placement continues to PMem/NVMe.
+            if (cxl_tier_enabled &&
+                g_dram_used_bytes + file_size > g_dram_capacity_bytes) {
+                std::string pool_ref;
+                if (fitcache::cxl_pool_store(original_path, file_size, pool_ref) == 0) {
+                    {
+                        std::unique_lock<std::shared_mutex> wlock(cache_mtx);
+                        path_cache_map[original_path] = pool_ref;
+                    }
+                    if (DEBUG_HU)
+                        L4C_INFO("Data mover: Copied %s -> %s (tier=CXL)",
+                                 original_path.c_str(), pool_ref.c_str());
+                    local_list.pop();
+                    continue;
+                }
             }
 
             if (g_dram_used_bytes + file_size <= g_dram_capacity_bytes) {

@@ -52,6 +52,7 @@ target_link_libraries(fitcache_client PRIVATE pthread dl PkgConfig::LOG4C PkgCon
 add_executable(fitcache_server
     server/fitcache_server.cpp
     server/fitcache_data_mover.cpp
+    server/fitcache_cxl_pool.cpp
     comm/fitcache_comm.cpp
     comm/fitcache_comm_server.cpp
     common/fitcache_logging.c
@@ -61,6 +62,24 @@ target_include_directories(fitcache_server PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${FITCACHE_INCLUDE_DIRS})
 target_link_libraries(fitcache_server PRIVATE pthread PkgConfig::LOG4C rt PkgConfig::MERCURY)
+
+# The CXL pool creates its backing file through libfamfs when it sits on a
+# famfs mount. libfamfs is vendored as a static library built on the host that
+# has the CXL memory, so this is opt-in; without it the pool still works on
+# regular filesystems.
+option(FITCACHE_FAMFS "Link the vendored libfamfs so the CXL pool can live on famfs" OFF)
+if(FITCACHE_FAMFS)
+    target_sources(fitcache_server PRIVATE
+        ${CMAKE_SOURCE_DIR}/vendor/famfs/thpool/thpool.c
+        ${CMAKE_SOURCE_DIR}/vendor/famfs/thpool/gettid_shim.c)
+    target_compile_definitions(fitcache_server PRIVATE FITCACHE_HAVE_FAMFS)
+    target_include_directories(fitcache_server PRIVATE
+        ${CMAKE_SOURCE_DIR}/vendor/famfs/include
+        ${CMAKE_SOURCE_DIR}/vendor/famfs/thpool)
+    target_link_libraries(fitcache_server PRIVATE
+        ${CMAKE_SOURCE_DIR}/vendor/famfs/lib/liblibfamfs.a
+        /usr/local/lib64/libfuse3.so.4 yaml uuid z daxctl)
+endif()
 
 install(TARGETS fitcache_client DESTINATION lib)
 install(TARGETS fitcache_server DESTINATION bin)

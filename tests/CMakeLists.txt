@@ -28,3 +28,28 @@ target_include_directories(test_cross_job_smoke PRIVATE
     ${CMAKE_SOURCE_DIR}/src/common)
 target_link_libraries(test_cross_job_smoke PRIVATE
     pthread PkgConfig::LOG4C)
+
+# CXL tier pool: store / read / seek / restart recovery, no Mercury. Runs
+# against a regular directory by default; pass a famfs directory as argv[1]
+# (and configure with -DFITCACHE_FAMFS=ON) to run it on CXL memory.
+add_executable(test_cxl_pool
+    test_cxl_pool.cpp
+    ${CMAKE_SOURCE_DIR}/src/server/fitcache_cxl_pool.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/fitcache_logging.c)
+target_compile_definitions(test_cxl_pool PRIVATE FitCache_CLIENT)
+target_include_directories(test_cxl_pool PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/server
+    ${CMAKE_SOURCE_DIR}/src/common)
+target_link_libraries(test_cxl_pool PRIVATE pthread PkgConfig::LOG4C)
+if(FITCACHE_FAMFS)
+    target_sources(test_cxl_pool PRIVATE
+        ${CMAKE_SOURCE_DIR}/vendor/famfs/thpool/thpool.c
+        ${CMAKE_SOURCE_DIR}/vendor/famfs/thpool/gettid_shim.c)
+    target_compile_definitions(test_cxl_pool PRIVATE FITCACHE_HAVE_FAMFS)
+    target_include_directories(test_cxl_pool PRIVATE
+        ${CMAKE_SOURCE_DIR}/vendor/famfs/include
+        ${CMAKE_SOURCE_DIR}/vendor/famfs/thpool)
+    target_link_libraries(test_cxl_pool PRIVATE
+        ${CMAKE_SOURCE_DIR}/vendor/famfs/lib/liblibfamfs.a
+        /usr/local/lib64/libfuse3.so.4 yaml uuid z daxctl)
+endif()

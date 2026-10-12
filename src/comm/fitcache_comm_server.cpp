@@ -2,6 +2,7 @@
 #include "fitcache_cluster_registry.h"
 #include "fitcache_cross_job.h"
 #include "fitcache_data_mover_internal.h"
+#include "fitcache_cxl_pool.h"
 #include "fitcache_cache_policy.h"
 #include "fitcache_logging.h"
 #include "fitcache_timer.h"
@@ -285,7 +286,10 @@ fitcache_open_rpc_handler(hg_handle_t handle)
         L4C_INFO("Server Rank %d : Successful Redirection %s to %s",
                  server_rank, path_str.c_str(), redir_path.c_str());
         fitcache_open_out_t out;
-        out.ret_status = open(redir_path.c_str(), O_RDONLY);
+        // A file in the CXL pool has no path to open; the pool hands out the fd.
+        out.ret_status = fitcache::cxl_pool_open(path_str);
+        if (out.ret_status < 0)
+            out.ret_status = open(redir_path.c_str(), O_RDONLY);
         out.peer_addr  = const_cast<char*>("");
         L4C_INFO("Server Rank %d : Opened %s with fd %d",
                  server_rank, redir_path.c_str(), out.ret_status);
@@ -471,6 +475,9 @@ fitcache_rpc_handler(hg_handle_t handle)
         int rfd = fitcache_rpc_state_p->in.accessfd;
         int64_t base_off = fitcache_rpc_state_p->in.offset;
         readbytes = 0;
+        ssize_t pool_got = 0;
+        if (fitcache::cxl_pool_read(rfd, buf, want, base_off, &pool_got))
+            want = got = (size_t) pool_got;   // served from the CXL pool; skip the fd loop
         while (got < want) {
             ssize_t n;
             if (use_pread) {
@@ -534,6 +541,7 @@ fitcache_close_rpc_handler(hg_handle_t handle)
     int ret = HG_Get_input(handle, &in);
     assert(ret == HG_SUCCESS);
     L4C_INFO("DEBUG HU: Closing File %d\n",in.fd);
+    fitcache::cxl_pool_close(in.fd);   // before close(): the fd number may be reused at once
     ret = close(in.fd);
     if(ret != 0) {
         L4C_ERR("Failed to close file %d, errno: %d (%s)", in.fd, errno, strerror(errno));
@@ -573,7 +581,11 @@ fitcache_seek_rpc_handler(hg_handle_t handle)
     int ret = HG_Get_input(handle, &in);
     assert(ret == 0);
 
-    out.ret = lseek64(in.fd, in.offset, in.whence);
+    int64_t pool_pos;
+    if (fitcache::cxl_pool_seek(in.fd, in.offset, in.whence, &pool_pos))
+        out.ret = pool_pos;
+    else
+        out.ret = lseek64(in.fd, in.offset, in.whence);
 
     HG_Respond(handle,NULL,NULL,&out);
 
