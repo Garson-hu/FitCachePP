@@ -11,6 +11,7 @@ extern "C" {
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cinttypes>
 #include <cstdio>
@@ -58,6 +59,9 @@ struct OpenFile {
 };
 
 std::mutex g_mtx;
+// Set once the pool is usable. The RPC handlers call the hooks below on every
+// open/read/seek/close, so with the tier off they return before taking g_mtx.
+std::atomic<bool> g_ready{false};
 int        g_pool_fd = -1;
 char      *g_base = nullptr;
 uint64_t   g_capacity = 0;
@@ -236,6 +240,7 @@ int cxl_pool_init(const std::string &dir, uint64_t capacity, int server_rank,
     }
     L4C_INFO("cxl-pool: %s ready (%" PRIu64 " bytes, %d files restored, %" PRIu64 " bytes used)",
              g_pool_path.c_str(), capacity, n, g_next);
+    g_ready = true;
     return 0;
 }
 
@@ -281,6 +286,7 @@ int cxl_pool_store(const std::string &original_path, uint64_t size, std::string 
 }
 
 int cxl_pool_open(const std::string &original_path) {
+    if (!g_ready) return -1;
     std::lock_guard<std::mutex> lock(g_mtx);
     auto it = g_index.find(original_path);
     if (it == g_index.end()) return -1;
@@ -292,6 +298,7 @@ int cxl_pool_open(const std::string &original_path) {
 }
 
 bool cxl_pool_read(int fd, void *buf, size_t want, int64_t offset, ssize_t *got) {
+    if (!g_ready) return false;
     Extent ext;
     int64_t pos;
     {
@@ -310,6 +317,7 @@ bool cxl_pool_read(int fd, void *buf, size_t want, int64_t offset, ssize_t *got)
 }
 
 bool cxl_pool_seek(int fd, int64_t offset, int whence, int64_t *result) {
+    if (!g_ready) return false;
     std::lock_guard<std::mutex> lock(g_mtx);
     auto it = g_open.find(fd);
     if (it == g_open.end()) return false;
@@ -327,6 +335,7 @@ bool cxl_pool_seek(int fd, int64_t offset, int whence, int64_t *result) {
 }
 
 void cxl_pool_close(int fd) {
+    if (!g_ready) return;
     std::lock_guard<std::mutex> lock(g_mtx);
     g_open.erase(fd);
 }

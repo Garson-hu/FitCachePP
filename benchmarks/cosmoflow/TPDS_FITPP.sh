@@ -76,10 +76,9 @@ HOROVOD_HOSTLIST=${HOROVOD_HOSTLIST%,}
 # filters all of those — and at NOTICE with zero registry errors the file
 # is never created at all, which makes the engagement self-check think
 # FitCache wasn't engaged when it actually was.
-# 2026-10-06: default lowered to WARN (400); the client's INFO trace filled the
-# home quota. Export FitCache_LOG_LEVEL=600 explicitly to get the lines above
-# back (the engagement self-check then falls back to the cached-file count).
-export FitCache_LOG_LEVEL="${FitCache_LOG_LEVEL:-400}"
+# Export a lower level (e.g. 400 = WARN) where the client's INFO trace would
+# fill a quota-limited home directory.
+export FitCache_LOG_LEVEL="${FitCache_LOG_LEVEL:-600}"
 export RDMAV_FORK_SAFE=1
 export VERBS_LOG_LEVEL=4
 # Disable TF/XLA's LLVM bitcode load — TF-ROCm 2.14's bundled LLVM 18 reader
