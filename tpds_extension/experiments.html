@@ -45,7 +45,8 @@ workloads (fed synthetic data), measured in the layout real training uses, cold-
 corpus, §1.1) and <strong>weak-scaling</strong> (128&nbsp;GiB/node constant, §1.1b). The <strong>syscall path</strong> is
 measured weak-scaling with <strong>real CosmoFlow training</strong> (44.5&nbsp;GB/node constant, 16→2048 GPUs, §1.1c) and
 with real DeepCAM training (97.9&nbsp;GB/node, 16→512 GPUs, §1.1d — recorded, held out of the paper). <strong>Part 2</strong>
-validates the design features (restart resilience, tier generality). Method:
+validates the design features (restart resilience, tier generality), including a supplementary CXL/famfs tier on ARC
+(§2.4: CosmoFlow 1→16 GPUs, at parity with the published IPDPS PMem bars). Method:
 <a href="experiments_methodology.html">experiments_methodology.html</a> §12 (§12.10 for the syscall campaigns).</p>
 
 <h1>Part 1 — Final results: three real workloads, 16→2048 GPUs <span class="badge done">FINAL</span></h1>
@@ -382,8 +383,82 @@ cold Lustre metadata, repeats are MDS-cached):</p>
 <tr><td><code>synth_weak_16320x4gb</code> (64&nbsp;TiB)</td><td>16,320</td><td>144&nbsp;s</td><td><strong>2.8&nbsp;s</strong></td><td>one-time per job, amortized against population of the same corpus; a loader that already indexes its shards (e.g. Megatron <code>.idx</code>) can supply sizes and skip the stat scan entirely</td></tr>
 </table>
 
+<h2>2.4 — CXL/famfs tier on ARC: CosmoFlow 1→16 GPUs vs the published PMem bars <span class="badge done">DONE 2026-10-23</span> <span class="badge supp">SUPPLEMENTARY</span></h2>
+<p class="note"><strong>Design feature:</strong> the memory tier is not tied to PMem. On ARC's CXL node the tier is a famfs
+file system on CXL memory, and each cache server keeps its tier in one pooled famfs file. This is a supplementary result:
+the IPDPS PMem results stay as published.</p>
+
+<p class="callout"><strong>Setup.</strong> Real CosmoFlow training, <code>train_61440</code> (61,440 train + 1,024
+validation files), batch 2, 5 epochs (1 cold + 4 warm), every run a cold start. Cache: 8 <code>fitcache_server</code>
+processes on the CXL node c28 (4 Micron CXL devices, famfs on <code>/dev/dax2.0</code>, 512&nbsp;GB), each with a
+32&nbsp;GiB pool file; transport <code>ofi+tcp</code> over 100&nbsp;Gb/s IB. Clients: one RTX 4060 Ti per node. The client
+CPU class is matched to the IPDPS runs at each scale, because CosmoFlow's step time follows the CPU class. 3 runs per
+scale (6 at 4 GPUs), all counted. Reference: the published IPDPS ARC bars (<code>fig:small_ARC</code>). Raw on ARC:
+<code>benchmarks/results/arc_cxl_pool_series/gpus{N}_rep{k}/</code>; launchers
+<code>benchmarks/cosmoflow/arc_cxl_pool_series.sh</code> and <code>arc_cxl_pool_reserved.sbatch</code> (branch
+<code>arc-famfs-tier</code>, 9849a37).</p>
+
+<h3>Runs (Total epoch time, s)</h3>
+<table>
+<tr><th>GPUs</th><th>Client nodes (CPU class)</th><th>Runs</th><th>Mean</th><th>Warm step: CXL / IPDPS PMem (ms)</th></tr>
+<tr><td>1</td><td>c60 / c66 / c62 (siena)</td><td>30,988.9 · 29,340.8 · 29,245.0</td><td><strong>29,858.2</strong></td><td>188–193 / 183</td></tr>
+<tr><td>2</td><td>c3,c50 / c2,c50 / c52,c53 (turin)</td><td>10,008.7 · 9,931.8 · 9,923.6</td><td><strong>9,954.7</strong></td><td>127–129 / ~130</td></tr>
+<tr><td>4</td><td>rep1–2 c2,c50,c51,c52; rep3 c52,c53,c55,c56; rep4–6 c2,c3,c54,c55 (turin)</td><td>5,335.8 · 5,499.2 · 5,066.9 · 5,284.5 · 4,981.6 · 4,978.2</td><td><strong>5,191.0</strong></td><td>128–130 (rep2 132–146) / ~130</td></tr>
+<tr><td>8</td><td>c0–c3, c54–c56 (turin) + c28</td><td>2,909.3 · 2,857.5 · 2,864.7</td><td><strong>2,877.1</strong></td><td>146–148 / 152</td></tr>
+<tr><td>16</td><td>rep1 5 turin + 9 siena + 2 rome; rep2 10 siena + 6 rome; rep3 7 turin + 9 siena</td><td>2,201.7 · 2,174.8 · 1,837.4</td><td><strong>2,071.3</strong></td><td>209–223 · 216–232 · 188–190 / 211</td></tr>
+</table>
+
+<h3>Against the published IPDPS bars (s)</h3>
+<table>
+<tr><th>GPUs</th><th>CXL (mean)</th><th>PMem [95% CI]</th><th>CXL vs PMem</th><th>BeeGFS</th><th>CXL vs BeeGFS</th><th>HVAC</th><th>CXL vs HVAC</th></tr>
+<tr><td>1</td><td>29,858.2</td><td>30,401.8 [27,381–33,422]</td><td><strong>−1.8%</strong></td><td>37,254.6</td><td>−19.9%</td><td>35,299.6</td><td>−15.4%</td></tr>
+<tr><td>2</td><td>9,954.7</td><td>10,076.4 [9,666–10,487]</td><td><strong>−1.2%</strong></td><td>14,120.5</td><td>−29.5%</td><td>12,267.2</td><td>−18.9%</td></tr>
+<tr><td>4</td><td>5,191.0</td><td>5,232.8 [4,886–5,579]</td><td><strong>−0.8%</strong></td><td>7,175.1</td><td>−27.7%</td><td>6,185.2</td><td>−16.1%</td></tr>
+<tr><td>8</td><td>2,877.1</td><td>2,937.7 [2,760–3,115]</td><td><strong>−2.1%</strong></td><td>4,261.7</td><td>−32.5%</td><td>3,551.2</td><td>−19.0%</td></tr>
+<tr><td>16</td><td>2,071.3</td><td>2,172.5 [2,001–2,344]</td><td><strong>−4.7%</strong></td><td>3,436.7</td><td>−39.7%</td><td>2,481.3</td><td>−16.5%</td></tr>
+</table>
+
+<p class="note"><strong>Reading:</strong> the CXL tier is 0.8–4.7% faster than the PMem bars at every scale. Every CXL
+mean lies inside PMem's 95% CI, and the gaps are the size of the run-to-run spread (CV 0.5–4.1%, 9.8% at 16 GPUs). The
+claim the data supports is <strong>parity with PMem</strong>, not a speedup over it.</p>
+<p class="warn"><strong>16 GPUs — node mix:</strong> IPDPS used 10 siena + 6 rome nodes. rep2 has exactly that mix and
+lands at 2,174.8&nbsp;s (+0.1% vs PMem). rep1 (2 rome) is +1.3%. rep3 has no rome nodes, because rome was excluded after
+client memory grew on the rome kernel until ranks were OOM-killed, and it is −15.4%. So the −4.7% mean comes from the node
+mix, not from the tier.</p>
+<p class="note"><strong>4 GPUs — two node sets:</strong> c50–c53 became RTX 5060 Ti nodes after rep1–3, so rep4–6 ran
+on c2, c3, c54, c55 (c3 has a 2.5&nbsp;Gb/s IB link). The warm step is 128&nbsp;ms in both sets. rep1–3 average
+5,300.6&nbsp;s and rep4–6 average 5,081.4&nbsp;s. All six are reported.<br>
+<strong>8 GPUs — eighth rank on c28:</strong> only seven turin RTX 4060 Ti nodes remain, so c28's own RTX 4060 Ti
+8&nbsp;GB (Turin-family EPYC) takes the eighth rank next to the 8 servers. c0, c1 and c3 have 2.5&nbsp;Gb/s IB links.
+IPDPS used c50–c56 and c58.<br>
+<strong>BeeGFS/HVAC columns are the 2025 IPDPS measurements.</strong> A controlled 4-node run on 2026-10-08 (c52, c55,
+c56, c58; <code>n_train</code> 8192 × 2 epochs) gave the same warm epoch for the CXL pool, a DRAM tier and plain BeeGFS
+(170–173&nbsp;s): on an idle BeeGFS the step is bound by compute and the input pipeline. The 20–40% lead over BeeGFS is
+therefore against the 2025 BeeGFS, not against a BeeGFS run on the same day.<br>
+<strong>Other differences from IPDPS:</strong> FitCache++ code (Frontier branch) instead of the IPDPS build; 8 servers on
+one CXL node instead of 2 servers per GPU on the two PMem nodes (c35, c36); the first 61,440 train files in tar order
+(same count, possibly different samples). Every run's server logs show the CXL pool was set up (no fallback).<br>
+<strong>One all-turin 4-GPU run is set aside:</strong> c2, c55, c56, c58, 5,859.2&nbsp;s, warm step 153&nbsp;ms against
+128–130&nbsp;ms in every other 4-GPU run. With it, the 4-GPU mean of 7 runs is 5,286.5&nbsp;s (+1.0% against PMem), still
+inside PMem's CI. The other set-aside runs used the wrong CPU class (methodology §12.11).</p>
+
+<h3>Tier microbenchmark on c28 (mmap of a 4&nbsp;GiB file, <code>memcpy</code>)</h3>
+<table>
+<tr><th>Measure</th><th>famfs on CXL (<code>dax2.0</code>)</th><th>tmpfs on DRAM</th></tr>
+<tr><td>Sequential read, 1 thread</td><td>23&nbsp;GB/s</td><td>42&nbsp;GB/s</td></tr>
+<tr><td>Sequential read, peak</td><td>~49&nbsp;GB/s (from 4 threads)</td><td>~310&nbsp;GB/s (16–32 threads)</td></tr>
+<tr><td>Sequential write</td><td>~32&nbsp;GB/s</td><td>~33&nbsp;GB/s</td></tr>
+<tr><td>Random 4&nbsp;KiB read, mean (p50 / p99)</td><td>515&nbsp;ns (510 / 870)</td><td>376&nbsp;ns (350 / 620)</td></tr>
+</table>
+<p class="note">These are 4&nbsp;KiB-copy latencies through the file mapping. They are not comparable with the cache-line
+device latency that <code>tab:arc</code> cites for PMem (0.305&nbsp;µs). <strong>Correctness:</strong> the pool unit test
+passes on famfs, the md5 of 2,048 files is identical for direct, fill and warm reads, and a restarted server serves both
+passes from the restored pool.</p>
+
 <footer>
-Last updated: 2026-09-09. <strong>Syscall-path weak scaling added (§1.1c–d)</strong> — CosmoFlow real training 24/24
+Last updated: 2026-10-24. <strong>CXL/famfs tier on ARC added (§2.4)</strong> — CosmoFlow 1→16 GPUs, 3 runs per scale
+(6 at 4 GPUs): 29,858 / 9,955 / 5,191 / 2,877 / 2,071&nbsp;s, i.e. −1.8% / −1.2% / −0.8% / −2.1% / −4.7% vs the published
+PMem bars, all inside PMem's 95% CI (parity; the 16-GPU gap is node mix). Earlier entry (2026-09-09): <strong>Syscall-path weak scaling added (§1.1c–d)</strong> — CosmoFlow real training 24/24
 jobs, 16→2048 GPUs at 44.5&nbsp;GB/node: 1.30× flat to 512 GPUs → 1.65× at 1024 → 3.07× at 2048 (warm 132.5–148.7&nbsp;s
 scale-flat; per-phase PFS probe analysis included); DeepCAM real training 18/18 jobs 16→512 GPUs at 97.9&nbsp;GB/node,
 17.1×→10.1×, recorded but held out of the paper (campaign capped at 512 GPUs by a ≥1024-rank torch rendezvous hang; IPDPS

@@ -671,6 +671,107 @@ and &ldquo;[c10d] client socket cannot be initialized … errno 97&rdquo;, 0 ran
 followed the Sep&nbsp;1 maintenance. ~380 node-hours were consumed for zero data; the five remaining large jobs were
 cancelled on 2026-09-09 with 471 node-hours left and the campaign capped at 512 GPUs.</p>
 
+<h3>12.11 CXL/famfs tier on ARC — CosmoFlow 1→16 GPUs against the published PMem bars (2026-10-05 → 10-23)</h3>
+<p class="note"><strong>Why.</strong> In the base paper the ARC memory tier is PMem. This series runs the same cache with
+its memory tier on CXL memory (famfs) and compares it with the published PMem bars of <code>fig:small_ARC</code>. It is a
+supplementary result: the PMem results stay. BeeGFS and HVAC were not rerun (decision 2026-10-03). Numbers are in
+<a href="experiments.html">experiments.html</a> §2.4.</p>
+<p class="note"><strong>Testbed.</strong> Cache node c28: AMD EPYC 9745 (Turin family), 256 cores, 755&nbsp;GB DRAM, four
+Micron CXL memory devices, 100&nbsp;Gb/s InfiniBand. Only <code>/dev/dax2.0</code> (512&nbsp;GB) carries famfs (FUSE mode,
+shadow directory under <code>/tmp</code>). Clients: one RTX 4060 Ti 16&nbsp;GB per node, in three CPU classes (turin EPYC
+9115, siena EPYC 8124P, rome). Software: FitCache++ branch <code>arc-famfs-tier</code> (the <code>Frontier</code> branch plus
+the pooled CXL tier, built with <code>-DFITCACHE_FAMFS=ON</code> against the vendored libfamfs), gcc 12.4.0, Mercury 2.0.1.
+Trainer env: TF 2.14 + Horovod 0.28.1 (MPICH), rebuilt on 2026-10-07 from the IPDPS <code>environment.yml</code> at
+<code>/mnt/beegfs/ghu4/envs/hvac_tf</code>. Dataset on BeeGFS: the first 61,440 train members of the full
+<code>cosmoUniverse_2019_05_4parE_tf_v2</code> tar plus the 1,024 validation files of the mini set. The count matches
+IPDPS, but the samples may differ.</p>
+<p class="note"><strong>Protocol (mirrors the IPDPS ARC runs, recovered from <code>logs/pdsw/RunTime{1,2,3}</code>).</strong>
+<code>n_train</code> 61,440, <code>n_valid</code> 1,024, batch 2, 5 epochs (1 cold + 4 warm), one GPU per node. Every run
+starts cold: the pool index is deleted and the pool files are reused. The metric is train.py's
+&ldquo;Total epoch time&rdquo; (the sum of the five epoch times). That this is the plotted value was checked on the IPDPS
+logs: the BeeGFS 1-GPU log sums average 37,241.9&nbsp;s against 37,254.6 in the paper, and FitCache 16 GPUs gives 2,176.5
+against 2,172.5. Three runs per scale. At 4 GPUs three more runs were added after the node set had to change, and all six
+are reported.</p>
+<p class="note"><strong>Cache configuration (same at every scale).</strong> 8 <code>fitcache_server</code> processes on
+c28. The count is fixed so the file-to-server hash does not change with scale. IPDPS used 2 servers per GPU on the two PMem
+nodes c35/c36. Each server has a 32&nbsp;GiB pool file
+<code>/mnt/famfs/dax2.0/ghu4_deeptier/fitcachepp_cxl_pool/cxl_pool.rank{0..7}.34359738368.bin</code>, 256&nbsp;GiB in total.
+That holds the whole ~180&nbsp;GB dataset, so the run has no evictions. The DRAM tier capacity is 0, so every promoted file
+goes to the pool. The NVMe tier and the pool index are in <code>/mnt/local/ghu4/fitcachepp_cxl_series_nvme</code>.
+Transport is <code>ofi+tcp;ofi_rxm://</code> over ib0. Verbs works with <code>FitCache_HG_INFO='ofi+verbs;ofi_rxm://'</code>
+and <code>FI_VERBS_IFACE=ib0</code>, but it gave the same step time in a 4-node test, so the series stayed on TCP. Log level
+is NOTICE (500). Engagement check: the launcher aborts the run if any server log says &ldquo;CXL tier requested … could not
+be set up&rdquo;. A silent fallback to NVMe happened once, after a c28 reboot.</p>
+
+<p class="note"><strong>Client nodes are matched to IPDPS per scale.</strong> CosmoFlow's step time follows the client CPU
+class, not the storage tier. Warm steps are about 128–130&nbsp;ms on turin and 183–193&nbsp;ms on siena. A 4-GPU CXL run on
+siena nodes took 7,742&nbsp;s against the 5,233&nbsp;s PMem bar from turin nodes, with the GPUs 96–100% busy and the servers
+idle.</p>
+<table>
+<tr><th>GPUs</th><th>IPDPS PMem nodes</th><th>CXL series nodes</th></tr>
+<tr><td>1</td><td>c66 (siena)</td><td>c60 / c66 / c62 (siena)</td></tr>
+<tr><td>2</td><td>c52, c53 (turin)</td><td>c3+c50 / c2+c50 / c52+c53 (turin)</td></tr>
+<tr><td>4</td><td>c50, c51, c54, c55 (turin)</td><td>rep1–2 c2, c50, c51, c52 · rep3 c52, c53, c55, c56 · rep4–6 c2, c3, c54, c55 (turin)</td></tr>
+<tr><td>8</td><td>c50–c56, c58 (turin)</td><td>c0–c3, c54–c56 (turin) + c28's own RTX 4060 Ti 8&nbsp;GB</td></tr>
+<tr><td>16</td><td>c60–c63, c65, c68–c78 (10 siena + 6 rome)</td><td>rep1 5 turin + 9 siena + 2 rome · rep2 10 siena + 6 rome · rep3 7 turin + 9 siena</td></tr>
+</table>
+<p class="note">Two changes to ARC during the series forced substitutions. (1) In 2026-10, c50–c53 and c58 got RTX 5060 Ti
+(Blackwell) GPUs. The trainer stack (TF 2.14, CUDA 11.8, NCCL 2.25.1) runs one GPU on them through PTX JIT, and a Conv3D
+microbenchmark was not faster there (8.2&nbsp;ms against 7.4&nbsp;ms on a 4060 Ti). Multi-GPU training fails at the first
+step with &ldquo;ncclAllReduce failed: unhandled cuda error&rdquo;, for both plain BeeGFS and CXL, so these nodes were not
+used. That left seven turin RTX 4060 Ti nodes, and c28's own GPU took the eighth rank at 8 GPUs. (2) Rome nodes run kernel
+5.19.9 (elrepo). On them the trainer's resident memory grew by about 3.5&nbsp;MB per file read until ranks were OOM-killed.
+On turin nodes in the same run it stayed at 2.8&nbsp;GB. Rome was excluded after 2026-10-08, so 16-GPU rep3 has no rome
+nodes. c0, c1 and c3 have 2.5&nbsp;Gb/s IB links, but a 2-GPU run on c3 matched the other 2-GPU runs, and the 8-GPU warm step
+is 147&nbsp;ms against 152 for IPDPS.</p>
+
+<p class="note"><strong>Reference values: the published bars, read from the figure.</strong> The figure has no numeric
+labels. Bar tops and error-bar ends were read from the geometry of
+<code>Figs/4-Evaluation/ARC/Exps_Small_Scale_Results_ARC_Cosmoflow.pdf</code>, with the y axis mapped through its ticks
+(0 at y&nbsp;=&nbsp;59.24, 10,000 at y&nbsp;=&nbsp;123.722, PDF points). The error-bar ends give the 95% CIs. These values
+reproduce every number quoted in the paper text (37,254.62, 30,401.83, 3,436.67, 2,481.28, 2,172.51, and 28.6% / 17.9% at 2
+GPUs). The surviving IPDPS logs were not used as the reference because they do not reproduce every paper number. For
+example, BeeGFS at 16 GPUs sums to 2,506.5&nbsp;s in the log and is 3,436.67 in the paper.</p>
+
+<p class="callout warn"><strong>Runs set aside (kept on disk, not in the means).</strong>
+<code>benchmarks/results/arc_cxl_pool_series/node_mismatch/</code> holds six complete runs on nodes that do not match
+IPDPS: 2 GPUs rep1 on siena (15,744.9&nbsp;s), 4 GPUs rep1 on siena (7,742.1), 8 GPUs rep1 on siena (4,091.5), 8 GPUs
+rep2/rep3 on turin + siena c60 (3,633.0 / 3,638.4; c60 sets a ~188&nbsp;ms pace), and <strong>4 GPUs on c2, c55, c56, c58
+(5,859.2)</strong>. That last run is all turin. It was set aside because its warm step was 153&nbsp;ms, against
+128–130&nbsp;ms in every other 4-GPU turin run. c58 is the only node in it that no 128&nbsp;ms run used, and c58 was also
+in the IPDPS 8-GPU set (152&nbsp;ms per step). <strong>If it is counted, the 4-GPU mean of 7 runs is 5,286.5&nbsp;s (+1.0%
+against PMem), still inside PMem's 95% CI.</strong> <code>failed_2026100{6,7,8}/</code> holds runs that produced no result:
+home quota exceeded by INFO-level logs, the TF env deleted mid-run, Horovod start timeouts (fixed with
+<code>--start-timeout 300</code>), the NVMe fallback after the reboot, runs killed when c28's job was released or requeued,
+and rome OOM. <code>gpus1_rep1_killed_when_c28_released/</code> is a partial run.</p>
+
+<p class="note"><strong>Holding nodes until a run fits.</strong> All runs from 2026-10-22 on came from one batch job per node
+set, <code>arc_cxl_pool_reserved.sbatch</code>, in partition <code>all</code>. Its PriorityTier (5) is above the per-GPU
+partitions (1), so later jobs cannot overtake it. The job holds the GPU nodes and either c28 or an ssh session adopted into
+the user's own c28 job. It then starts <code>arc_cxl_pool_reserved_runs.sh</code> on c28. That runner works through
+<code>RUN_PLAN</code> one run at a time. It retries a failed run up to <code>MAX_TRIES</code> times and does not start a run
+that cannot finish in the time left on the allocation. When it stops it writes a status file, and the batch job then
+releases the nodes. Pre-flight checks: famfs is mounted, the shadow files are read (the systemd-tmpfiles rule ages
+<code>/tmp</code> out after 10 days), and the project directory is re-created with <code>sudo famfs-mkdir</code> if it is
+missing. CXL memory is volatile, so after a reboot famfs comes back empty. The runner also waits until no other
+<code>fitcache_server</code> is running and checks that every node's GPU is an RTX 4060 Ti.</p>
+
+<p class="note"><strong>Tier microbenchmark and correctness.</strong> The microbenchmark ran on c28 on 2026-10-05 with
+a scratch tool that is not in the repo. It maps a 4&nbsp;GiB file and times <code>memcpy</code>: sequential read and write
+at 1–32 threads, and random 4&nbsp;KiB reads. It ran on famfs (CXL) and on tmpfs (DRAM). The random-read numbers are
+latencies of a 4&nbsp;KiB copy. They are not the cache-line device latency that <code>tab:arc</code> cites for PMem from
+the literature. Correctness checks: <code>build/tests/test_cxl_pool &lt;famfs dir&gt;</code> passes (store, read, seek,
+EOF, pool full, restart recovery, reset). The md5 of 2,048 files is identical for direct, fill and warm reads. After a server
+restart, the restored index served both passes from the pool.</p>
+
+<p class="note"><strong>Reproduce</strong> (from the repo root on c28, with famfs mounted):<br>
+one run: <code>FITPP_SITE=arc CLIENT_NODES="c2 c3 c54 c55" benchmarks/cosmoflow/arc_cxl_pool_series.sh 4 rep7</code> (holds
+the client nodes itself unless <code>FITPP_NO_HOLD=1</code>)<br>
+held plan: <code>SERVER_IS_CLIENT=1 RUN_PLAN='8 rep1;8 rep2;8 rep3' sbatch -o
+benchmarks/results/arc_cxl_pool_series/reserved-%j.out benchmarks/cosmoflow/arc_cxl_pool_reserved.sbatch</code><br>
+per-run output: <code>gpus{N}_rep{k}/horovodrun_*.log</code> (epoch lines and &ldquo;Total epoch time&rdquo;),
+<code>launcher.log</code>, server logs, <code>client_rss.log</code>.</p>
+
 <footer>
 Generated 2026-06-14 from the benchmark sources + harness scripts (mined and cross-checked; every claim cites <code>file:line</code>).
 Rewritten 2026-06-14 for plain-English readability; 2026-06-20 rewritten for the redesign — the whole system is now the <code>mmap</code>
@@ -685,7 +786,10 @@ extended §12.5 with the fstat SIGBUS guard and the .meta-optional resolve seman
 §12.8</strong> (weak-scaling protocol: 128&nbsp;GiB/node constant, disjoint cold shard windows) <strong>and §12.9</strong>
 (adaptive-placement verification: three-case decision sanity + overhead self-timing). <strong>2026-09-09: added
 §12.10</strong> (syscall-path weak scaling with real CosmoFlow / DeepCAM training: corpora, job shape, IPDPS-tree DeepCAM,
-RPC-robustness fixes, probe caveats, the ≥1024-rank rendezvous hang that capped DeepCAM). Numbers are authoritative in
+RPC-robustness fixes, probe caveats, the ≥1024-rank rendezvous hang that capped DeepCAM). <strong>2026-10-24: added
+§12.11</strong> (CXL/famfs tier on ARC: testbed, IPDPS-matched protocol, cache configuration, per-scale node mapping, how the
+published PMem bars were read from the figure, runs set aside, the held-allocation runner, microbenchmark and correctness
+method). Numbers are authoritative in
 <a href="experiments.html">experiments.html</a>. Focus is methodology (how experiments are built, run, and measured).
 </footer>
 

@@ -217,6 +217,31 @@ therefore restores reusable cache <em>state</em> and reduces cold metadata recov
 server-side restore currently covers on-demand-promoted data; client-side warm correctness is unaffected either way
 (validated in <a href="experiments.html">experiments.html</a> Part 2).</p>
 
+<h2>CXL memory tier — one pooled famfs file per server <span class="badge supp">Supplementary</span></h2>
+<p>On ARC's CXL node the memory tier lives on CXL memory through famfs. The tier cannot copy one file per cached sample the way
+the DRAM, PMem and NVMe tiers do. famfs files must be created at their final size through libfamfs, and they cannot be renamed,
+resized or deleted. Space is allocated in 2&nbsp;MiB units, so a 2.9&nbsp;MB CosmoFlow sample would take 4&nbsp;MiB. The
+metadata log of this famfs (8&nbsp;MiB) holds 13,443 entries, fewer than the 61,440 files of <code>train_61440</code>. The
+create cost also grows with the log: about 2&nbsp;s per file on a long log, 0.02–0.09&nbsp;s on a fresh one.</p>
+<p>So each server keeps <strong>one pre-allocated pool file</strong>
+(<code>&lt;FitCache_CXL_PATH&gt;/cxl_pool.rank&lt;k&gt;.&lt;capacity&gt;.bin</code>, created through
+<code>famfs_mkdir_parents</code> + <code>famfs_mkfile</code>) and maps it once. The data mover packs promoted files into the
+mapping with 4&nbsp;KiB-aligned bump allocation. Placement order is DRAM, then the CXL pool, then PMem, then NVMe. If the pool
+is full, placement falls through to the next tier. The read and seek RPC handlers serve a pooled file from the
+mapping, and reads are a <code>memcpy</code>. The open handler returns a <code>dup</code> of the pool fd as the handle, so the existing
+fd plumbing is unchanged. The index of what the pool holds is kept on a regular filesystem
+(<code>FitCache_CXL_INDEX_PATH</code>, default the NVMe tier directory). A generation token in the pool's first page makes a
+restarted server ignore a stale index. Deleting the index empties the pool, which is how each run starts cold without new
+famfs space. Env: <code>FitCache_CXL_PATH</code>, <code>FitCache_CXL_CAPACITY</code> (bytes per server process),
+<code>FitCache_CXL_INDEX_PATH</code>. Build: <code>-DFITCACHE_FAMFS=ON</code> links the vendored libfamfs. With the flag off
+(the Frontier default), the pool still works on a regular filesystem.</p>
+<p class="note"><strong>Scope.</strong> A pooled file has no path of its own, so it is served only through the server read
+RPC path. That is the path the CosmoFlow runs use. The client <code>mmap</code> warm-hit resolver (Mechanism 1) does not see
+pooled files and maps the PFS copy instead. Pooled files get no <code>.meta</code> sidecar, are not announced to peer jobs, and
+are never a migration target. CXL memory is volatile: a reboot of the CXL node empties famfs, and the pool files are re-created
+by the next server start. Code: <code>src/server/fitcache_cxl_pool.{h,cpp}</code> (branch <code>arc-famfs-tier</code>).
+Results: <a href="experiments.html">experiments.html</a> §2.4.</p>
+
 <h2>Future work — cross-job cache sharing <span class="badge supp">Future work</span></h2>
 <p>Cross-job sharing (<code>FitCache_CROSS_JOB=1</code>, HRW/peer-read path) remains future work only; no new compute is spent on
 it and it is not a claim in this paper. The single-job placement path (<code>CROSS_JOB=0</code>) is the one exercised by all
@@ -239,6 +264,7 @@ Fixed with the server short-read loop and &le;1 GiB chunked populate.</li>
 </ul>
 
 <footer>
+2026-10-24: added the CXL memory tier (one pooled famfs file per server; supplementary ARC result in experiments.html §2.4).<br>
 Last updated: 2026-07-15 (merged the standalone prefetch-migration design note into Mechanism 2; added the 2026-07 client
 hardening to Mechanism 1 — PFS-free warm resolve, open-RPC skip, fstat coverage guard; scoped Mechanism 3 to
 on-demand-promoted data; fixed companion links; corrected server count to 1/node).<br>
