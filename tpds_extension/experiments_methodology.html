@@ -739,8 +739,8 @@ IPDPS: 2 GPUs rep1 on siena (15,744.9&nbsp;s), 4 GPUs rep1 on siena (7,742.1), 8
 rep2/rep3 on turin + siena c60 (3,633.0 / 3,638.4; c60 sets a ~188&nbsp;ms pace), and <strong>4 GPUs on c2, c55, c56, c58
 (5,859.2)</strong>. That last run is all turin. It was set aside because its warm step was 153&nbsp;ms, against
 128–130&nbsp;ms in every other 4-GPU turin run. c58 is the only node in it that no 128&nbsp;ms run used, and c58 was also
-in the IPDPS 8-GPU set (152&nbsp;ms per step). <strong>If it is counted, the 4-GPU mean of 7 runs is 5,286.5&nbsp;s (+1.0%
-against PMem), still inside PMem's 95% CI.</strong> <code>failed_2026100{6,7,8}/</code> holds runs that produced no result:
+in the IPDPS 8-GPU set (152&nbsp;ms per step). It is not counted (decision 2026-10-25).
+<code>failed_2026100{6,7,8}/</code> holds runs that produced no result:
 home quota exceeded by INFO-level logs, the TF env deleted mid-run, Horovod start timeouts (fixed with
 <code>--start-timeout 300</code>), the NVMe fallback after the reboot, runs killed when c28's job was released or requeued,
 and rome OOM. <code>gpus1_rep1_killed_when_c28_released/</code> is a partial run.</p>

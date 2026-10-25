@@ -437,10 +437,8 @@ c56, c58; <code>n_train</code> 8192 × 2 epochs) gave the same warm epoch for th
 therefore against the 2025 BeeGFS, not against a BeeGFS run on the same day.<br>
 <strong>Other differences from IPDPS:</strong> FitCache++ code (Frontier branch) instead of the IPDPS build; 8 servers on
 one CXL node instead of 2 servers per GPU on the two PMem nodes (c35, c36); the first 61,440 train files in tar order
-(same count, possibly different samples). Every run's server logs show the CXL pool was set up (no fallback).<br>
-<strong>One all-turin 4-GPU run is set aside:</strong> c2, c55, c56, c58, 5,859.2&nbsp;s, warm step 153&nbsp;ms against
-128–130&nbsp;ms in every other 4-GPU run. With it, the 4-GPU mean of 7 runs is 5,286.5&nbsp;s (+1.0% against PMem), still
-inside PMem's CI. The other set-aside runs used the wrong CPU class (methodology §12.11).</p>
+(same count, possibly different samples). Every run's server logs show the CXL pool was set up (no fallback).
+Runs not counted, and why: methodology §12.11.</p>
 
 <h3>Tier microbenchmark on c28 (mmap of a 4&nbsp;GiB file, <code>memcpy</code>)</h3>
 <table>
@@ -456,6 +454,8 @@ passes on famfs, the md5 of 2,048 files is identical for direct, fill and warm r
 passes from the restored pool.</p>
 
 <footer>
+2026-10-25: §2.4 drafted into the paper as a new subsection right after the GPUCluster small-scale results (red text,
+TPDS_FitCachePP <code>main</code>), 4 GPUs reported as the 6 counted runs.<br>
 Last updated: 2026-10-24. <strong>CXL/famfs tier on ARC added (§2.4)</strong> — CosmoFlow 1→16 GPUs, 3 runs per scale
 (6 at 4 GPUs): 29,858 / 9,955 / 5,191 / 2,877 / 2,071&nbsp;s, i.e. −1.8% / −1.2% / −0.8% / −2.1% / −4.7% vs the published
 PMem bars, all inside PMem's 95% CI (parity; the 16-GPU gap is node mix). Earlier entry (2026-09-09): <strong>Syscall-path weak scaling added (§1.1c–d)</strong> — CosmoFlow real training 24/24
