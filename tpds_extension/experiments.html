@@ -251,7 +251,8 @@ uint8 returned (normalize-on-GPU convention), <code>batch_size=64</code>, 8 rank
 cache hits, footprint census byte-exact); two environment effects to expect in the filled-in numbers: the stock
 DataLoader's per-rank ingest ceiling (~0.3&nbsp;GB/s) and Frontier's two node-SSD speed classes (§1.5).</p>
 
-<h2>1.3 — GNN (real 2-hop sampler + feature gather) — N× footprint <span class="badge done">FINAL</span></h2>
+<h2>1.3 — GNN (real 2-hop sampler + feature gather) — N× footprint <span class="badge supp">SUPERSEDED 2026-11-18 by §1.3b</span></h2>
+<p class="warn"><strong>Superseded.</strong> This June table divided native epoch 0 by FitCachePP <em>epoch 1</em> (a page-cache re-read), and all scales read one shared copy (32–512 GPUs OST-warmed, marked †). The paper now uses §1.3b. Kept for the record.</p>
 <p class="note">Real IGB-large (853&nbsp;GB feat+CSR), real 2-hop heterogeneous sampling (fanouts 12/8/8), 8 concurrent
 gatherers/node. Un-partitionable: any feature row can be touched → every node caches the whole set → storage
 <strong>N×</strong> (841&nbsp;GiB/node at every scale, du-confirmed). Cold-realism: 39-day-aged data +
@@ -273,13 +274,55 @@ per-node gather is scale-independent so the anchor is representative); at N=128�
 genuinely saturate Lustre and the speedup <em>rises</em> to <strong>24.1× at 2048 GPUs</strong> — real contention, the
 regime where the cache matters most.</p>
 
+<h2>1.3b — GNN rerun: one cold copy per scale, epoch 0 on both sides (2026-11-14 → 11-18) <span class="badge done">FINAL</span> <span class="badge done">IN PAPER 2026-11-18</span></h2>
+<p class="note">Same bench and sampler as §1.3 (8 gatherer ranks/node, fanouts 12/8/8, 20 batches × 1024 seeds, 12&nbsp;GiB blocks,
+902.4&nbsp;GB staged per node). Every scale reads its own private copy <code>igb_cold_copies/N&lt;nodes&gt;</code>, cooled ≥9.25&nbsp;h;
+one job at a time. Both sides report <strong>epoch 0 after the page cache is cleared</strong>, timed by the <strong>slowest rank</strong>:
+native reads Lustre; FitCachePP reads the copy staged to node-local NVMe before the epoch (staging not timed; 0 Lustre pages read
+during the FitCachePP epoch, verified from OST client statistics). Source: <code>benchmarks/results/frontier/gnn_cold_copies/</code>
+(<code>summary.json</code>, <code>block_ost_native.txt</code> per run). Method: methodology §12.12. Paper: Table V GNN columns (red).</p>
+<table>
+<tr><th>Nodes</th><th>GPUs</th><th>Native e0, slowest (s)</th><th>FitCachePP e0, slowest (s)</th><th>Speedup (slowest rank, in paper)</th><th>Speedup (median rank)</th><th>Run</th></tr>
+<tr><td>2</td><td>16</td><td>886.0</td><td>110.1</td><td><strong>8.0×</strong></td><td>8.1×</td><td><code>20261115_100916_N2_r1</code></td></tr>
+<tr><td>4</td><td>32</td><td>705.4</td><td>110.6</td><td><strong>6.4×</strong></td><td>6.5×</td><td><code>20261115_093111_N4_r1</code></td></tr>
+<tr><td>8</td><td>64</td><td>537.8</td><td>109.5</td><td><strong>4.9×</strong></td><td>4.9×</td><td><code>20261115_085607_N8_r1</code></td></tr>
+<tr><td>16</td><td>128</td><td>539.7</td><td>108.9</td><td><strong>5.0×</strong></td><td>4.3×</td><td><code>20261115_073900_N16_r1</code></td></tr>
+<tr><td>32</td><td>256</td><td>486.6</td><td>110.1</td><td><strong>4.4×</strong></td><td>4.0×</td><td><code>20261115_063254_N32_r1</code></td></tr>
+<tr><td>64</td><td>512</td><td>552.3</td><td>175.3</td><td><strong>3.2×</strong></td><td>4.0×</td><td><code>20261114_114330_N64_r1</code></td></tr>
+<tr><td>128</td><td>1024</td><td>830.0</td><td>111.4</td><td><strong>7.5×</strong></td><td>7.5×</td><td><code>20261116_155352_N128_r1</code></td></tr>
+<tr><td>256</td><td>2048</td><td>1098.1</td><td>118.0</td><td><strong>9.3×</strong></td><td>9.3×</td><td><code>20261118_031727_N256_r1</code></td></tr>
+</table>
+<p>Repeats on the same copy (≥9.25&nbsp;h later, final cache-drop protocol, with diagnostics): 16 GPUs 1573.5 / 111.6&nbsp;s = <strong>14.1×</strong>;
+32 GPUs 721.4 / 111.8&nbsp;s = 6.5×; 64 GPUs 556.2 / 113.0&nbsp;s = 4.9×. The 16–512-GPU first runs used eviction only
+(FitCachePP epoch 0 ~2&nbsp;s faster than with the final drop-then-evict protocol); 1024/2048 GPUs and the repeats used drop-then-evict.
+Staging (not in the speedup): 422–557&nbsp;s at 16–512 GPUs, 947&nbsp;s at 1024, 1675&nbsp;s at 2048.</p>
+<table>
+<tr><th>Diagnostics (median rank)</th><th>16 GPUs (repeat)</th><th>32 GPUs (repeat)</th><th>64 GPUs (repeat)</th><th>2048 GPUs</th></tr>
+<tr><td>Native e0, median rank (s)</td><td>1573</td><td>721</td><td>555</td><td>1023</td></tr>
+<tr><td>Lustre bytes read per node</td><td>619&nbsp;GB</td><td>618&nbsp;GB</td><td>619&nbsp;GB</td><td>616&nbsp;GB</td></tr>
+<tr><td>Paper features, single-OST part: time / latency per RPC</td><td>263&nbsp;s / 4.1&nbsp;ms</td><td>248&nbsp;s / 3.9&nbsp;ms</td><td>181&nbsp;s / 2.7&nbsp;ms</td><td>583&nbsp;s / 8.7&nbsp;ms</td></tr>
+<tr><td>Author features, single-OST part</td><td>137&nbsp;s / 14.1&nbsp;ms</td><td>57&nbsp;s / 5.4&nbsp;ms</td><td>48&nbsp;s / 4.4&nbsp;ms</td><td>111&nbsp;s / 11.0&nbsp;ms</td></tr>
+<tr><td>Paper features, 8-OST striped part</td><td>852&nbsp;s / 6.7&nbsp;ms</td><td>295&nbsp;s / 2.1&nbsp;ms</td><td>233&nbsp;s / 1.6&nbsp;ms</td><td>267&nbsp;s / 1.6&nbsp;ms</td></tr>
+<tr><td>Author features, 8-OST striped part</td><td>277&nbsp;s / 14.2&nbsp;ms</td><td>97&nbsp;s / 4.8&nbsp;ms</td><td>74&nbsp;s / 3.4&nbsp;ms</td><td>40&nbsp;s / 1.6&nbsp;ms</td></tr>
+</table>
+<p class="note"><strong>Why the speedup is U-shaped.</strong> FitCachePP reads only local NVMe and is flat (109–118&nbsp;s; one slow node at
+512 GPUs). Native: Lustre read-ahead turns each missed 4&nbsp;KB page into a 0.5–0.7&nbsp;MB RPC, so every node reads ~617&nbsp;GB to
+gather 21.4&nbsp;GB, independent of node count (2–256 nodes measured); the epoch then follows the RPC latency of the copy's OSTs.
+<strong>Small scale:</strong> latency was higher with fewer nodes and varies with other traffic on those OSTs: in the slow 16-GPU repeat,
+half of the striped OSTs were ~4× slower than the other half, and a striped read waits for its slowest OST (all 8 OSTs delivered the
+same MB/s). <strong>Large scale:</strong> the first 128&nbsp;GiB of each feature file sits on ONE capacity OST (Orion default PFL layout)
+that every node must read; from 64 to 2048 GPUs its latency rises 2.7→8.7&nbsp;ms and the single-OST time per rank grows 229→693&nbsp;s
+while the rest stays 325→338&nbsp;s. <strong>512 GPUs:</strong> the 8 ranks of one node took 175.3&nbsp;s in the FitCachePP epoch
+(median 107.7&nbsp;s), so the slowest-rank speedup is 3.2× vs 4.0× by median rank. srun interleaved some long stdout lines
+(2 of 32 / 2 of 64 ranks unrecoverable in the 32/64-GPU repeats); 2048 GPUs used intact per-rank files.</p>
+
 <h2>1.4 — Cross-workload summary</h2>
 <table>
 <tr><th>Workload (real loader)</th><th>Access</th><th>Footprint</th><th>Cold speedup (anchor)</th><th>At 2048 GPUs</th><th>What bounds warm</th></tr>
 <tr><td>Megatron strong (IndexedDataset+DataLoader)</td><td>random ~2&nbsp;KB docs</td><td><strong>1×</strong> (537G→4G/node)</td><td><strong>30.2×</strong></td><td>warm flat ~3–6&nbsp;s; slice in RAM regime</td><td>per-sample loader latency</td></tr>
 <tr><td>Megatron weak (same loader, 128&nbsp;GiB/node constant)</td><td>random ~2&nbsp;KB docs</td><td><strong>1×</strong> (128&nbsp;GiB/node at every scale)</td><td><strong>54×</strong></td><td><strong>15×</strong> (sustained; 15–112× across all scales)</td><td>native side = Lustre contention; warm nearly scale-flat</td></tr>
 <tr><td>Vision (DataLoader, 150&nbsp;KB records)</td><td>random 150&nbsp;KB images</td><td><strong>1×</strong> (1.1T→8G/node)</td><td><strong>5.2×</strong></td><td>I/O path ~10&nbsp;GB/s scale-flat; end-to-end loader- and SSD-class-bound</td><td>DataLoader consumer + node SSD class</td></tr>
-<tr><td>GNN (2-hop sampler)</td><td>random 4&nbsp;KB rows</td><td><strong>N×</strong> (841G/node)</td><td><strong>18.8×</strong></td><td><strong>24.1×</strong> (grows with contention)</td><td>genuinely storage-bound → full win</td></tr>
+<tr><td>GNN (2-hop sampler)</td><td>random 4&nbsp;KB rows</td><td><strong>N×</strong> (841G/node)</td><td><strong>8.0×</strong> <span class="note">(updated 2026-11-18, §1.3b; was 18.8×)</span></td><td><strong>9.3×</strong> (U-shape, 3.2× minimum at 512 GPUs; was 24.1×)</td><td>native: Lustre RPC latency of the copy's OSTs; FitCachePP local NVMe, flat 109–118&nbsp;s</td></tr>
 <tr><td>CosmoFlow real training, syscall path, weak (44.5&nbsp;GB/node constant)</td><td>sequential 2.9&nbsp;MB TFRecords via <code>pread</code></td><td><strong>1×</strong> (44.5&nbsp;GB/node in DRAM tier at every scale)</td><td><strong>1.30×</strong></td><td><strong>3.07×</strong> (1.3× flat to 512 GPUs, then native climbs as Lustre contends)</td><td>GPU compute + all-reduce (warm 132–149&nbsp;s scale-flat)</td></tr>
 <tr><td>DeepCAM real training, syscall path, weak (97.9&nbsp;GB/node; IPDPS code; <em>held out of paper</em>)</td><td>sequential 2.9&nbsp;MB HDF5 samples via <code>pread64</code></td><td><strong>1×</strong> (97.9&nbsp;GB/node NVMe at every scale)</td><td><strong>17.1×</strong></td><td>10.1× at 512 GPUs (campaign capped; ≥1024-rank rendezvous hang)</td><td>DDP all-reduce + RPC-timeout fallback ranks</td></tr>
 </table>
@@ -295,7 +338,7 @@ sustained at every scale to 2048 GPUs (§1.1b).</p>
 <h2>1.5 — Method notes &amp; caveats</h2>
 <p class="note"><strong>Cold baselines.</strong> A native measurement is only &ldquo;cold&rdquo; if it is the first
 reader of the corpus after an ≥8.5&nbsp;h cool-down (Lustre's servers cache recently-read data). Every speedup in
-§1.1–1.2 is measured that way, one scale per slot; GNN (§1.3) uses 39-day-aged data + page-cache eviction. Cold points
+§1.1–1.2 is measured that way, one scale per slot; GNN (§1.3) uses 39-day-aged data + page-cache eviction; the 2026-11 rerun (§1.3b, now in the paper) gives every scale its own copy cooled ≥9.25&nbsp;h. Cold points
 are single-shot (a cold measurement consumes its own coldness).<br>
 <strong>Node-SSD variance.</strong> Frontier nodes have two SSD speed classes (~1.9 vs ~5&nbsp;GB/s direct-read);
 random-access warm reads are slower on the majority class, and the epoch metric (slowest rank) includes the slowest
@@ -454,9 +497,10 @@ passes on famfs, the md5 of 2,048 files is identical for direct, fill and warm r
 passes from the restored pool.</p>
 
 <footer>
+Last updated: 2026-11-18. <strong>GNN rerun added (§1.3b), now in the paper (Table V)</strong>: one cold copy per scale, epoch 0 on both sides, slowest rank: 8.0/6.4/4.9/5.0/4.4/3.2/7.5/9.3× at 16–2048 GPUs; repeats at 16/32/64 GPUs; Lustre client statistics explain the U shape. §1.3 marked superseded; §1.4, §1.5 updated.<br>
 2026-10-25: §2.4 drafted into the paper as a new subsection right after the GPUCluster small-scale results (red text,
 TPDS_FitCachePP <code>main</code>), 4 GPUs reported as the 6 counted runs.<br>
-Last updated: 2026-10-24. <strong>CXL/famfs tier on ARC added (§2.4)</strong> — CosmoFlow 1→16 GPUs, 3 runs per scale
+Earlier entry (2026-10-24): <strong>CXL/famfs tier on ARC added (§2.4)</strong> — CosmoFlow 1→16 GPUs, 3 runs per scale
 (6 at 4 GPUs): 29,858 / 9,955 / 5,191 / 2,877 / 2,071&nbsp;s, i.e. −1.8% / −1.2% / −0.8% / −2.1% / −4.7% vs the published
 PMem bars, all inside PMem's 95% CI (parity; the 16-GPU gap is node mix). Earlier entry (2026-09-09): <strong>Syscall-path weak scaling added (§1.1c–d)</strong> — CosmoFlow real training 24/24
 jobs, 16→2048 GPUs at 44.5&nbsp;GB/node: 1.30× flat to 512 GPUs → 1.65× at 1024 → 3.07× at 2048 (warm 132.5–148.7&nbsp;s
@@ -469,7 +513,7 @@ cold shard ranges: 15–112× sustained through 2048 GPUs (§1.1b). <strong>Per-
 (16/16)</strong> — every scale measured as the first
 reader of its corpus after a cool-down. Megatron: 30.2×/46.1×/30.1×/17.2× at 16–128 GPUs → 4.8×/3.6× at 256–512 →
 0.8×/0.9× at 1024–2048 (≤8&nbsp;GB slices sit in RAM: caching unnecessary by construction). Vision: 5.2× at 16–32 GPUs;
-~1× and below from 64 GPUs (node-SSD class + DataLoader ceiling; 100% cache hits verified). GNN: 18.8×→24.1×, N×.
+~1× and below from 64 GPUs (node-SSD class + DataLoader ceiling; 100% cache hits verified). GNN: 8.0× at 16 GPUs, 3.2× minimum at 512, 9.3× at 2048 (updated 2026-11-18, §1.3b; was 18.8×→24.1×), N×.
 Footprints exact 1/N. Raw: <code>*_dl8_1x/cold_ladder_map.txt</code>, <code>cold_ladder_N*_rows.txt</code>. Method:
 <a href="experiments_methodology.html">experiments_methodology.html</a> §12.
 </footer>

@@ -772,6 +772,27 @@ benchmarks/results/arc_cxl_pool_series/reserved-%j.out benchmarks/cosmoflow/arc_
 per-run output: <code>gpus{N}_rep{k}/horovodrun_*.log</code> (epoch lines and &ldquo;Total epoch time&rdquo;),
 <code>launcher.log</code>, server logs, <code>client_rss.log</code>.</p>
 
+<h3>12.12 GNN rerun protocol — one cold copy per scale, epoch 0 on both sides (2026-11-14 → 11-18)</h3>
+<p><strong>Why.</strong> The June GNN sweep (experiments §1.3) read one shared copy at every scale, so mid-scale natives were
+OST-warmed, and its speedup divided native epoch 0 by FitCachePP epoch 1 (a page-cache re-read).
+<strong>Corpus.</strong> Six IGB-large files (paper/author features, two CSR graphs; 902.4&nbsp;GB) copied once per scale to
+<code>data/gnn/igb_cold_copies/N&lt;nodes&gt;</code>, default Orion PFL layout (first 128&nbsp;GiB of each feature file on one
+capacity OST, the rest on 8 OSTs with 1&nbsp;MiB stripes; each copy on different OSTs).
+<strong>Scheduling.</strong> <code>benchmarks/gnn/drive_gnn_cold_copies.py</code> submits one job at a time, waits ≥9.25&nbsp;h
+after a copy was last read, and for 1024/2048 GPUs caps the native timeout so that a run hitting it stays inside the remaining allocation.
+<strong>Job</strong> (<code>gnn_cold_copies_job.template.sh</code>): evict page cache → native epochs from Lustre → stage the whole set to
+node-local NVMe with <code>cp</code> (size-verified) → fsync + <code>POSIX_FADV_DONTNEED</code> on staged and Lustre files, then
+memory-pressure eviction (residency 0&nbsp;GiB recorded before both measured epochs) → FitCachePP epochs via <code>LD_PRELOAD</code>.
+Reported: epoch 0 on both sides, slowest rank; staging not timed. The 16–512-GPU first runs used eviction only (FitCachePP epoch 0
+~2&nbsp;s faster).
+<strong>Diagnostics</strong> (from 2026-11-17; outside every timed region): per-block gather times per rank (<code>BLOCKWALLS</code>,
+intact per-rank copies in <code>blockwalls/</code> via <code>GNN_BLOCKWALLS_DIR</code>, because srun interleaves long stdout lines), and
+per-node Lustre client statistics of the copy's 28 OSTs every 10&nbsp;s (<code>ost_stats_sampler.sh</code>: read RPCs, pages, RPCs in
+flight, average RPC time from <code>/proc/fs/lustre/osc/*/{rpc_stats,import}</code>). <code>analyze_gnn_block_ost.py</code> splits the
+epoch by file region and differences the counters over each region's window.
+<strong>Queue.</strong> The 4-node repeat ran under the <code>develop</code> QOS (service partition, ≤4 nodes, ≤2&nbsp;h); the
+<code>debug</code> QOS was not used because OLCF prohibits production work in it.</p>
+
 <footer>
 Generated 2026-06-14 from the benchmark sources + harness scripts (mined and cross-checked; every claim cites <code>file:line</code>).
 Rewritten 2026-06-14 for plain-English readability; 2026-06-20 rewritten for the redesign — the whole system is now the <code>mmap</code>
@@ -789,7 +810,7 @@ extended §12.5 with the fstat SIGBUS guard and the .meta-optional resolve seman
 RPC-robustness fixes, probe caveats, the ≥1024-rank rendezvous hang that capped DeepCAM). <strong>2026-10-24: added
 §12.11</strong> (CXL/famfs tier on ARC: testbed, IPDPS-matched protocol, cache configuration, per-scale node mapping, how the
 published PMem bars were read from the figure, runs set aside, the held-allocation runner, microbenchmark and correctness
-method). Numbers are authoritative in
+method). <strong>2026-11-18: added §12.12</strong> (GNN rerun: one cold copy per scale, epoch 0 on both sides, Lustre client diagnostics). Numbers are authoritative in
 <a href="experiments.html">experiments.html</a>. Focus is methodology (how experiments are built, run, and measured).
 </footer>
 
